@@ -1,0 +1,293 @@
+/**
+ * 会话图谱 · 持久化状态
+ *
+ * 纯函数，Host 与客户端两侧共用（客户端侧会被内联进 client.js）。
+ * 职责：把「界面上的偏好」与「用户创建的关系」规整成可持久化的形态，
+ * 并在两个形态之间转换：
+ *
+ *   持久形态   Ref 用对象 `{ sessionId, turn? }`（需求文档 §5.2）
+ *   客户端形态 端点用字符串 id `sessionId:turn` / `header:sessionId`
+ *
+ * 版本演进照 §5.3：`version` 必填；**未知版本拒绝应用并明说不兼容，不猜测性解析**。
+ */
+
+export const STATE_VERSION = 1;
+
+/** NFR-1：超限就截断，避免一条癫狂的记录把界面拖死 */
+export const LIMITS = {
+  links: 2000,
+  positions: 4000,
+  alias: 2000,
+  hiddenBlocks: 4000,
+  collapsedSessions: 200,
+  aliasLength: 200,
+  labelLength: 120
+};
+
+const str = (v) => (v === undefined || v === null ? '' : String(v));
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+export function emptyState(now = 0) {
+  return {
+    version: STATE_VERSION,
+    links: [],
+    positions: {},
+    viewport: null,
+    collapsedSessions: [],
+    hiddenBlocks: [],
+    alias: {},
+    updatedAt: now
+  };
+}
+
+/* --------------------------------------------------------- id ↔ Ref */
+
+/** `sessionId:turn` / `header:sessionId` / `sessionId:empty` → Ref */
+export function idToRef(id) {
+  const s = str(id);
+  if (s === '') return null;
+  const cut = s.indexOf(':');
+  if (cut <= 0) return null;
+  const head = s.slice(0, cut);
+  const tail = s.slice(cut + 1);
+  if (head === 'header') return { sessionId: tail };
+  if (tail === 'empty') return { sessionId: head };
+  const turn = Number(tail);
+  return Number.isInteger(turn) && turn > 0 ? { sessionId: head, turn } : null;
+}
+
+/** Ref → 客户端内部 id；认不出来返回空串 */
+export function refToId(ref) {
+  if (!isObject(ref)) return '';
+  const sessionId = str(ref.sessionId);
+  if (sessionId === '') return '';
+  if (ref.turn === undefined || ref.turn === null) return `header:${sessionId}`;
+  const turn = Number(ref.turn);
+  return Number.isInteger(turn) && turn > 0 ? `${sessionId}:${turn}` : '';
+}
+
+/* ------------------------------------------------------------ 规整 */
+
+const turnKey = (v) => (/^\d+$/.test(String(v)) ? String(Number(v)) : '');
+
+/** 字符串数组：去空、去重、限长 */
+const uniqStrings = (raw, limit) =>
+  [...new Set((Array.isArray(raw) ? raw : []).map(str).filter(Boolean))].slice(0, limit);
+
+/** 干净的初始状态 */
+function capObject(raw, limit, mapValue) {  const out = {};
+  if (!isObject(raw)) return out;
+  let n = 0;
+  for (const [k, v] of Object.entries(raw)) {
+    if (n >= limit) break;
+    const value = mapValue(v);
+    if (value === null) continue;
+    out[str(k)] = value;
+    n += 1;
+  }
+  return out;
+}
+
+const sanitizeLink = (raw, now) => {
+  if (!isObject(raw)) return null;
+  /* 端点两种形态都收：规范的 Ref 对象，或客户端内部用的字符串 id */
+  const fromRef = isObject(raw.from) ? raw.from : idToRef(raw.from);
+  const toRef = isObject(raw.to) ? raw.to : idToRef(raw.to);
+  if (!isObject(fromRef) || !isObject(toRef)) return null;
+  if (!str(fromRef.sessionId) || !str(toRef.sessionId)) return null;
+  const kind = raw.kind === 'reference' ? 'reference' : 'link';
+  const id = str(raw.id)
+    || `${kind}:${refToId(fromRef) || fromRef.sessionId}->${refToId(toRef) || toRef.sessionId}`;
+  return {
+    id,
+    kind,
+    from: { sessionId: str(fromRef.sessionId), ...(fromRef.turn ? { turn: Number(fromRef.turn) } : {}) },
+    to: { sessionId: str(toRef.sessionId), ...(toRef.turn ? { turn: Number(toRef.turn) } : {}) },
+    ...(raw.label ? { label: str(raw.label).slice(0, LIMITS.labelLength) } : {}),
+    createdAt: Number.isFinite(Number(raw.createdAt)) ? Number(raw.createdAt) : now,
+    updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : now
+  };
+};
+
+/**
+ * 把任意外来记录规整成合法状态。
+ * @returns {object|null} 版本不认识时返回 null（调用方据此拒绝应用，而不是猜）
+ */
+export function sanitizeState(raw, now = 0) {
+  if (!isObject(raw)) return null;
+  const version = Number(raw.version);
+  if (version !== STATE_VERSION) return null;
+
+  const viewport = isObject(raw.viewport)
+    ? {
+      zoom: clampNumber(raw.viewport.zoom, 0.25, 2, 1),
+      panX: clampNumber(raw.viewport.panX, -1e6, 1e6, 0),
+      panY: clampNumber(raw.viewport.panY, -1e6, 1e6, 0)
+    }
+    : null;
+
+  return {
+    version: STATE_VERSION,
+    links: (Array.isArray(raw.links) ? raw.links : [])
+      .slice(0, LIMITS.links).map((l) => sanitizeLink(l, now)).filter(Boolean),
+    positions: capObject(raw.positions, LIMITS.positions, (v) => {
+      if (!isObject(v)) return null;
+      const x = Number(v.x);
+      const y = Number(v.y);
+      return Number.isFinite(x) && Number.isFinite(y) ? { x: Math.round(x), y: Math.round(y) } : null;
+    }),
+    viewport,
+    collapsedSessions: uniqStrings(raw.collapsedSessions, LIMITS.collapsedSessions),
+    hiddenBlocks: uniqStrings(raw.hiddenBlocks, LIMITS.hiddenBlocks),
+    alias: capObject(raw.alias, LIMITS.alias, (v) => {
+      const text = str(v).trim().slice(0, LIMITS.aliasLength);
+      return text === '' ? null : text;
+    }),
+    updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : now
+  };
+}
+
+function clampNumber(v, lo, hi, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(hi, Math.max(lo, n));
+}
+
+/* -------------------------------------------------------- 增量合并 */
+
+/**
+ * 把客户端提交的增量并进状态。**纯函数**，不改原对象。
+ *
+ * 约定：patch 里出现的键才动，未出现的保持不变；
+ * 传 `null` 表示清空该键（例如删除一条连线用 links 的完整列表覆盖）。
+ *
+ * @param {object} state 已规整的状态
+ * @param {object} patch 客户端增量
+ * @param {number} now
+ */
+export function mergePatch(state, patch, now = 0) {
+  const base = sanitizeState(state, now) || emptyState(now);
+  if (!isObject(patch)) return base;
+  const next = { ...base, version: STATE_VERSION, updatedAt: now };
+
+  if ('hiddenBlocks' in patch) {
+    next.hiddenBlocks = uniqStrings(patch.hiddenBlocks, LIMITS.hiddenBlocks);
+  }
+  if ('alias' in patch) {
+    next.alias = capObject(patch.alias, LIMITS.alias, (v) => {
+      const text = str(v).trim().slice(0, LIMITS.aliasLength);
+      return text === '' ? null : text;
+    });
+  }
+  if ('positions' in patch) {
+    next.positions = capObject(patch.positions, LIMITS.positions, (v) => {
+      if (!isObject(v)) return null;
+      const x = Number(v.x);
+      const y = Number(v.y);
+      return Number.isFinite(x) && Number.isFinite(y) ? { x: Math.round(x), y: Math.round(y) } : null;
+    });
+  }
+  if ('collapsedSessions' in patch) {
+    next.collapsedSessions = uniqStrings(patch.collapsedSessions, LIMITS.collapsedSessions);
+  }
+  if ('viewport' in patch) {
+    next.viewport = isObject(patch.viewport)
+      ? {
+        zoom: clampNumber(patch.viewport.zoom, 0.25, 2, 1),
+        panX: clampNumber(patch.viewport.panX, -1e6, 1e6, 0),
+        panY: clampNumber(patch.viewport.panY, -1e6, 1e6, 0)
+      }
+      : null;
+  }
+  if ('links' in patch) {
+    const incoming = (Array.isArray(patch.links) ? patch.links : [])
+      .slice(0, LIMITS.links).map((l) => sanitizeLink(l, now)).filter(Boolean);
+    /* 按 id 覆盖式合并：同一 id 视为更新，其它保留 —— 这样客户端可以只发变化的那几条 */
+    const byId = new Map(base.links.map((l) => [l.id, l]));
+    incoming.forEach((l) => {
+      const prev = byId.get(l.id);
+      byId.set(l.id, prev ? { ...prev, ...l, createdAt: prev.createdAt, updatedAt: now } : l);
+    });
+    next.links = [...byId.values()].slice(0, LIMITS.links);
+  }
+  if (Array.isArray(patch.removeLinkIds) && patch.removeLinkIds.length) {
+    const drop = new Set(patch.removeLinkIds.map(str));
+    next.links = next.links.filter((l) => !drop.has(l.id));
+  }
+  return next;
+}
+
+/* ------------------------------------------------- 两侧形态的转换 */
+
+/** 持久形态 → 客户端内部形态（端点换成字符串 id） */
+export function stateToClient(state) {
+  const s = sanitizeState(state, 0) || emptyState(0);
+  const hidden = {};
+  s.hiddenBlocks.forEach((id) => { hidden[id] = true; });
+  const positions = {};
+  Object.entries(s.positions).forEach(([id, p]) => { positions[id] = { x: p.x, y: p.y }; });
+  return {
+    version: s.version,
+    hidden,
+    alias: { ...s.alias },
+    positions,
+    viewport: s.viewport ? { ...s.viewport } : null,
+    collapsedSessions: [...s.collapsedSessions],
+    links: s.links.map((l) => ({
+      id: l.id,
+      kind: l.kind,
+      from: refToId(l.from),
+      to: refToId(l.to),
+      ...(l.label ? { label: l.label } : {})
+    }))
+  };
+}
+
+/** 客户端增量 → 持久形态增量 */
+export function clientPatchToState(patch) {
+  if (!isObject(patch)) return {};
+  const out = {};
+  if ('hidden' in patch) {
+    out.hiddenBlocks = Object.entries(isObject(patch.hidden) ? patch.hidden : {})
+      .filter(([, on]) => !!on).map(([id]) => str(id));
+  }
+  if ('alias' in patch) out.alias = isObject(patch.alias) ? patch.alias : {};
+  if ('positions' in patch) out.positions = isObject(patch.positions) ? patch.positions : {};
+  if ('viewport' in patch) out.viewport = patch.viewport;
+  if ('collapsedSessions' in patch) {
+    out.collapsedSessions = Array.isArray(patch.collapsedSessions) ? patch.collapsedSessions : [];
+  }
+  if ('links' in patch) {
+    out.links = (Array.isArray(patch.links) ? patch.links : []).map((l) => ({
+      ...l,
+      from: isObject(l.from) ? l.from : idToRef(l.from),
+      to: isObject(l.to) ? l.to : idToRef(l.to)
+    })).filter((l) => l.from && l.to);
+  }
+  if (Array.isArray(patch.removeLinkIds)) out.removeLinkIds = patch.removeLinkIds;
+  /* 落盘前先过一遍规整，别把畸形数据写进去 */
+  const cleaned = {};
+  const normalized = mergePatch(emptyState(0), out, 0);
+  if ('hiddenBlocks' in out) cleaned.hiddenBlocks = normalized.hiddenBlocks;
+  if ('alias' in out) cleaned.alias = normalized.alias;
+  if ('positions' in out) cleaned.positions = normalized.positions;
+  if ('viewport' in out) cleaned.viewport = normalized.viewport;
+  if ('collapsedSessions' in out) cleaned.collapsedSessions = normalized.collapsedSessions;
+  if ('links' in out) cleaned.links = normalized.links;
+  if (out.removeLinkIds) cleaned.removeLinkIds = out.removeLinkIds;
+  return cleaned;
+}
+
+/* ------------------------------------------------------------ 其他 */
+
+/** 状态里引用了哪些会话 —— 家族判定与清理用得上 */
+export function sessionsInState(state) {
+  const s = sanitizeState(state, 0);
+  if (!s) return [];
+  const ids = new Set();
+  s.links.forEach((l) => { ids.add(l.from.sessionId); ids.add(l.to.sessionId); });
+  s.hiddenBlocks.forEach((id) => { const r = idToRef(id); if (r) ids.add(r.sessionId); });
+  Object.keys(s.alias).forEach((id) => { const r = idToRef(id); if (r) ids.add(r.sessionId); });
+  s.collapsedSessions.forEach((id) => ids.add(id));
+  return [...ids];
+}

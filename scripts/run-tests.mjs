@@ -12,7 +12,12 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const suites = ['../test/core.test.mjs', '../test/host.test.mjs', '../test/client.test.mjs'];
+const suites = [
+  '../test/core.test.mjs',
+  '../test/state.test.mjs',
+  '../test/host.test.mjs',
+  '../test/client.test.mjs'
+];
 
 let failed = false;
 for (const rel of suites) {

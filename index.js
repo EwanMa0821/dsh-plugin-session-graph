@@ -13,7 +13,9 @@
 
 import { normalizeSessions, buildGraph } from './src/core/model.js';
 import { render } from './src/core/export.js';
+import { stateToClient } from './src/core/state.js';
 import { foldTurns, linkForks } from './src/host/fold.js';
+import { openStore } from './src/host/store.js';
 
 export const name = 'dsh-plugin-session-graph';
 
@@ -138,7 +140,7 @@ async function readTurns(query, rec) {
 
 /* ------------------------------------------------------------ 请求处理 */
 
-export async function buildPayload(ctx, params, limits) {
+export async function buildPayload(ctx, params, limits, store) {
   const currentId = params.get('sessionId') || '';
   if (!currentId) throw Object.assign(new Error('缺少 sessionId'), { status: 400 });
 
@@ -154,11 +156,19 @@ export async function buildPayload(ctx, params, limits) {
     throw Object.assign(new Error('sessionId 不在可读会话中'), { status: 404 });
   }
 
+  /* 持久化状态按**家族根**分片（§5.3）。家族的根在这里算：往上走到没有父会话为止。 */
+  const familyRootId = rootOf(sessions, currentId);
+  const stored = store ? await store.read(familyRootId) : null;
+  const saved = stored && stored.state ? stateToClient(stored.state) : null;
+
+  /* 存档里的隐藏与别名是基线，请求参数是本次会话的覆盖 —— 两者合并后再建图，
+     否则刷新之后界面会与存档对不上。 */
+  const hidden = { ...(saved ? saved.hidden : {}), ...parseMap(params.get('hidden')) };
+  const alias = { ...(saved ? saved.alias : {}), ...parseMap(params.get('alias')) };
+  const links = (saved && saved.links) || [];
+
   const graph = buildGraph({
-    sessions, turnsBySession, currentId,
-    includeHidden,
-    hidden: parseMap(params.get('hidden')),
-    alias: parseMap(params.get('alias'))
+    sessions, turnsBySession, currentId, includeHidden, hidden, alias, links
   });
 
   if (limits && limits.maxBlocks && graph.stats.blocks > limits.maxBlocks) {
@@ -170,7 +180,7 @@ export async function buildPayload(ctx, params, limits) {
       contentType: 'application/json; charset=utf-8',
       body: JSON.stringify({
         version: graph.version,
-        rootId: graph.rootId,
+        rootId: familyRootId,
         currentId: graph.currentId,
         order: graph.order,
         notes: graph.notes,
@@ -179,20 +189,36 @@ export async function buildPayload(ctx, params, limits) {
         blocks: graph.blocks,
         edges: graph.edges,
         /* 各会话的轮次明细，供客户端给"其他会话"也画出块（FR-3） */
-        turns: turnsBySession
+        turns: turnsBySession,
+        /* 持久化状态：客户端拿它初始化隐藏/别名/连线/布局；writable 为 false 时只读 */
+        state: saved,
+        writable: !!(store && stored && stored.writable),
+        incompatible: !!(stored && stored.incompatible)
       }),
       /* json 是给视图取数用的，不触发下载 */
       download: false
     };
   }
 
-  const out = render(graph, format, {});
+  const out = render(graph, format, { links });
   return {
     contentType: format === 'mm' ? 'application/xml; charset=utf-8' : 'text/markdown; charset=utf-8',
     body: out.content,
     download: true,
     filename: out.filename
   };
+}
+
+/** 家族根：沿 parentId 一路向上；血环或断链时兜底为当前会话 */
+export function rootOf(sessions, currentId) {
+  const byId = new Map(sessions.map((s) => [s.id, s]));
+  const seen = new Set();
+  let cur = byId.get(currentId);
+  while (cur && cur.parentId && byId.has(cur.parentId) && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    cur = byId.get(cur.parentId);
+  }
+  return cur ? cur.id : currentId;
 }
 
 function parseMap(value) {
@@ -213,22 +239,34 @@ export function apply(ctx, config) {
     maxBlocks: numberOr(config && config.maxBlocks, 3000)
   };
 
+  /* 存储句柄放在闭包里，路由注册在前、存储打开在后。
+     顺序很要紧：打开存储要走异步的领域设施，万一它挂住，路由就永远注册不上，
+     浏览器侧只会看到一个 404 而无从判断。先让路由一定在位，再补上持久化。 */
+  const holder = { store: null, ready: false };
+
   const register = (scoped) => {
     const conn = service(scoped, 'connection');
     if (!conn || !conn.fetch || typeof conn.fetch.register !== 'function') return;
     conn.fetch.register({
       path: ROUTE,
-      methods: ['GET', 'HEAD'],
+      methods: ['GET', 'HEAD', 'POST'],
       requestBody: 'buffered',
       fetch: async (request) => {
-        const response = await respond(ctx, request, limits);
-        if (request.method === 'GET') return response;
+        const response = request.method === 'POST'
+          ? await respondWrite(holder, request)
+          : await respondRead(holder, ctx, request, limits);
+        if (request.method !== 'HEAD') return response;
         /* HEAD 是浏览器的下载预检：取消响应体，只回状态与响应头 */
         if (response.body && typeof response.body.cancel === 'function') {
           await response.body.cancel();
         }
         return new Response(null, { status: response.status, headers: response.headers });
       }
+    });
+    /* 路由已在位，再去开存储；失败只是降级为只读，不影响上面这条注册 */
+    void openStore(service(scoped, 'storageDomain')).then((store) => {
+      holder.store = store;
+      holder.ready = true;
     });
   };
 
@@ -237,10 +275,10 @@ export function apply(ctx, config) {
   else register(ctx);
 }
 
-async function respond(ctx, request, limits) {
+async function respondRead(holder, ctx, request, limits) {
   let result;
   try {
-    result = await buildPayload(ctx, new URL(request.url).searchParams, limits);
+    result = await buildPayload(ctx, new URL(request.url).searchParams, limits, holder.store);
   } catch (error) {
     return text(String((error && error.message) || error), (error && error.status) || 503);
   }
@@ -251,6 +289,42 @@ async function respond(ctx, request, limits) {
       `attachment; filename="session-graph"; filename*=UTF-8''${encodeURIComponent(result.filename)}`;
   }
   return new Response(result.body, { status: 200, headers });
+}
+
+/**
+ * 写入：客户端把界面偏好与手动连线以增量形式提交上来。
+ *
+ * 请求体：`{ familyRootId, patch }`。整体按 §5.3 的 schema 落进领域表。
+ */
+async function respondWrite(holder, request) {
+  if (!holder.ready) {
+    return json({ ok: false, writable: false, reason: '存储尚未就绪' }, 503);
+  }
+  if (!holder.store) {
+    return json({ ok: false, writable: false, reason: '存储不可用，当前为只读模式' }, 503);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, reason: '请求体不是合法 JSON' }, 400);
+  }
+  const familyId = String((body && body.familyRootId) || '');
+  if (familyId === '') return json({ ok: false, reason: '缺少 familyRootId' }, 400);
+  try {
+    const state = await holder.store.write(familyId, (body && body.patch) || {});
+    return json({ ok: true, writable: true, state }, 200);
+  } catch (error) {
+    const code = error && error.code === 'incompatible-version' ? 409 : 503;
+    return json({ ok: false, reason: String((error && error.message) || error) }, code);
+  }
+}
+
+function json(payload, status) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8' }
+  });
 }
 
 function numberOr(v, d) {

@@ -10,3 +10,6 @@ prototype/
 Thumbs.db
 *.log
 *.tmp
+
+# 从 app.asar 提取的参考源码，仅供本地查阅
+.ref/

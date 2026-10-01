@@ -342,10 +342,9 @@ function captureRoute(over = {}) {
   return registered[0];
 }
 
-test('apply 注册 GET/HEAD 路由，路径与预检方法正确', () => {
+test('apply 注册路由，路径与请求体处理方式正确', () => {
   const route = captureRoute();
   assert.equal(route.path, '/api/session.graph-export');
-  assert.deepEqual(route.methods, ['GET', 'HEAD']);
   assert.equal(route.requestBody, 'buffered');
   assert.equal(typeof route.fetch, 'function');
 });
@@ -415,4 +414,163 @@ test('json 格式不带 content-disposition，避免误触发下载', async () =
     'http://x/api/session.graph-export?sessionId=root&format=json'));
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('content-disposition'), null);
+});
+
+/* ----------------------------------------------------------- 持久化 */
+
+const settle = () => new Promise((r) => setTimeout(r, 0));
+
+/** 假的存储域设施；`fail` 为真时 open 直接抛（模拟 backend-not-found） */
+function fakeStorageDomain(records = new Map(), fail = false) {
+  return {
+    records,
+    open: async () => {
+      if (fail) throw new Error('backend-not-found');
+      return {
+        table: () => ({
+          get: (k) => records.get(k),
+          put: async (k, v) => { records.set(k, v); },
+          delete: async (k) => records.delete(k)
+        }),
+        close: async () => {}
+      };
+    }
+  };
+}
+
+const postBody = (payload) => new Request('http://x/api/session.graph-export', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify(payload)
+});
+
+test('路由同时声明 GET / HEAD / POST，且请求体是缓冲型的', () => {
+  const route = captureRoute();
+  assert.deepEqual(route.methods, ['GET', 'HEAD', 'POST']);
+  assert.equal(route.requestBody, 'buffered');
+});
+
+test('POST 把增量写进存储域，并回传合并后的状态', async () => {
+  const domain = fakeStorageDomain();
+  const route = captureRoute({ storageDomain: domain });
+  await settle();
+
+  const res = await route.fetch(postBody({
+    familyRootId: 'root',
+    patch: { hiddenBlocks: ['root:1'], alias: { 'root:2': '别名' } }
+  }));
+  assert.equal(res.status, 200);
+  const data = await res.json();
+  assert.equal(data.ok, true);
+  assert.equal(data.writable, true);
+  assert.deepEqual(data.state.hiddenBlocks, ['root:1']);
+  assert.deepEqual(data.state.alias, { 'root:2': '别名' });
+  assert.equal(domain.records.size, 1, '按家族根分片，只写了一条记录');
+});
+
+test('两次 POST 是累加的：清空别名不会带走隐藏标记', async () => {
+  const domain = fakeStorageDomain();
+  const route = captureRoute({ storageDomain: domain });
+  await settle();
+
+  await route.fetch(postBody({ familyRootId: 'root', patch: { hiddenBlocks: ['root:1'] } }));
+  const res = await route.fetch(postBody({ familyRootId: 'root', patch: { alias: {} } }));
+  const data = await res.json();
+  assert.deepEqual(data.state.hiddenBlocks, ['root:1'], '第一次写的还在');
+});
+
+test('存档里的隐藏标记真的参与建图 —— 刷新后界面与存档一致', async () => {
+  const domain = fakeStorageDomain(new Map([
+    ['root', { version: 1, links: [], positions: {}, alias: {}, collapsedSessions: [], hiddenBlocks: ['root:1'] }]
+  ]));
+  const route = captureRoute({ storageDomain: domain });
+  await settle();
+
+  const res = await route.fetch(new Request(
+    'http://x/api/session.graph-export?sessionId=root&format=json'));
+  const data = await res.json();
+  assert.equal(data.stats.hiddenSkipped, 1, '存档里藏了一块');
+  assert.equal(data.stats.blocks, 3, '建图时就没把它算进去');
+  assert.equal(data.state.hidden['root:1'], true, '状态以客户端形态回传');
+  assert.equal(data.writable, true);
+});
+
+test('存储域不可用时降级为只读：GET 照常，POST 明确拒绝（§5.3）', async () => {
+  const route = captureRoute({ storageDomain: fakeStorageDomain(new Map(), true) });
+  await settle();
+
+  const read = await route.fetch(new Request(
+    'http://x/api/session.graph-export?sessionId=root&format=json'));
+  assert.equal(read.status, 200, '只读模式下读取不受影响');
+  assert.equal((await read.json()).writable, false);
+
+  const write = await route.fetch(postBody({ familyRootId: 'root', patch: { hiddenBlocks: ['root:1'] } }));
+  assert.equal(write.status, 503);
+  assert.equal((await write.json()).writable, false);
+});
+
+test('压根没有存储域时同样是只读，而不是报错', async () => {
+  const route = captureRoute();
+  await settle();
+  const res = await route.fetch(new Request(
+    'http://x/api/session.graph-export?sessionId=root&format=json'));
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).writable, false);
+});
+
+test('未来版本的记录：报不兼容且拒绝覆盖', async () => {
+  const future = { version: 99, links: [], positions: {}, alias: {}, hiddenBlocks: [] };
+  const domain = fakeStorageDomain(new Map([['root', future]]));
+  const route = captureRoute({ storageDomain: domain });
+  await settle();
+
+  const read = await route.fetch(new Request(
+    'http://x/api/session.graph-export?sessionId=root&format=json'));
+  const data = await read.json();
+  assert.equal(data.incompatible, true);
+  assert.equal(data.writable, false);
+  assert.equal(data.state, null);
+
+  const write = await route.fetch(postBody({ familyRootId: 'root', patch: { hiddenBlocks: ['root:1'] } }));
+  assert.equal(write.status, 409, '用 409 表示版本冲突，而不是服务不可用');
+  assert.deepEqual(domain.records.get('root'), future, '原记录一字未动');
+});
+
+test('POST 的坏输入各有明确答复', async () => {
+  const route = captureRoute({ storageDomain: fakeStorageDomain() });
+  await settle();
+
+  const noJson = await route.fetch(new Request('http://x/api/session.graph-export', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: 'not json'
+  }));
+  assert.equal(noJson.status, 400);
+
+  const noFamily = await route.fetch(postBody({ patch: {} }));
+  assert.equal(noFamily.status, 400);
+  assert.match(String((await noFamily.json()).reason), /familyRootId/);
+});
+
+test('导出文件会带上存档里的手动连线（FR-15）', async () => {
+  const domain = fakeStorageDomain(new Map([
+    ['root', {
+      version: 1,
+      positions: {},
+      alias: {},
+      collapsedSessions: [],
+      hiddenBlocks: [],
+      links: [{
+        id: 'L1', kind: 'link',
+        from: { sessionId: 'root', turn: 1 }, to: { sessionId: 'child', turn: 1 },
+        label: '因为'
+      }]
+    }]
+  ]));
+  const route = captureRoute({ storageDomain: domain });
+  await settle();
+
+  const res = await route.fetch(new Request(
+    'http://x/api/session.graph-export?sessionId=root&format=mm'));
+  const body = await res.text();
+  assert.match(body, /<arrowlink DESTINATION="ID_\d+"/, '手动连线导出成箭头链接');
+  assert.match(body, /因为/, '连线标签进了根备注');
 });
