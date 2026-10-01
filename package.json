@@ -1,0 +1,65 @@
+{
+  "name": "dsh-plugin-session-graph",
+  "version": "0.1.0",
+  "description": "会话图谱：把 DSH 会话组织成块与连线的图谱视图，点块分叉，并导出为思维导图",
+  "type": "module",
+  "license": "MIT",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/zh.json": "./locale/zh.json",
+    "./locale/en.json": "./locale/en.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "src",
+    "locale",
+    "scripts/build-client.mjs",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node scripts/run-tests.mjs",
+    "build:client": "node scripts/build-client.mjs",
+    "check": "node scripts/check-package.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "mindmap",
+    "session-graph"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EwanMa0821/dsh-plugin-session-graph.git"
+  },
+  "homepage": "https://github.com/EwanMa0821/dsh-plugin-session-graph#readme",
+  "bugs": {
+    "url": "https://github.com/EwanMa0821/dsh-plugin-session-graph/issues"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": "^0.2.0-rc.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "meta": {
+    "title": "会话图谱",
+    "description": "把会话组织成块与连线的图谱视图；点块分叉，并可导出为思维导图"
+  }
+}

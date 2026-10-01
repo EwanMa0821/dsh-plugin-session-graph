@@ -1,0 +1,14 @@
+# 全部以 LF 存储与检出。
+#
+# client.js 是提交进仓库的生成物，scripts/check-package.mjs 会逐字节比对
+# 「重新生成的内容」与「仓库里已提交的内容」。行尾一旦被平台改写，
+# 这个校验就会在别的机器上误报"产物已过期"。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary

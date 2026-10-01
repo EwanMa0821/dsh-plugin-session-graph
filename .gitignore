@@ -1,0 +1,12 @@
+# 依赖与产物
+node_modules/
+
+# 设计资料不进公开仓库 —— 仓库只放插件本体
+docs/
+prototype/
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+*.log
+*.tmp

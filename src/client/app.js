@@ -1,0 +1,746 @@
+/* ============================================================
+   会话图谱 · 客户端应用
+   本文件由 scripts/build-client.mjs 原样追加到生成的 client.js 中，
+   运行在 __ModuleLoader__ 的 factory 作用域里，因此可以直接使用
+   上面已经内联的核心函数（buildGraph / layout / render ...）。
+
+   约束（NFR-2）：只用 --dsw-* 主题变量；不 import 任何宿主客户端包；
+   不向 document.body 追加；样式以 React 元素渲染，随组件卸载移除。
+   ============================================================ */
+
+const NS = 'dsh-plugin-session-graph';
+const TARGET = 'session-graph';
+const VIEW_ORDER = 20;
+
+const CSS = `
+.sg-root{position:absolute;inset:0;display:flex;font-family:inherit;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-base);user-select:none;-webkit-user-select:none}
+.sg-canvas-wrap{flex:1;min-width:0;position:relative;overflow:hidden;user-select:none;-webkit-user-select:none;
+  cursor:grab;
+  background-image:radial-gradient(var(--dsw-alias-border-l2) 1px,transparent 1px);background-size:22px 22px}
+.sg-canvas-wrap.sg-panning{cursor:grabbing}
+.sg-world{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform}
+.sg-world svg{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}
+.sg-e-branch{fill:none;stroke:var(--dsw-alias-label-dimmed);stroke-width:1.6}
+.sg-e-link{fill:none;stroke:var(--dsw-alias-state-business-primary);stroke-width:1.6;stroke-dasharray:6 5}
+.sg-e-ref{fill:none;stroke:var(--dsw-alias-label-caption);stroke-width:1.7;stroke-dasharray:1.5 4.5}
+.sg-node{position:absolute;border-radius:var(--dsw-radius-md,12px);background:var(--dsw-alias-bg-layer-1);
+  box-shadow:var(--dsw-elevation-stroke);padding:8px 11px;display:flex;flex-direction:column;gap:3px;
+  cursor:grab;user-select:none;transition:background .12s,box-shadow .12s}
+.sg-node:hover{background:var(--dsw-alias-bg-layer-2)}
+.sg-node:focus-visible{outline:none;box-shadow:0 0 0 2px var(--dsw-alias-state-business-primary),var(--dsw-elevation-panel)}
+.sg-node.sg-current{border-left:3px solid var(--dsw-alias-state-business-primary);padding-left:9px}
+.sg-node.sg-selected{box-shadow:0 0 0 2px var(--dsw-alias-state-business-primary),var(--dsw-elevation-panel)}
+.sg-node.sg-hidden{opacity:.28;border:1.5px dashed var(--dsw-alias-border-l4);background:transparent}
+.sg-node.sg-empty{cursor:default;border:1.5px dashed var(--dsw-alias-border-l4);background:transparent;
+  box-shadow:none;display:grid;place-items:center;text-align:center;font-size:11.5px;
+  color:var(--dsw-alias-label-caption);pointer-events:none}
+.sg-hd{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dsw-alias-label-caption)}
+.sg-hd .sg-turn{font-weight:600}
+.sg-hd .sg-dot{width:5px;height:5px;border-radius:50%;background:var(--dsw-alias-state-success-primary)}
+.sg-hd .sg-dot.sg-open{background:var(--dsw-alias-state-warn-primary)}
+.sg-hd .sg-dot.sg-failed{background:var(--dsw-alias-state-error-primary)}
+.sg-hd .sg-sp{flex:1}
+.sg-badge{display:inline-flex;align-items:center;gap:3px;height:15px;padding:0 5px;border-radius:4px;
+  background:var(--dsw-alias-markdown-tag);font-size:10.5px;color:var(--dsw-alias-label-tertiary)}
+.sg-ask{font-size:12.5px;color:var(--dsw-alias-label-primary);line-height:1.35;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.sg-ans{font-size:11.5px;color:var(--dsw-alias-label-tertiary);line-height:1.35;overflow:hidden;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.sg-label{position:absolute;height:26px;display:flex;align-items:center;gap:7px;padding:0 9px;border-radius:7px;
+  background:var(--dsw-alias-bg-layer-2);border:.5px solid var(--dsw-alias-border-l2);white-space:nowrap;
+  cursor:pointer;user-select:none;font-size:12px}
+.sg-label.sg-current{background:var(--dsw-alias-state-business-tertiary);border-color:transparent}
+.sg-label .sg-sdot{width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-label-caption)}
+.sg-label.sg-current .sg-sdot{background:var(--dsw-alias-state-business-primary)}
+.sg-label .sg-st{font-weight:600;color:var(--dsw-alias-label-primary);max-width:210px;overflow:hidden;
+  text-overflow:ellipsis}
+.sg-label .sg-sm{color:var(--dsw-alias-label-caption);font-size:11px}
+.sg-tools{position:absolute;top:12px;right:12px;display:flex;align-items:center;gap:4px;padding:4px;
+  border-radius:10px;background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-elevation-panel);z-index:8}
+.sg-btn{height:26px;padding:0 9px;border:none;border-radius:7px;background:transparent;cursor:pointer;
+  font:inherit;font-size:12px;color:var(--dsw-alias-label-secondary);display:inline-flex;align-items:center;gap:5px}
+.sg-btn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.sg-btn.sg-on{background:var(--dsw-alias-interactive-bg-active);color:var(--dsw-alias-label-primary)}
+.sg-zoom{font-size:11.5px;color:var(--dsw-alias-label-caption);padding:0 6px;font-variant-numeric:tabular-nums}
+.sg-hint{position:absolute;left:12px;bottom:12px;font-size:11.5px;color:var(--dsw-alias-label-caption);
+  background:var(--dsw-alias-bg-layer-1);border-radius:7px;padding:5px 10px;box-shadow:var(--dsw-elevation-stroke);z-index:8}
+.sg-hint-warn{left:auto;right:12px;bottom:12px;color:var(--dsw-alias-state-warn-primary)}
+.sg-side{width:330px;flex:0 0 330px;border-left:.5px solid var(--dsw-alias-border-l1);display:flex;
+  flex-direction:column;min-height:0;user-select:text;-webkit-user-select:text}
+.sg-side-hd{padding:13px 15px 11px;border-bottom:.5px solid var(--dsw-alias-border-l1);display:flex;
+  align-items:center;gap:8px}
+.sg-side-hd .sg-t{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}
+.sg-side-hd .sg-s{font-size:11.5px;color:var(--dsw-alias-label-caption);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;max-width:150px}
+.sg-x{margin-left:auto;border:none;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;
+  font-size:15px;padding:2px 5px;border-radius:5px}
+.sg-x:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.sg-side-bd{flex:1;overflow-y:auto;padding:14px 15px;min-height:0}
+.sg-sec{margin-bottom:15px}
+.sg-sec .sg-lb{font-size:11px;font-weight:600;letter-spacing:.05em;color:var(--dsw-alias-label-caption);
+  margin-bottom:6px}
+.sg-sec .sg-tx{font-size:12.5px;line-height:1.6;color:var(--dsw-alias-label-secondary);word-break:break-word}
+.sg-sec .sg-tx.sg-strong{color:var(--dsw-alias-label-primary)}
+.sg-meta{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-size:12px}
+.sg-meta .sg-k{color:var(--dsw-alias-label-caption)}
+.sg-meta .sg-v{color:var(--dsw-alias-label-secondary);text-align:right}
+.sg-acts{display:flex;flex-direction:column;gap:7px}
+.sg-act{height:34px;border-radius:var(--dsw-radius-sm,8px);border:.5px solid var(--dsw-alias-border-l2);
+  background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font:inherit;font-size:12.5px;
+  cursor:pointer;display:flex;align-items:center;gap:9px;padding:0 11px;text-align:left}
+.sg-act:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.sg-act.sg-primary{background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-on-brand,#fff);
+  border-color:transparent;font-weight:600}
+.sg-act:disabled{opacity:.45;cursor:not-allowed}
+.sg-emptybox{padding:30px 18px;text-align:center;font-size:12.5px;color:var(--dsw-alias-label-caption);line-height:1.7}
+.sg-err{margin:16px;padding:12px;border-radius:var(--dsw-radius-sm,8px);border:.5px solid var(--dsw-alias-border-l2);
+  background:var(--dsw-alias-bg-layer-1);font-size:12.5px;color:var(--dsw-alias-label-secondary)}
+.sg-mask{position:absolute;inset:0;background:var(--dsw-alias-bg-mask-1,#0000003d);display:grid;place-items:center;z-index:20}
+.sg-dlg{width:760px;max-width:calc(100% - 40px);max-height:calc(100% - 40px);display:flex;flex-direction:column;
+  background:var(--dsw-alias-bg-layer-1);border-radius:var(--dsw-radius-lg,16px);
+  box-shadow:var(--dsw-elevation-prominent);overflow:hidden}
+.sg-dlg-hd{padding:14px 16px 12px;border-bottom:.5px solid var(--dsw-alias-border-l1);display:flex;align-items:center;gap:9px}
+.sg-dlg-hd .sg-t{font-size:13.5px;font-weight:600;color:var(--dsw-alias-label-primary)}
+.sg-dlg-hd .sg-s{font-size:11.5px;color:var(--dsw-alias-label-caption)}
+.sg-dlg-bd{padding:14px 16px;overflow-y:auto;min-height:0}
+.sg-row{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.sg-row .sg-lb{font-size:12px;color:var(--dsw-alias-label-caption);width:56px;flex:0 0 56px}
+.sg-seg{display:inline-flex;padding:3px;border-radius:9px;background:var(--dsw-alias-bg-module-platform);gap:3px}
+.sg-seg button{height:28px;padding:0 12px;border:none;border-radius:7px;background:transparent;cursor:pointer;
+  font:inherit;font-size:12.5px;color:var(--dsw-alias-label-secondary)}
+.sg-seg button[aria-pressed="true"]{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);
+  font-weight:600;box-shadow:var(--dsw-elevation-stroke)}
+.sg-chk{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--dsw-alias-label-secondary)}
+.sg-prev{border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm,8px);
+  background:var(--dsw-alias-bg-module-platform);padding:11px 13px;font-family:ui-monospace,Consolas,monospace;
+  font-size:11.5px;line-height:1.65;color:var(--dsw-alias-label-secondary);white-space:pre;overflow:auto;max-height:280px}
+.sg-dlg-ft{padding:11px 16px;border-top:.5px solid var(--dsw-alias-border-l1);display:flex;align-items:center;gap:9px}
+.sg-dlg-ft .sg-hi{flex:1;font-size:11.5px;color:var(--dsw-alias-label-caption)}
+.sg-bigbtn{height:32px;padding:0 15px;border-radius:var(--dsw-radius-sm,8px);cursor:pointer;font:inherit;
+  font-size:12.5px;border:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);
+  color:var(--dsw-alias-label-secondary)}
+.sg-bigbtn.sg-primary{background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-on-brand,#fff);
+  border-color:transparent;font-weight:600}
+`;
+
+/* ------------------------------------------------------------ 小工具 */
+
+/** 订阅一个快照源。只依赖 { getSnapshot, subscribe } 这两个方法。 */
+function useSource(source) {
+  const [value, setValue] = React.useState(() => {
+    try { return source && source.getSnapshot ? source.getSnapshot() : undefined; } catch { return undefined; }
+  });
+  React.useEffect(() => {
+    if (!source || typeof source.subscribe !== 'function') return undefined;
+    let alive = true;
+    const pull = () => { if (alive) { try { setValue(source.getSnapshot()); } catch { /* 源暂时不可读 */ } } };
+    pull();
+    const off = source.subscribe(pull);
+    return () => { alive = false; if (typeof off === 'function') off(); };
+  }, [source]);
+  return value;
+}
+
+/** 会话列表快照 → 数组。宿主可能给它套好几层壳，这里尽量都认。 */
+function listOf(snapshot) {
+  if (!snapshot) return [];
+  if (Array.isArray(snapshot)) return snapshot;
+  for (const key of ['items', 'sessions', 'rows', 'list', 'entries']) {
+    if (Array.isArray(snapshot[key])) return snapshot[key];
+  }
+  if (snapshot.byId && typeof snapshot.byId === 'object') return Object.values(snapshot.byId);
+  return [];
+}
+
+/** 当前会话 id：优先用槽位注入给的，缺失时从会话目录里找一个像样的 */
+function resolveSessionId(props, snapshot) {
+  if (props && props.sessionId) return props.sessionId;
+  const sessions = props && props.sessions;
+  if (sessions) {
+    for (const key of ['current', 'currentId', 'activeId']) {
+      const v = typeof sessions[key] === 'function' ? sessions[key]() : sessions[key];
+      if (typeof v === 'string' && v) return v;
+    }
+  }
+  const list = listOf(snapshot);
+  const marked = list.find((s) => s && (s.current === true || s.active === true));
+  if (marked) return marked.id || marked.sessionId;
+  return list.length === 1 ? (list[0].id || list[0].sessionId) : '';
+}
+
+/* ------------------------------------------------------------ 主组件 */
+
+function GraphView(props) {
+  const { ctx, target, sessions } = props || {};
+  const listSnapshot = useSource(sessions && sessions.list);
+  const sessionId = resolveSessionId(props, listSnapshot);
+  const [selected, setSelected] = React.useState(null);
+  const [hidden, setHidden] = React.useState({});
+  const [alias, setAlias] = React.useState({});
+  const [links, setLinks] = React.useState([]);
+  const [showHidden, setShowHidden] = React.useState(false);
+  const [collapseOthers, setCollapseOthers] = React.useState(false);
+  const [view, setView] = React.useState({ scale: 1, panX: 24, panY: 20, fitted: false });
+  const [exportOpen, setExportOpen] = React.useState(false);
+  const [exportFmt, setExportFmt] = React.useState('mm');
+  const [exportHidden, setExportHidden] = React.useState(false);
+  const [toast, setToast] = React.useState('');
+  /* 只留一个"路由是否可用"的布尔量，给空态说人话用；不对外暴露状态码 */
+  const [routeOk, setRouteOk] = React.useState(true);
+  const hostRef = React.useRef(null);
+  const [size, setSize] = React.useState({ w: 900, h: 600 });
+
+  const graphSnapshot = useSource(target);
+
+  /* 视口尺寸：跟随容器，切换视图后回来仍正确 */
+  React.useEffect(() => {
+    const el = hostRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(() => {
+      setSize({ w: el.clientWidth || 900, h: el.clientHeight || 600 });
+    });
+    ro.observe(el);
+    setSize({ w: el.clientWidth || 900, h: el.clientHeight || 600 });
+    return () => ro.disconnect();
+  }, []);
+
+  /* 每次数据变化重建图模型 */
+  const sessionsNorm = React.useMemo(() => normalizeSessions(listOf(listSnapshot)), [listSnapshot]);
+  const sessionKey = sessionsNorm.map((s) => s.id).join(',');
+  const localTurns = React.useMemo(
+    () => turnsFromTimeline(graphSnapshot && graphSnapshot.timeline),
+    [graphSnapshot]
+  );
+
+  /* 家族里其他会话的轮次要向 Host 取（本地的装配器时间线只覆盖当前会话）。
+     取不到就退化成"只有当前会话有块"——家族骨架仍然完整。 */
+  const [remote, setRemote] = React.useState(null);
+  React.useEffect(() => {
+    if (!sessionId) return undefined;
+    let alive = true;
+    const url = '/api/session.graph-export'
+      + '?format=json'
+      + '&sessionId=' + encodeURIComponent(sessionId)
+      + (sessionKey ? '&sessions=' + encodeURIComponent(sessionKey) : '');
+    const carrier = typeof fetch === 'function' ? fetch : null;
+    if (!carrier) { setRouteOk(false); return undefined; }
+    carrier(url, { credentials: 'same-origin' })
+      .then((r) => {
+        if (!alive) return null;
+        setRouteOk(!!(r && r.ok));
+        return r && r.ok ? r.json() : null;
+      })
+      .then((data) => { if (alive && data && data.turns) setRemote(data.turns); })
+      .catch(() => { if (alive) setRouteOk(false); });
+    return () => { alive = false; };
+  }, [sessionId, sessionKey]);
+
+  const turnsBySession = React.useMemo(() => {
+    const out = { ...(remote || {}) };
+    if (!sessionId || !localTurns.length) return out;
+    /* 逐字段合并，而不是整条覆盖。
+       本地时间线更新更快，但它的轮次记录里**没有问答文本**（文本在 data 这个 Map 里，
+       按插件定义键存放），远程读的是原始事件、文本是齐的——
+       整条覆盖会把文本抹成空。 */
+    const byTurn = new Map((out[sessionId] || []).map((t) => [t.turn, t]));
+    localTurns.forEach((t) => {
+      const prev = byTurn.get(t.turn) || {};
+      byTurn.set(t.turn, {
+        ...prev,
+        ...t,
+        prompt: t.prompt || prev.prompt || '',
+        response: t.response || prev.response || '',
+        toolCalls: t.toolCalls || prev.toolCalls || 0,
+        deliverables: t.deliverables || prev.deliverables || 0
+      });
+    });
+    out[sessionId] = [...byTurn.values()].sort((a, b) => a.turn - b.turn);
+    return out;
+  }, [remote, localTurns, sessionId]);
+
+  const graph = React.useMemo(() => {
+    try {
+      return buildGraph({
+        sessions: sessionsNorm,
+        turnsBySession,
+        currentId: sessionId,
+        hidden, alias, links,
+        includeHidden: showHidden
+      });
+    } catch (e) {
+      return { error: e };
+    }
+  }, [sessionsNorm, turnsBySession, sessionId, hidden, alias, links, showHidden]);
+
+  const laid = React.useMemo(() => {
+    if (!graph || graph.error) return { nodes: [], headers: new Map(), bounds: null, opts: DEFAULT_LAYOUT };
+    try { return layout(graph); } catch { return { nodes: [], headers: new Map(), bounds: null, opts: DEFAULT_LAYOUT }; }
+  }, [graph]);
+
+  const nodeMap = React.useMemo(() => new Map(laid.nodes.map((n) => [n.id, n])), [laid]);
+
+  /* 首次有内容时自动适应视图；之后切视图回来不再重算（FR-12） */
+  React.useEffect(() => {
+    if (view.fitted || !laid.nodes.length) return;
+    const fit = fitView(laid.nodes, size.w, size.h);
+    setView({ ...fit, fitted: true });
+  }, [laid, size, view.fitted]);
+
+  const fit = React.useCallback(() => {
+    setView({ ...fitView(laid.nodes, size.w, size.h), fitted: true });
+  }, [laid, size]);
+
+  const say = React.useCallback((m) => {
+    setToast(m);
+    setTimeout(() => setToast(''), 2600);
+  }, []);
+
+  /* ---- 交互 ---- */
+  const drag = React.useRef(null);
+  const [panning, setPanning] = React.useState(false);
+
+  const onWheel = React.useCallback((ev) => {
+    ev.preventDefault();
+    const r = hostRef.current ? hostRef.current.getBoundingClientRect() : { left: 0, top: 0 };
+    const mx = ev.clientX - r.left;
+    const my = ev.clientY - r.top;
+    setView((v) => {
+      const next = Math.max(0.25, Math.min(2, v.scale * (ev.deltaY < 0 ? 1.12 : 1 / 1.12)));
+      const k = next / v.scale;
+      return { scale: next, panX: mx - (mx - v.panX) * k, panY: my - (my - v.panY) * k, fitted: true };
+    });
+  }, []);
+
+  const onDown = React.useCallback((ev) => {
+    const el = ev.target;
+    if (el.closest && el.closest('.sg-tools')) return;
+    if (ev.button !== 0) return;
+
+    /* 必须掐掉按下事件的默认行为：否则浏览器会从画布背后的文字节点起选区，
+       拖一次就横跨工具栏、提示条与输入框拉出一整页蓝色高亮。
+       preventDefault 同时会挡住自动聚焦，所以这里手动把焦点收回到画布，
+       方向键导航才继续可用。 */
+    if (typeof ev.preventDefault === 'function') ev.preventDefault();
+    if (hostRef.current && typeof hostRef.current.focus === 'function') {
+      try { hostRef.current.focus({ preventScroll: true }); } catch { /* 老浏览器不吃参数 */ }
+    }
+
+    const nodeEl = el.closest ? el.closest('[data-sg-node]') : null;
+    const id = nodeEl ? nodeEl.getAttribute('data-sg-node') : null;
+    const hit = id && nodeMap.has(id) ? id : null;
+    /* 在**按下**时选中，而不是等抬起：双击过程中手抖一两个像素很常见，
+       若靠"没移动过"来决定选中，双击就会既不选中、又照样分叉 */
+    if (hit) setSelected(hit);
+    drag.current = {
+      kind: 'pan',
+      sx: ev.clientX, sy: ev.clientY,
+      px: view.panX, py: view.panY,
+      moved: false,
+      id: hit
+    };
+    setPanning(true);
+  }, [nodeMap, view]);
+
+  React.useEffect(() => {
+    const move = (ev) => {
+      const d = drag.current;
+      if (!d) return;
+      /* 拖拽期间持续拦默认行为：挡住原生的拖放、拖拽滚动与选区 */
+      if (typeof ev.preventDefault === 'function') ev.preventDefault();
+      const dx = ev.clientX - d.sx;
+      const dy = ev.clientY - d.sy;
+      if (Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
+      if (d.kind === 'pan') setView((v) => ({ ...v, panX: d.px + dx, panY: d.py + dy, fitted: true }));
+    };
+    const up = () => {
+      const d = drag.current;
+      drag.current = null;
+      setPanning(false);
+      /* 空白处单击（且没拖动）才清选中；点在块上时选中已在按下时给过了 */
+      if (d && !d.moved && !d.id) setSelected(null);
+    };
+    /* 拖到窗口外再松手也要收尾，否则拖拽状态会一直挂着 */
+    const cancel = (ev) => { if (ev && ev.key === 'Escape') { drag.current = null; setPanning(false); } };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+    window.addEventListener('blur', up);
+    window.addEventListener('keydown', cancel, true);
+    return () => {
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+      window.removeEventListener('blur', up);
+      window.removeEventListener('keydown', cancel, true);
+    };
+  }, []);
+
+  const onKeyDown = React.useCallback((ev) => {
+    const k = ev.key;
+    if (k === 'f' || k === 'F') { ev.preventDefault(); fit(); return; }
+    if (k === 'Escape') { ev.preventDefault(); setExportOpen(false); setSelected(null); return; }
+    if (k.indexOf('Arrow') === 0) {
+      ev.preventDefault();
+      const next = moveSelection(laid.nodes, selected, k);
+      if (next) setSelected(next);
+    }
+  }, [fit, laid, selected]);
+
+  /* ---- 动作 ---- */
+  const doFork = React.useCallback((sid, turn) => {
+    const block = graph.blocks.find((b) => b.sessionId === sid && b.turn === turn);
+    if (block && block.status === 'open') { say('该轮尚未结束，不能从这里分叉'); return; }
+    const atSeq = block ? block.endSeq : null;
+    if (atSeq === null || atSeq === undefined) { say('这一轮没有可用的分叉边界，可能尚未载入'); return; }
+    try {
+      const titles = graph.sessions.map((s) => s.title);
+      const src = graph.sessions.find((s) => s.id === sid);
+      const childTitle = src ? uniqueTitle(src.title, titles) : undefined;
+      const p = ctx.sessions.fork({ sessionId: sid, atSeq, increaseTitle: true, onCreated: () => undefined });
+      if (p && typeof p.catch === 'function') {
+        p.catch((err) => {
+          const code = err && err.rpcError ? err.rpcError.code : '';
+          if (code === 'session/fork-unavailable') say('没有可用的已完成轮次');
+          else if (code === 'session/not-found') say('源会话不可用，请刷新图谱');
+          else say('分叉失败：' + (err && err.message ? err.message : String(err)));
+        });
+      }
+      say('已从第 ' + turn + ' 轮分叉' + (childTitle ? ' → ' + childTitle : ''));
+    } catch (e) {
+      say('分叉失败：' + (e && e.message ? e.message : String(e)));
+    }
+  }, [ctx, graph, say]);
+
+  const openSession = React.useCallback((sid) => {
+    if (typeof ctx.sessions.retain === 'function') { try { ctx.sessions.retain(sid); } catch { /* 已保留 */ } }
+    if (typeof props.onOpenSession === 'function') props.onOpenSession(sid);
+    else say('请在左侧会话列表中选择该会话');
+  }, [ctx, props, say]);
+
+  /* 导出：生成内容 → 不挂到 body 的 anchor 触发下载 */
+  const exportText = React.useCallback((fmt, includeHidden) => {
+    const g = buildGraph({
+      sessions: sessionsNorm, turnsBySession, currentId: sessionId,
+      hidden, alias, links, includeHidden
+    });
+    return render(g, fmt, { links, stamp: stamp(new Date()) });
+  }, [sessionsNorm, turnsBySession, sessionId, hidden, alias, links]);
+
+  /* 导出（FR-15）：优先走 Host 路由——先 HEAD 预检，通过后交给浏览器下载管理器；
+     路由不可用时回落到本地生成 + Blob，保证功能不因为接线问题而消失。 */
+  const routeUrl = React.useCallback((fmt, includeHidden) => {
+    const ids = sessionsNorm.map((s) => s.id).join(',');
+    return '/api/session.graph-export'
+      + '?format=' + fmt
+      + '&sessionId=' + encodeURIComponent(sessionId)
+      + (ids ? '&sessions=' + encodeURIComponent(ids) : '')
+      + (includeHidden ? '&includeHidden=true' : '')
+      + (Object.keys(hidden).length ? '&hidden=' + encodeURIComponent(JSON.stringify(hidden)) : '')
+      + (Object.keys(alias).length ? '&alias=' + encodeURIComponent(JSON.stringify(alias)) : '');
+  }, [sessionsNorm, sessionId, hidden, alias]);
+
+  const saveUrl = React.useCallback((url, filename) => {
+    /* 与产品既有会话日志导出同一手法：anchor 不挂到 document.body，直接 click() */
+    const a = document.createElement('a');
+    a.href = url;
+    if (filename) a.download = filename;
+    a.click();
+  }, []);
+
+  const doDownload = React.useCallback(async () => {
+    const fmt = exportFmt;
+    let filename = '';
+    try {
+      const out = exportText(fmt, exportHidden);
+      filename = out.filename;
+    } catch (e) {
+      say('导出失败：' + (e && e.message ? e.message : String(e)));
+      return;
+    }
+    const url = routeUrl(fmt, exportHidden);
+    try {
+      if (typeof fetch === 'function') {
+        const head = await fetch(url, { method: 'HEAD', credentials: 'same-origin' });
+        if (head && head.ok) {
+          saveUrl(url);                      /* 文件名由 Content-Disposition 决定 */
+          setExportOpen(false);
+          say('已开始下载 ' + filename);
+          return;
+        }
+      }
+    } catch { /* 预检失败 → 走本地回落 */ }
+    try {
+      const out = exportText(fmt, exportHidden);
+      const blobUrl = URL.createObjectURL(new Blob([out.content], {
+        type: fmt === 'mm' ? 'application/xml' : 'text/markdown'
+      }));
+      saveUrl(blobUrl, out.filename);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+      setExportOpen(false);
+      say('已开始下载 ' + out.filename + '（本地生成）');
+    } catch (e) {
+      say('导出失败：' + (e && e.message ? e.message : String(e)));
+    }
+  }, [exportFmt, exportHidden, exportText, routeUrl, saveUrl, say]);
+
+  /* ---- 渲染 ---- */
+  const nodes = showHidden ? laid.nodes : laid.nodes.filter((n) => !(n.kind === 'block' && n.block.hidden));
+  const cell = nodes.map((n) => {
+    if (n.kind === 'header') {
+      return h('div', {
+        key: n.id,
+        className: 'sg-label' + (n.sessionId === sessionId ? ' sg-current' : ''),
+        style: { left: n.x, top: n.y, minWidth: n.w, height: n.h },
+        title: '点击切换到这个会话',
+        onClick: () => openSession(n.sessionId)
+      },
+      h('span', { className: 'sg-sdot' }),
+      h('span', { className: 'sg-st' }, n.title),
+      h('span', { className: 'sg-sm' }, n.turnCount + ' 轮'));
+    }
+    if (n.kind === 'empty') {
+      return h('div', {
+        key: n.id, className: 'sg-node sg-empty',
+        style: { left: n.x, top: n.y, width: n.w, minHeight: n.h }
+      }, h('span', null, '空子会话 · 尚未提问'));
+    }
+    const b = n.block;
+    const cls = 'sg-node'
+      + (b.current ? ' sg-current' : '')
+      + (selected === n.id ? ' sg-selected' : '')
+      + (b.hidden && showHidden ? ' sg-hidden' : '');
+    const badges = [];
+    if (b.toolCalls) badges.push(h('span', { key: 't', className: 'sg-badge' }, '⚙ ' + b.toolCalls));
+    if (b.deliverables) badges.push(h('span', { key: 'd', className: 'sg-badge' }, '⧉ ' + b.deliverables));
+    return h('div', {
+      key: n.id,
+      className: cls,
+      'data-sg-node': n.id,
+      tabIndex: 0,
+      role: 'button',
+      'aria-label': '第 ' + b.turn + ' 轮：' + b.prompt,
+      style: { left: n.x, top: n.y, width: n.w, minHeight: n.h },
+      onDoubleClick: (e) => { e.stopPropagation(); doFork(b.sessionId, b.turn); },
+      onKeyDown: (e) => { if (e.key === 'Enter') { e.stopPropagation(); setSelected(n.id); } }
+    },
+    h('div', { className: 'sg-hd' },
+      h('span', { className: 'sg-turn' }, '第 ' + b.turn + ' 轮'),
+      h('span', { className: 'sg-dot' + (b.status === 'open' ? ' sg-open' : b.status === 'failed' ? ' sg-failed' : '') }),
+      h('span', { className: 'sg-sp' }),
+      badges),
+    h('div', { className: 'sg-ask' }, b.alias ? '✎ ' + b.alias : (b.prompt || '第 ' + b.turn + ' 轮')),
+    h('div', { className: 'sg-ans' }, b.response || '（该轮回答尚未载入）'));
+  });
+
+  const edges = (graph.error ? [] : graph.edges).map((e) => {
+    const d = edgePath(e, nodeMap);
+    if (!d) return null;
+    return h('path', { key: e.id, className: 'sg-e-branch', d });
+  }).filter(Boolean);
+
+  /* 空态说人话（FR-13）：不暴露状态码，只告诉用户现在能看到什么、可以做什么 */
+  const body = graph.error
+    ? h('div', { className: 'sg-err' },
+        '图谱没能装配起来。',
+        h('br'),
+        '可以把当前视图切到「对话」再切回来重试；若一直如此，请反馈这条信息：' + graph.error.message)
+    : !laid.nodes.length
+      ? h('div', { className: 'sg-emptybox' },
+          '这个家族里还没有可显示的轮次。',
+          h('br'), h('br'),
+          '发出第一条消息之后，图谱里就会出现第一个块。')
+      : null;
+
+  /* 内容由宿主侧读取；读取失败时当前会话仍有骨架，只是没有问答文本 */
+  const contentHint = (!routeOk && !graph.error && laid.nodes.length)
+    ? h('div', { className: 'sg-hint sg-hint-warn' },
+        '暂时读不到会话内容，只显示了轮次骨架。切到「对话」再切回来可重试。')
+    : null;
+
+  const detail = selected ? buildDetail() : h('div', { className: 'sg-emptybox' },
+    '家族 ' + (graph.error ? 0 : graph.stats.sessions) + ' 个会话 · ' +
+    (graph.error ? 0 : graph.stats.blocks) + ' 个块',
+    h('br'), h('br'),
+    '点一个块看它的提问与回答；双击块从那里分叉。');
+
+  function buildDetail() {
+    const n = nodeMap.get(selected);
+    if (!n || n.kind !== 'block') return null;
+    const b = n.block;
+    const open = b.status === 'open';
+    return [
+      h('div', { key: 'hd', className: 'sg-side-hd' },
+        h('span', { className: 'sg-t' }, '第 ' + b.turn + ' 轮'),
+        h('span', { className: 'sg-s' }, b.sessionTitle),
+        h('button', { className: 'sg-x', onClick: () => setSelected(null) }, '✕')),
+      h('div', { key: 'bd', className: 'sg-side-bd' },
+        h('div', { className: 'sg-sec' },
+          h('div', { className: 'sg-lb' }, '提问'),
+          h('div', { className: 'sg-tx sg-strong' }, b.prompt || '（未载入）')),
+        h('div', { className: 'sg-sec' },
+          h('div', { className: 'sg-lb' }, '回答'),
+          h('div', { className: 'sg-tx' }, b.response || '（未载入）')),
+        h('div', { className: 'sg-sec' },
+          h('div', { className: 'sg-lb' }, '元信息'),
+          h('div', { className: 'sg-meta' },
+            h('span', { className: 'sg-k' }, '会话'), h('span', { className: 'sg-v' }, b.sessionTitle),
+            h('span', { className: 'sg-k' }, '状态'), h('span', { className: 'sg-v' },
+              open ? '进行中' : b.status === 'failed' ? '失败' : '已完成'),
+            h('span', { className: 'sg-k' }, '工具调用'), h('span', { className: 'sg-v' }, String(b.toolCalls)),
+            h('span', { className: 'sg-k' }, '交付物'), h('span', { className: 'sg-v' }, String(b.deliverables)))),
+        h('div', { className: 'sg-sec' },
+          h('div', { className: 'sg-lb' }, '操作'),
+          h('div', { className: 'sg-acts' },
+            h('button', {
+              className: 'sg-act sg-primary', disabled: open,
+              title: open ? '该轮尚未结束' : '也可以直接双击块',
+              onClick: () => doFork(b.sessionId, b.turn)
+            }, '⑂ 从这里分叉'),
+            h('button', {
+              className: 'sg-act',
+              onClick: () => { setHidden({ ...hidden, [b.id]: !hidden[b.id] }); setShowHidden(true); }
+            }, hidden[b.id] ? '⊘ 取消隐藏' : '⊘ 隐藏此块'),
+            h('button', {
+              className: 'sg-act',
+              onClick: () => { const s = listOf(listSnapshot).find((x) => x.id === b.sessionId || x.sessionId === b.sessionId); openSession(b.sessionId); }
+            }, '◻ 切换到该会话'))))
+    ];
+  }
+
+  return h('div', { className: 'sg-root' },
+    h('style', null, CSS),
+    h('div', {
+      className: 'sg-canvas-wrap' + (panning ? ' sg-panning' : ''),
+      ref: hostRef, tabIndex: 0, onKeyDown, onWheel, onMouseDown: onDown
+    },
+      h('div', {
+        className: 'sg-world',
+        style: { transform: 'translate(' + view.panX + 'px,' + view.panY + 'px) scale(' + view.scale + ')' }
+      },
+      h('svg', { width: Math.max(1200, (laid.bounds ? laid.bounds.maxX + 160 : 1200)),
+                 height: Math.max(760, (laid.bounds ? laid.bounds.maxY + 120 : 760)) }, edges),
+      cell),
+      h('div', { className: 'sg-tools' },
+        h('button', { className: 'sg-btn', onClick: fit }, '适应视图 F'),
+        h('button', {
+          className: 'sg-btn' + (showHidden ? ' sg-on' : ''),
+          onClick: () => setShowHidden(!showHidden)
+        }, '显示已隐藏'),
+        h('button', {
+          className: 'sg-btn' + (collapseOthers ? ' sg-on' : ''),
+          onClick: () => setCollapseOthers(!collapseOthers)
+        }, '折叠其他会话'),
+        h('button', { className: 'sg-btn', onClick: () => setExportOpen(true) }, '↧ 导出'),
+        h('span', { className: 'sg-zoom' }, Math.round(view.scale * 100) + '%')),
+      h('div', { className: 'sg-hint' },
+        '滚轮缩放 · 拖空白平移 · 单击块看详情 · 双击块分叉 · 方向键移动 · F 适应视图'),
+      contentHint,
+      body,
+      exportOpen ? exportDialog() : null,
+      toast ? h('div', {
+        style: {
+          position: 'absolute', left: '50%', bottom: '14px', transform: 'translateX(-50%)',
+          background: 'var(--dsw-alias-toast-bg)', color: 'var(--dsw-alias-toast-label)',
+          padding: '9px 14px', borderRadius: '8px', fontSize: '12.5px', zIndex: 40
+        }
+      }, toast) : null),
+    h('aside', { className: 'sg-side' }, detail));
+
+  function exportDialog() {
+    let preview = '';
+    let filename = '';
+    let errorText = '';
+    try {
+      const out = exportText(exportFmt, exportHidden);
+      preview = out.content;
+      filename = out.filename;
+    } catch (e) {
+      errorText = e && e.message ? e.message : String(e);
+    }
+    const skipped = (graph.error ? 0 : graph.stats.hiddenSkipped);
+    return h('div', { className: 'sg-mask', onClick: (e) => { if (e.target === e.currentTarget) setExportOpen(false); } },
+      h('div', { className: 'sg-dlg' },
+        h('div', { className: 'sg-dlg-hd' },
+          h('span', { className: 'sg-t' }, '导出会话图谱'),
+          h('span', { className: 'sg-s' }, filename),
+          h('button', { className: 'sg-x', onClick: () => setExportOpen(false) }, '✕')),
+        h('div', { className: 'sg-dlg-bd' },
+          h('div', { className: 'sg-row' },
+            h('span', { className: 'sg-lb' }, '格式'),
+            h('div', { className: 'sg-seg' },
+              h('button', { 'aria-pressed': exportFmt === 'mm' ? 'true' : 'false', onClick: () => setExportFmt('mm') },
+                'FreeMind .mm'),
+              h('button', { 'aria-pressed': exportFmt === 'md' ? 'true' : 'false', onClick: () => setExportFmt('md') },
+                'Markdown .md')),
+            h('span', { className: 'sg-s' },
+              exportFmt === 'mm' ? '可导入 XMind / MindManager / Freeplane' : '可导入 XMind / Obsidian')) ,
+          h('div', { className: 'sg-row' },
+            h('span', { className: 'sg-lb' }, '范围'),
+            h('label', { className: 'sg-chk' },
+              h('input', {
+                type: 'checkbox', checked: exportHidden,
+                onChange: (e) => setExportHidden(!!e.target.checked)
+              }), '包含已隐藏的块'),
+            skipped && !exportHidden
+              ? h('span', { className: 'sg-s' }, '有 ' + skipped + ' 个块因被隐藏而未导出')
+              : null),
+          h('div', { className: 'sg-row' },
+            h('span', { className: 'sg-lb' }, '预览'),
+            h('div', { style: { flex: 1, minWidth: 0 } }, h('div', { className: 'sg-prev' }, preview))),
+          errorText ? h('div', { className: 'sg-err' }, '生成失败：' + errorText) : null),
+        h('div', { className: 'sg-dlg-ft' },
+          h('span', { className: 'sg-hi' },
+            '块内用「问」「答」两段区分用户提问与助手回答；分叉会话挂在它的分叉源块之下。'),
+          h('button', {
+            className: 'sg-bigbtn',
+            onClick: () => {
+              try {
+                const out = exportText(exportFmt, exportHidden);
+                if (navigator && navigator.clipboard) navigator.clipboard.writeText(out.content);
+                say('已复制到剪贴板');
+              } catch { say('复制失败，可手动选中预览区'); }
+            }
+          }, '复制'),
+          h('button', { className: 'sg-bigbtn sg-primary', onClick: doDownload }, '下载文件'))));
+  }
+}
+
+/* ------------------------------------------------------------ 插件入口 */
+
+function apply(ctx) {
+  /* 视图数据层：只做纯折叠，不订阅会话事件、不轮询、不写 DOM */
+  ctx.uiConversation.views.register({
+    target: TARGET,
+    create: () => {
+      const builder = {
+        snapshot: { timeline: null },
+        replace(state) { return builder.accept(state); },
+        apply(state) { return builder.accept(state); },
+        accept(state) {
+          const timeline = state && state.timeline ? state.timeline : null;
+          if (builder.snapshot.timeline === timeline) return builder.snapshot;
+          builder.snapshot = { timeline };
+          return builder.snapshot;
+        }
+      };
+      return builder;
+    }
+  });
+
+  /* 视图槽位。产物注册在 effect 作用域内，卸载即移除。 */
+  ctx.slots.inject('conversation.view', () => ctx.slots.register({
+    name: 'conversation.view',
+    id: TARGET,
+    order: VIEW_ORDER,
+    label: () => '图谱',
+    inject: (sessionId) => {
+      let target = null;
+      try {
+        target = ctx.uiConversation.binding(sessionId).target(TARGET);
+      } catch {
+        /* 会话暂时不可绑定：视图退化为空态，不抛到槽位渲染里 */
+      }
+      return { sessionId, ctx, target, sessions: ctx.sessions };
+    }
+  }, GraphView));
+}
+
+return { inject: ['slots', 'sessions', 'uiSession', 'uiConversation'], apply };

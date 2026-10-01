@@ -1,0 +1,13 @@
+# 会话图谱 · 组合补丁
+#
+# 一条 Host 行即可：客户端半通过 package.json 的 dsh.client 自动加载，
+# 它会向 conversation.view 槽位注册「图谱」视图。
+#
+# 两个上限用于兜底（NFR-1）：超过就拒绝而不是把浏览器拖死。
+
+- insert:
+    - id: session-graph
+      name: 'dsh-plugin-session-graph'
+      config:
+        maxSessions: 200
+        maxBlocks: 3000

@@ -1,0 +1,5 @@
+{
+  "title": "Session Graph",
+  "description": "A graph view that arranges a session into blocks and edges; fork from any block, link blocks, and export as a mind map",
+  "view.graph": "Graph"
+}
