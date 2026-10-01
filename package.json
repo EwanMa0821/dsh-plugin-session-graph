@@ -21,7 +21,8 @@
     "icon.svg",
     "cordis.patch.yml",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "assets/"
   ],
   "scripts": {
     "test": "node scripts/run-tests.mjs",

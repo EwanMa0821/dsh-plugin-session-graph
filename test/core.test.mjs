@@ -1039,3 +1039,46 @@ test('默认布局常量与原型一致', () => {
   assert.equal(DEFAULT_LAYOUT.pitch, 100);
   assert.equal(DEFAULT_LAYOUT.columnStep, 320);
 });
+
+/* ------------------------------------------------ 引用式会话的可见性 */
+
+test('被引用拉进来的会话必须有节点 —— 否则引用边画不出来', () => {
+  const sessions = normalizeSessions([
+    ...RAW_SESSIONS,
+    { id: 'fresh', title: '引用：新会话', parentId: null }
+  ]);
+  const link = { id: 'R1', kind: 'reference', from: 'root:2', to: 'header:fresh' };
+  const g = buildGraph({
+    sessions, turnsBySession: { ...TURNS, fresh: [] }, currentId: 'root', links: [link]
+  });
+
+  assert.equal(g.referenced.indexOf('fresh') >= 0, true, '它被标成"引用拉进来的"');
+  assert.equal(g.order.indexOf('fresh') >= 0, true,
+    'order 里必须有它 —— layout 按 order 建节点，漏了就是有数据没节点');
+  const laid = layout(g);
+  const ids = laid.nodes.map((n) => n.id);
+  assert.equal(ids.indexOf('header:fresh') >= 0, true, '会话头建出来了');
+  const nodeMap = new Map(laid.nodes.map((n) => [n.id, n]));
+  assert.ok(edgePath(link, nodeMap), '引用边这才画得出来');
+});
+
+test('引用拉进来的会话在导出里不当独立根，避免同一个会话出现两遍', () => {
+  const sessions = normalizeSessions([
+    ...RAW_SESSIONS,
+    { id: 'fresh', title: '引用：新会话', parentId: null }
+  ]);
+  const link = { id: 'R1', kind: 'reference', from: 'root:2', to: 'header:fresh' };
+  const g = buildGraph({
+    sessions, turnsBySession: { ...TURNS, fresh: [] }, currentId: 'root', links: [link]
+  });
+  const { content } = toFreeMind(g, { links: [link] });
+  const hits = (content.match(/引用：新会话/g) || []).length;
+  assert.equal(hits, 1, '只出现一次（挂在源块之下），实际出现 ' + hits + ' 次');
+});
+
+test('血缘内的会话照旧当根', () => {
+  const g = graphOf();
+  assert.deepEqual(g.referenced, [], '没有引用边时不该有"引用拉进来的"会话');
+  const { content } = toFreeMind(g, { links: [] });
+  assert.ok(content.includes('读懂'), '家族根照常导出');
+});

@@ -308,6 +308,14 @@ export function buildGraph(input) {
 
   const scoped = sessions.filter((s) => scopedIds.has(s.id));
 
+  /* order 必须带上被引用拉进来的会话。
+     layout() 是按 order 建节点的：只把它们放进 sessions 而漏掉 order，
+     结果就是"有数据、没有节点"—— 引用边连端点都找不到，永远画不出来（FR-7）。
+     这些 id 单独暴露出来，是因为它们在导出里要**挂在源块之下**，
+     不能再当独立根列一次，否则同一个会话出现两遍。 */
+  const referencedIds = [...scopedIds].filter((id) => fam.order.indexOf(id) < 0);
+  const order = [...fam.order, ...referencedIds];
+
   /* 每个会话的全部轮次（**不过滤隐藏**）。端点是否被隐藏必须按全集判断，
      否则"被隐藏的块"会与"从未载入的轮次"混同，导致派生边悄悄改挂到会话头。 */
   const allBySession = new Map();
@@ -430,7 +438,8 @@ export function buildGraph(input) {
     version: GRAPH_VERSION,
     currentId,
     rootId: fam.rootId,
-    order: fam.order,
+    order,
+    referenced: referencedIds,
     notes: fam.notes,
     sessions: scoped,
     blocks,

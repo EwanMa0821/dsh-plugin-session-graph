@@ -15,6 +15,13 @@
 
 竖排是同一个会话的先后轮次，向右是分叉出去的子孙，实线是派生关系。
 
+![会话图谱示例](assets/graph-example.svg)
+
+> 上面这张图不是界面截图，而是**用插件自己的装配、布局与几何代码渲染出来的**：
+> 同一份 `buildGraph` / `layout` / `edgePath` 就是界面上跑的那几个函数。
+> 它可以随代码重新生成（`node scripts/make-preview.mjs`），不会像截图那样过期。
+> 图里的颜色是字面量，因为这张图不在宿主里、拿不到主题变量；界面本身只用主题变量。
+
 ---
 
 ## 功能
@@ -144,7 +151,7 @@ src/client/app.js    客户端应用
 ## 开发
 
 ```bash
-node scripts/run-tests.mjs      # 227 项测试，在同一进程内运行
+node scripts/run-tests.mjs      # 233 项测试，在同一进程内运行
 node scripts/check-package.mjs  # 清单、图标、patch、产物是否过期
 node scripts/build-client.mjs   # 改过 src/ 之后必须跑
 ```

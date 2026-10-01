@@ -252,6 +252,13 @@ const viewRegistry = { definition: null };
 
 function fakeCtx() {
   const ctx = {
+    /* 记下插件在 effect 作用域里注册了什么（NFR-4） */
+    effects: [],
+    effect(fn, label) {
+      const dispose = fn();
+      this.effects.push({ label, dispose: typeof dispose === 'function' ? dispose : null });
+      return () => { if (typeof dispose === 'function') dispose(); };
+    },
     slots: {
       owner: null, options: null, Component: null,
       inject(owner, cb) { this.owner = owner; return cb(); },
@@ -1824,4 +1831,57 @@ test('不认识的键不会在界面上留空洞', async () => {
   const text = textIn(tree);
   assert.ok(!/undefined/.test(text), '没有 undefined');
   assert.ok(!/\{turn\}|\{n\}|\{msg\}/.test(text), '没有未插值的占位符');
+});
+
+/* ------------------------------------- 验收 13 / NFR-4 复核 */
+
+test('切走再回来，选中块还在（验收 13）', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    selectBlock('root:2');
+    tree = render(ctx.slots.Component, props);
+    assert.ok(nodeEl(tree, 'root:2').props.className.includes('sg-selected'), '先选中');
+
+    /* 模拟切到别处再切回来：组件被卸载重建 */
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    tree = render(ctx.slots.Component, props);
+    assert.ok(nodeEl(tree, 'root:2').props.className.includes('sg-selected'),
+      '重挂载后选中态恢复');
+
+    /* 清干净，免得影响后面的用例 —— 点空白处才清选中（点同一个块是保持选中） */
+    press(tree, { x: 600, y: 500 });
+    releaseOver(null);
+    tree = render(ctx.slots.Component, props);
+    assert.ok(!nodeEl(tree, 'root:2').props.className.includes('sg-selected'), '点空白清掉选中');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('选中的块被隐藏后，详情面板不会拿它去建内容', async () => {
+  serverReply = { ...serverReply, state: blankState({ hidden: { 'root:2': true } }) };
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    /* 选中一个已隐藏、因而不在画布上的块，界面要退回空态而不是崩 */
+    let tree = render(ctx.slots.Component, props);
+    const aside = elements(tree).find((n) => n.props && n.props.className === 'sg-side');
+    assert.ok(aside, '右栏照常在');
+    assert.ok(!textIn(tree).includes('undefined'), '没有 undefined 漏出来');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('字典注册落在 effect 作用域内（NFR-4）', () => {
+  assert.ok(Array.isArray(ctx.effects), '假 ctx 记录了 effect');
+  assert.ok(ctx.effects.some((e) => typeof e.label === 'string' && e.label.includes('dictionaries')),
+    '字典注册包在 ctx.effect 里：' + ctx.effects.map((e) => e.label).join(', '));
 });

@@ -8,6 +8,9 @@
    不 require 别的包；不向 document.body 追加；样式以 React 元素渲染，随组件卸载移除。
    ============================================================ */
 
+/* 视图切走会卸载组件；选中块放在模块级 Map 里，重挂载时恢复（验收 13） */
+const lastSelection = new Map();
+
 const NS = 'dsh-plugin-session-graph';
 const TARGET = 'session-graph';
 const VIEW_ORDER = 20;
@@ -346,7 +349,13 @@ function GraphView(props) {
   );
   const mdLabels = React.useMemo(() => markdownLabels(t), [t]);
 
-  const [selected, setSelected] = React.useState(null);
+  const [selected, setSelected] = React.useState(() => lastSelection.get(sessionId) || null);
+  /* 切到别的视图会卸载本组件，选中块要活过重挂载（验收 13）。
+     放模块级 Map 而不是存档：需求只要求跨视图切换保留，不要求跨刷新；
+     而且这是"当前在看什么"，不是需要跨设备同步的图谱数据。 */
+  React.useEffect(() => {
+    if (sessionId) lastSelection.set(sessionId, selected);
+  }, [sessionId, selected]);
   const [hidden, setHidden] = React.useState({});
   const [alias, setAlias] = React.useState({});
   const [links, setLinks] = React.useState([]);
@@ -1343,7 +1352,7 @@ function GraphView(props) {
 
   const detail = selectedEdge
     ? buildEdgeDetail()
-    : (selected ? buildDetail() : h('div', { className: 'sg-emptybox' },
+    : (selected && nodeMap.has(selected) ? buildDetail() : h('div', { className: 'sg-emptybox' },
       t('side.empty', {
         sessions: fmtNum(graph.error ? 0 : graph.stats.sessions),
         blocks: fmtNum(graph.error ? 0 : graph.stats.blocks)
@@ -1631,17 +1640,19 @@ function GraphView(props) {
 
 function apply(ctx) {
   /* 把字典登记进宿主的本地化服务（NFR-3 第一条：文案经宿主服务提供）。
-     登记失败不影响渲染 —— 取值时还有本地字典兜底，语义与宿主一致。 */
+     注册要落在 effect 作用域里并随插件卸载回收（NFR-4），
+     与宿主自己的做法一致。登记失败不影响渲染 —— 取值时还有本地字典兜底。 */
   try {
     if (ctx.locale && typeof ctx.locale.register === 'function') {
-      ctx.locale.register(NS, flatten());
+      const registerDicts = () => { ctx.locale.register(NS, flatten()); };
+      if (typeof ctx.effect === 'function') ctx.effect(registerDicts, 'session-graph: dictionaries');
+      else registerDicts();
     }
   } catch { /* 宿主不认这份字典时退回本地取值 */ }
 
   /* 视图数据层：只做纯折叠，不订阅会话事件、不轮询、不写 DOM */
   ctx.uiConversation.views.register({
-    target: TARGET,
-    create: () => {
+    target: TARGET,    create: () => {
       const builder = {
         snapshot: { timeline: null },
         replace(state) { return builder.accept(state); },

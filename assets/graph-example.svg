@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="928" height="572" viewBox="-28 -28 928 572" font-family="ui-sans-serif,-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">
+<defs><marker id="arrow-solid" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#8b93a7"/></marker><marker id="arrow-hollow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#ffffff" stroke="#b06ae0" stroke-width="1.4"/></marker></defs>
+<rect x="-28" y="-28" width="928" height="572" fill="#ffffff"/>
+<path d="M232 173 C271.6 173, 280.4 73, 320 73" fill="none" stroke="#8b93a7" stroke-width="1.6" marker-end="url(#arrow-solid)"/>
+<path d="M552 73 C591.6 73, 600.4 73, 640 73" fill="none" stroke="#8b93a7" stroke-width="1.6" marker-end="url(#arrow-solid)"/>
+<path d="M232 273 C415.6 273, 456.4 73, 640 73" fill="none" stroke="#4176e6" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#arrow-solid)"/>
+<path d="M0 173 C104.4 173, 127.6 419, 232 419" fill="none" stroke="#b06ae0" stroke-width="1.6" stroke-dasharray="1.5 3.5" marker-end="url(#arrow-hollow)"/>
+<rect x="408" y="163" width="56" height="18" rx="9" fill="#ffffff" stroke="#dfe3ea"/>
+<text x="436" y="176.5" font-size="11" fill="#5b6478" text-anchor="middle">结论迁移</text>
+<rect x="99" y="286" width="34" height="18" rx="9" fill="#ffffff" stroke="#dfe3ea"/>
+<text x="116" y="299.5" font-size="11" fill="#5b6478" text-anchor="middle">引用</text>
+<rect x="0" y="0" width="232" height="26" rx="6" fill="#f3f5f8" stroke="#e3e7ee"/>
+<text x="10" y="17" font-size="12" font-weight="600" fill="#39414f">读懂《思考，快与慢》</text>
+<text x="222" y="17" font-size="11" fill="#8b93a7" text-anchor="end">3 轮</text>
+<rect x="0" y="36" width="232" height="74" rx="9" fill="#ffffff" stroke="#e3e7ee" stroke-width="1"/>
+<text x="11" y="55" font-size="11" font-weight="600" fill="#8b93a7">第 1 轮</text>
+<text x="221" y="55" font-size="10.5" fill="#8b93a7" text-anchor="end">⚙ 2</text>
+<text x="11" y="76" font-size="12" fill="#232a35">这本书的两个系统到底指什么？</text>
+<text x="11" y="94" font-size="11" fill="#7c8598">系统一快而直觉，系统二慢而费力。它们不是两个器官，而是两套加…</text>
+<rect x="0" y="136" width="232" height="74" rx="9" fill="#ffffff" stroke="#e3e7ee" stroke-width="1"/>
+<text x="11" y="155" font-size="11" font-weight="600" fill="#8b93a7">第 2 轮</text>
+<text x="11" y="176" font-size="12" fill="#232a35">那为什么人会被锚定效应影响？</text>
+<text x="11" y="194" font-size="11" fill="#7c8598">因为系统一拿最先出现的数字当参照，系统二往往懒得复核。</text>
+<rect x="0" y="236" width="232" height="74" rx="9" fill="#ffffff" stroke="#e3e7ee" stroke-width="1"/>
+<text x="11" y="255" font-size="11" font-weight="600" fill="#8b93a7">第 3 轮</text>
+<text x="11" y="276" font-size="12" fill="#232a35">有没有办法对抗它？</text>
+<text x="11" y="294" font-size="11" fill="#7c8598">先自己给出估计再看别人的数字；谈判里则可以先开价，把锚点放在…</text>
+<rect x="320" y="0" width="232" height="26" rx="6" fill="#eef4ff" stroke="#4176e6"/>
+<text x="330" y="17" font-size="12" font-weight="600" fill="#2f5fd0">锚定效应能用在谈判里吗</text>
+<text x="542" y="17" font-size="11" fill="#8b93a7" text-anchor="end">1 轮</text>
+<rect x="320" y="36" width="232" height="74" rx="9" fill="#ffffff" stroke="#e3e7ee" stroke-width="1"/>
+<text x="331" y="55" font-size="11" font-weight="600" fill="#8b93a7">第 1 轮</text>
+<text x="331" y="76" font-size="12" fill="#232a35">先开价真的有用吗？</text>
+<text x="331" y="94" font-size="11" fill="#7c8598">有，但取决于信息量：信息不足时先开价占优，信息充分时反而容易…</text>
+<rect x="640" y="0" width="232" height="26" rx="6" fill="#f3f5f8" stroke="#e3e7ee"/>
+<text x="650" y="17" font-size="12" font-weight="600" fill="#39414f">这些偏差在投资里长什么样</text>
+<text x="862" y="17" font-size="11" fill="#8b93a7" text-anchor="end">1 轮</text>
+<rect x="640" y="36" width="232" height="74" rx="9" fill="#ffffff" stroke="#e3e7ee" stroke-width="1"/>
+<text x="651" y="55" font-size="11" font-weight="600" fill="#8b93a7">第 1 轮</text>
+<text x="861" y="55" font-size="10.5" fill="#8b93a7" text-anchor="end">⚙ 5</text>
+<text x="651" y="76" font-size="12" fill="#232a35">投资里最常见的锚是什么？</text>
+<text x="651" y="94" font-size="11" fill="#7c8598">买入成本。它和资产的未来现金流毫无关系，却最容易变成参照点。</text>
+<rect x="0" y="406" width="232" height="26" rx="6" fill="#f3f5f8" stroke="#e3e7ee"/>
+<text x="10" y="423" font-size="12" font-weight="600" fill="#39414f">引用：系统一与系统二的区别</text>
+<text x="222" y="423" font-size="11" fill="#8b93a7" text-anchor="end">0 轮</text>
+<rect x="0" y="442" width="232" height="74" rx="9" fill="#fbfcfe" stroke="#c9ced9" stroke-dasharray="5 4"/>
+<text x="116" y="483" font-size="11.5" fill="#8b93a7" text-anchor="middle">空子会话 · 尚未提问</text>
+<text x="0" y="498" font-size="11" fill="#8b93a7">三类边在界面上靠形态区分，不只靠颜色：</text>
+<line x1="0" y1="520" x2="34" y2="520" stroke="#8b93a7" stroke-width="1.6" marker-end="url(#arrow-solid)"/>
+<text x="42" y="524" font-size="11" fill="#5b6478">派生边 · 实线 + 实心箭头</text>
+<line x1="250" y1="520" x2="284" y2="520" stroke="#4176e6" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#arrow-solid)"/>
+<text x="292" y="524" font-size="11" fill="#5b6478">手动边 · 虚线 + 实心箭头 + 标签</text>
+<line x1="500" y1="520" x2="534" y2="520" stroke="#b06ae0" stroke-width="1.6" stroke-dasharray="1.5 3.5" marker-end="url(#arrow-hollow)"/>
+<text x="542" y="524" font-size="11" fill="#5b6478">引用边 · 点线 + 空心箭头 + 标签</text>
+</svg>

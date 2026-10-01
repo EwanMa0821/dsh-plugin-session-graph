@@ -137,10 +137,13 @@ export function buildTree(graph, options = {}) {
       .map((l) => sessionOfId(l.to))
       .filter((sid) => bySession.has(sid));
 
-  /* 家族根：没有父、或父不在家族内的会话 */
+  /* 家族根：没有父、或父不在家族内的会话。
+     被引用拉进来的会话不算根 —— 它们挂在源块之下（refsAt），
+     否则同一个会话会在导出结果里出现两遍。 */
+  const pulled = new Set(graph.referenced || []);
   const roots = graph.order
     .map((id) => bySession.get(id))
-    .filter((s) => s && (!s.parentId || !bySession.has(s.parentId)));
+    .filter((s) => s && !pulled.has(s.id) && (!s.parentId || !bySession.has(s.parentId)));
 
   const skipped = [];
   const keptLinks = [];
