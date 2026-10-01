@@ -22,7 +22,8 @@ const CORE = [
   'src/core/graph.js',
   'src/core/export.js',
   'src/core/state.js',
-  'src/core/scale.js'
+  'src/core/scale.js',
+  'src/core/i18n.js'
 ];
 const APP = 'src/client/app.js';
 export const OUT = 'client.js';

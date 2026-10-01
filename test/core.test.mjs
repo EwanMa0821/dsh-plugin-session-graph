@@ -21,6 +21,9 @@ import { toFreeMind, toMarkdown, exportFilename, safeFilename, render } from '..
 import {
   TIERS, SLOW_LAYOUT_MS, tierOf, tierFeatures, sessionsWithBlocks, timedLayout
 } from '../src/core/scale.js';
+import {
+  UI, FALLBACK_LOCALE, localeKey, fallbackChain, pick, interpolate, makeT, formatNumber, flatten
+} from '../src/core/i18n.js';
 
 /* ------------------------------------------------------------------ 夹具 */
 
@@ -865,6 +868,74 @@ test('还在进行中的轮次不算 incomplete', () => {
     currentId: 'root'
   });
   assert.equal(g.stats.incomplete, 1, '进行中的不算，失败且无内容的算');
+});
+
+/* ------------------------------------------------- 本地化（NFR-3） */
+
+test('字典里每个键都有非空的 zh 与 en', () => {
+  const keys = Object.keys(UI);
+  assert.ok(keys.length > 100, '词条规模合理：' + keys.length);
+  const bad = keys.filter((k) => typeof UI[k].zh !== 'string' || UI[k].zh === ''
+    || typeof UI[k].en !== 'string' || UI[k].en === '');
+  assert.deepEqual(bad, [], '缺语言的键必须为零');
+});
+
+test('词典里不该残留未插值的花括号以外的问题，且中英不相等', () => {
+  /* 中英完全一样是"忘了翻译"的典型症状；允许少量专有名词例外 */
+  const same = Object.keys(UI).filter((k) => UI[k].zh === UI[k].en);
+  assert.deepEqual(same, [], '中英相同的键：' + same.join(', '));
+});
+
+test('回退链按语言标签逐级截断', () => {
+  assert.deepEqual(fallbackChain('zh-Hans-CN'),
+    ['zh-hans-cn', 'zh-hans', 'zh']);
+  assert.deepEqual(fallbackChain('en'), ['en']);
+  assert.deepEqual(fallbackChain(''), []);
+  assert.deepEqual(fallbackChain(null), []);
+});
+
+test('缺键回退英文 —— NFR-3 明确要求', () => {
+  assert.equal(pick({ zh: '甲', en: 'A' }, 'zh'), '甲');
+  assert.equal(pick({ zh: '甲', en: 'A' }, 'zh-CN'), '甲', '语言标签带地区也认');
+  assert.equal(pick({ en: 'A' }, 'zh'), 'A', '没有中文就落到英文');
+  assert.equal(pick({ zh: '甲', en: 'A' }, 'fr'), 'A', '完全不认识的语言同样落到英文');
+  assert.equal(pick('原文', 'zh'), '原文', '字符串原样返回');
+  assert.equal(pick(null, 'zh'), '');
+  assert.equal(pick({ zh: '' }, 'zh'), '', '空串不算命中，继续往下找');
+});
+
+test('makeT 插值：变量补齐时替换，缺变量时留下占位符', () => {
+  assert.equal(makeT('zh')('fork.done', { turn: 3 }), '已从第 3 轮分叉');
+  assert.equal(makeT('en')('fork.done', { turn: 3 }), 'Forked from turn 3');
+  assert.equal(interpolate('第 {turn} 轮', {}), '第 {turn} 轮', '缺变量不静默吞掉');
+  assert.equal(interpolate('{a}-{b}', { a: 1, b: 2 }), '1-2');
+});
+
+test('认不出的键回吐键名，绝不让界面出现空洞', () => {
+  assert.equal(makeT('zh')('nope.nope'), 'nope.nope');
+});
+
+test('makeT 优先用宿主给的解析器 —— 文案确实经宿主服务提供', () => {
+  const calls = [];
+  const resolver = (text) => { calls.push(text); return '来自宿主'; };
+  assert.equal(makeT('zh', resolver)('view.title'), '来自宿主');
+  assert.equal(calls.length, 1, '确实交给了宿主');
+  assert.deepEqual(calls[0], UI['view.title'], '交出去的是原始的 {zh,en} 对象');
+});
+
+test('数字按当前语言排版；坏输入不抛', () => {
+  assert.equal(formatNumber(1234567, 'en'), '1,234,567');
+  assert.equal(formatNumber(42, 'zh'), '42');
+  assert.equal(formatNumber('x', 'zh'), 'x', '非数字原样返回');
+  assert.equal(formatNumber(NaN, 'en'), 'NaN', 'NaN 也不抛');
+});
+
+test('flatten 摊平出各语言的扁平字典', () => {
+  const f = flatten();
+  assert.equal(Object.keys(f.zh).length, Object.keys(UI).length);
+  assert.equal(Object.keys(f.en).length, Object.keys(UI).length);
+  assert.equal(f.zh['view.title'], '图谱');
+  assert.equal(f.en['view.title'], 'Graph');
 });
 
 /* ------------------------------------------------- 规模降级（NFR-1） */

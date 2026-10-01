@@ -196,6 +196,36 @@ try {
   problems.push(`${OUT} 无法装载：` + e.message);
 }
 
+/* --------------------------------------------------- 本地化一致性（NFR-3） */
+
+try {
+  const i18n = await import('../src/core/i18n.js');
+  const dict = i18n.UI;
+  const keys = Object.keys(dict);
+
+  const missing = keys.filter((k) => typeof dict[k].zh !== 'string' || dict[k].zh === ''
+    || typeof dict[k].en !== 'string' || dict[k].en === '');
+  check(missing.length === 0,
+    `${keys.length} 个文案键都有 zh 与 en${missing.length ? '（缺：' + missing.slice(0, 5).join(', ') + '）' : ''}`);
+
+  /* bundle 里出现的每个 t('key') 都要在字典里 —— 键名拼错不报错，只会把键名原样显示出来 */
+  const used = new Set();
+  const src = fs.readFileSync(path.join(ROOT, OUT), 'utf8');
+  for (const m of src.matchAll(/\bt\(\s*'([a-zA-Z][\w.]*)'/g)) used.add(m[1]);
+  const unknown = [...used].filter((k) => !(k in dict));
+  check(unknown.length === 0,
+    `客户端用到的 ${used.size} 个文案键都在字典里${unknown.length ? '（未定义：' + unknown.slice(0, 5).join(', ') + '）' : ''}`);
+
+  /* 插件管理页读的是 locale/*.json；视图名要与字典同源，否则两边会飘 */
+  for (const loc of ['zh', 'en']) {
+    const file = readJson('locale/' + loc + '.json');
+    check(file['view.graph'] === dict['view.title'][loc],
+      `locale/${loc}.json 的 view.graph 与字典一致`);
+  }
+} catch (e) {
+  problems.push('本地化检查失败：' + e.message);
+}
+
 /* ------------------------------------------------------------- 输出 */
 
 process.stdout.write(`通过 ${notes.length} 项检查\n`);

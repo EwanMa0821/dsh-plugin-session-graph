@@ -171,6 +171,17 @@ test('factory 返回 { inject, apply }', () => {
 
 const source = (value) => ({ getSnapshot: () => value, subscribe: () => () => {} });
 
+/** 可变的源：测语言切换要用（切了之后订阅者要收到通知） */
+const mutableSource = (initial) => {
+  let value = initial;
+  const subs = new Set();
+  return {
+    getSnapshot: () => value,
+    subscribe(fn) { subs.add(fn); return () => subs.delete(fn); },
+    set(next) { value = next; [...subs].forEach((fn) => fn()); }
+  };
+};
+
 const FAMILY = [
   { id: 'root', title: '读懂《思考，快与慢》', parentId: null },
   { id: 'ancor', title: '锚定效应能用在谈判里吗', parentId: 'root', forkAtTurn: 3 },
@@ -263,6 +274,29 @@ function fakeCtx() {
     uiWorkspace: {
       openSession(id) { ctx.opened = id; }
     },
+    locale: (() => {
+      const src = mutableSource({ active: 'zh' });
+      return {
+        getSnapshot: () => src.getSnapshot(),
+        subscribe: (fn) => src.subscribe(fn),
+        set: (next) => src.set(next),
+        registered: [],
+        register(ns, dicts) { this.registered.push({ ns, dicts }); },
+        /* 复刻宿主 LocaleService.resolveText：按回退链解析，最后落到 en */
+        resolveText(text) {
+          if (typeof text === 'string') return text;
+          if (!text || typeof text !== 'object') return '';
+          const active = String(src.getSnapshot().active || '').toLowerCase();
+          const parts = active ? active.split('-') : [];
+          const chain = [];
+          for (let i = parts.length; i > 0; i -= 1) chain.push(parts.slice(0, i).join('-'));
+          for (const loc of chain) {
+            if (typeof text[loc] === 'string' && text[loc] !== '') return text[loc];
+          }
+          return typeof text.en === 'string' ? text.en : '';
+        }
+      };
+    })(),
     workspaces: {
       list: source({ items: [{ workspaceId: 'ws-1', sessionIds: ['root', 'ancor', 'invest'] }] })
     }
@@ -1729,4 +1763,65 @@ test('普通块不会误判成骨架块', async () => {
   } finally {
     serverReply = { ...serverReply, state: null, turns: REMOTE_TURNS, blocks: undefined };
   }
+});
+
+/* ------------------------------------------------ 本地化（NFR-3） */
+
+test('把字典登记给宿主的本地化服务', () => {
+  const hit = ctx.locale.registered.find((r) => r.ns === 'dsh-plugin-session-graph');
+  assert.ok(hit, '登记过本插件的命名空间');
+  assert.equal(typeof hit.dicts.zh['view.title'], 'string');
+  assert.equal(hit.dicts.en['view.title'], 'Graph');
+  assert.equal(Object.keys(hit.dicts.zh).length, Object.keys(hit.dicts.en).length,
+    '两种语言的词条数一致');
+});
+
+test('默认按中文渲染', async () => {
+  ctx.locale.set({ active: 'zh' });
+  try {
+    const tree = await mountLoaded();
+    assert.match(textIn(tree), /适应视图 F/, '工具条是中文');
+    assert.match(textIn(tree), /第 1 轮/, '块标题是中文');
+  } finally {
+    ctx.locale.set({ active: 'zh' });
+  }
+});
+
+test('语言切成 en 之后界面整体变英文', async () => {
+  ctx.locale.set({ active: 'en' });
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    const tree = render(ctx.slots.Component, props);
+    const text = textIn(tree);
+    assert.match(text, /Fit view \(F\)/, '工具条跟着变');
+    assert.match(text, /Turn 1/, '块标题跟着变');
+    assert.match(text, /Undo/, '撤销按钮跟着变');
+    assert.ok(!/适应视图/.test(text), '不该再出现中文工具条');
+    assert.ok(!/第 1 轮/.test(text), '不该再出现中文块标题');
+  } finally {
+    ctx.locale.set({ active: 'zh' });
+  }
+});
+
+test('语言变化会就地生效，不需要重新挂载', async () => {
+  ctx.locale.set({ active: 'zh' });
+  try {
+    let tree = await mountLoaded();
+    assert.match(textIn(tree), /适应视图 F/);
+    ctx.locale.set({ active: 'en' });           /* 通知订阅者 */
+    tree = render(ctx.slots.Component, props);
+    assert.match(textIn(tree), /Fit view \(F\)/, '同一实例上换语言即生效');
+  } finally {
+    ctx.locale.set({ active: 'zh' });
+  }
+});
+
+test('不认识的键不会在界面上留空洞', async () => {
+  const tree = await mountLoaded();
+  /* 抽查几个主要区域，确认没有 undefined 漏出来 */
+  const text = textIn(tree);
+  assert.ok(!/undefined/.test(text), '没有 undefined');
+  assert.ok(!/\{turn\}|\{n\}|\{msg\}/.test(text), '没有未插值的占位符');
 });
