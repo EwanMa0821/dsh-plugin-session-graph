@@ -2301,8 +2301,7 @@ const diagStore = (() => {
   };
 })();
 
-/** 记一条降级：给角标留痕，也给控制台留一条 warn（不打断用户） */
-function degrade(reason, error) {
+/** 记一条降级：给角标留痕，也给控制台留一条 warn（不打断用户） */function degrade(reason, error) {
   diagStore.add(reason, error);
   try { console.warn('[session-graph] 降级：' + reason, error || ''); } catch { /* 控制台不可用 */ }
 }
@@ -3444,7 +3443,9 @@ function GraphView(props) {
     }
     const b = n.block;
     /* FR-13：部分块数据读不出来时**该块降级**，而不是整张图报错。
-       判定与 stats.incomplete 一致：这一轮已结束，但提问与回答都没有文本。 */
+       判定与 stats.incomplete 一致：这一轮已结束，但提问与回答都没有文本。
+       （切视图会有一次重挂载，靠 remoteCache 让首帧就带正文，
+       所以这里不必再按"尚未载入"区分 —— 首帧告警态本身是有意的降级表达。） */
     const thin = b.status !== 'open' && !digest(b.prompt) && !digest(b.response);
     /* FR-4：超规模时 Host 把这个块降成了骨架 —— 有提问预览、没有回答。
        本地时间线若带着正文，合并之后就不再是骨架，那时按普通块画。 */
