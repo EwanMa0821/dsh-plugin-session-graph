@@ -1059,6 +1059,136 @@ test('Esc 取消重命名且不写入', async () => {
   }
 });
 
+/* ------------------------------------------------------- 手动布局 FR-5 */
+
+test('拖块移动：过程只改本地坐标，松手才落盘', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const before = postCalls.length;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    const x0 = nodeEl(tree, 'root:1').props.style.left;
+
+    press(tree, { node: 'root:1', x: 100, y: 100 });
+    tree = render(ctx.slots.Component, props);
+    /* 缩放不为 1 时位移要换算回世界坐标，所以只断言方向与"动了" */
+    fire('mousemove', { clientX: 220, clientY: 180, preventDefault() {} });
+    tree = render(ctx.slots.Component, props);
+    const xLive = nodeEl(tree, 'root:1').props.style.left;
+    assert.ok(xLive > x0, '拖动过程中块跟着指针走');
+    assert.equal(nodeEl(tree, 'root:1').props.style.top > 0, true, '纵向同样动了');
+
+    /* 拖动中不该落盘 */
+    await new Promise((r) => setTimeout(r, 520));
+    assert.equal(postCalls.slice(before).filter((p) => p.patch.positions).length, 0, '过程里不写');
+
+    fire('mouseup', {});
+    tree = render(ctx.slots.Component, props);
+    assert.equal(nodeEl(tree, 'root:1').props.style.left, xLive, '松手后停在原地');
+
+    await new Promise((r) => setTimeout(r, 520));
+    const sent = postCalls.slice(before).find((p) => p.patch.positions);
+    assert.ok(sent, '松手写入自有布局');
+    assert.deepEqual(sent.patch.positions['root:1'], { x: xLive, y: nodeEl(tree, 'root:1').props.style.top });
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('拖块不牵动同会话其它块', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    const other0 = nodeEl(tree, 'root:2').props.style.top;
+
+    press(tree, { node: 'root:1', x: 100, y: 100 });
+    render(ctx.slots.Component, props);
+    fire('mousemove', { clientX: 200, clientY: 260, preventDefault() {} });
+    render(ctx.slots.Component, props);
+    fire('mouseup', {});
+    tree = render(ctx.slots.Component, props);
+
+    assert.equal(nodeEl(tree, 'root:2').props.style.top, other0, '邻居一动不动');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('拖空白仍然是平移，且不动任何块坐标', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const before = postCalls.length;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    const world0 = elements(tree).find((n) => n.props && n.props.className === 'sg-world')
+      .props.style.transform;
+    const block0 = nodeEl(tree, 'root:1').props.style.left;
+
+    press(tree, { x: 400, y: 300 });          /* 不落在任何块上 */
+    render(ctx.slots.Component, props);
+    fire('mousemove', { clientX: 460, clientY: 300, preventDefault() {} });
+    tree = render(ctx.slots.Component, props);
+
+    const worldNow = elements(tree).find((n) => n.props && n.props.className === 'sg-world')
+      .props.style.transform;
+    assert.notEqual(worldNow, world0, '视口平移了');
+    assert.equal(nodeEl(tree, 'root:1').props.style.left, block0, '块坐标没被碰');
+
+    fire('mouseup', {});
+    render(ctx.slots.Component, props);
+    await new Promise((r) => setTimeout(r, 520));
+    assert.equal(postCalls.slice(before).filter((p) => p.patch.positions).length, 0);
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('拖动后撤销能回到原位', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    const x0 = nodeEl(tree, 'root:1').props.style.left;
+    const y0 = nodeEl(tree, 'root:1').props.style.top;
+
+    press(tree, { node: 'root:1', x: 100, y: 100 });
+    render(ctx.slots.Component, props);
+    fire('mousemove', { clientX: 260, clientY: 240, preventDefault() {} });
+    render(ctx.slots.Component, props);
+    fire('mouseup', {});
+    tree = render(ctx.slots.Component, props);
+    assert.notEqual(nodeEl(tree, 'root:1').props.style.left, x0, '确实挪过');
+
+    elements(tree).find((n) => n.props && n.props.className === 'sg-btn'
+      && String(n.props.children).includes('撤销')).props.onClick();
+    tree = render(ctx.slots.Component, props);
+    assert.equal(nodeEl(tree, 'root:1').props.style.left, x0, '撤销回到原位');
+    assert.equal(nodeEl(tree, 'root:1').props.style.top, y0);
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('存档里的块坐标在加载时就生效（FR-5 验收 1）', async () => {
+  serverReply = { ...serverReply, state: blankState({ positions: { 'root:1': { x: 640, y: 12 } } }) };
+  try {
+    const tree = await mountLoaded();
+    assert.equal(nodeEl(tree, 'root:1').props.style.left, 640, '重开后位置保持');
+    assert.equal(nodeEl(tree, 'root:1').props.style.top, 12);
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
 test('点边标签即选中该连线，可改标签也可删除', async () => {
   serverReply = {
     ...serverReply,

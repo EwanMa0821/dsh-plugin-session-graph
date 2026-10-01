@@ -696,6 +696,68 @@ test('render 按格式分发', () => {
   assert.match(render(g, 'unknown').content, /^<map/, '未知格式回落 mm');
 });
 
+/* --------------------------------------------------- 手动布局（FR-5） */
+
+/** 同一会话里三块，方便观察"拖走一块会不会牵动别人" */
+const stackGraph = () => buildGraph({
+  sessions: normalizeSessions([{ id: 'root', title: '根' }]),
+  turnsBySession: { root: [1, 2, 3].map((n) => turn(n, 'Q' + n, 'A' + n)) },
+  currentId: 'root'
+});
+const atOf = (result, id) => {
+  const n = result.nodes.find((x) => x.id === id);
+  return n ? { x: n.x, y: n.y, moved: !!n.moved } : null;
+};
+
+test('layout 尊重已保存坐标：已拖拽过的块坐标即权威', () => {
+  const g = stackGraph();
+  const auto = layout(g);
+  const saved = layout(g, { positions: { 'root:2': { x: 900, y: 40 } } });
+
+  assert.deepEqual(atOf(saved, 'root:2'), { x: 900, y: 40, moved: true }, '用存档坐标');
+  assert.deepEqual(atOf(saved, 'root:1'), { x: auto.nodes.find((n) => n.id === 'root:1').x,
+    y: auto.nodes.find((n) => n.id === 'root:1').y, moved: false }, '同会话其它块不被牵动');
+  assert.deepEqual(atOf(saved, 'root:3'), { x: auto.nodes.find((n) => n.id === 'root:3').x,
+    y: auto.nodes.find((n) => n.id === 'root:3').y, moved: false });
+});
+
+test('layout 只在没有坐标时自动落位 —— 新块落在本会话最下方', () => {
+  const g = stackGraph();
+  const before = layout(g, { positions: { 'root:1': { x: 500, y: 500 } } });
+  const y1 = atOf(before, 'root:1').y;
+  const y2 = atOf(before, 'root:2').y;
+  assert.equal(y1, 500, '第一块在存档位置');
+  assert.ok(y2 < 500, '第二块仍在自动位，没有因为第一块被拖走而跟着跑');
+});
+
+test('layout 忽略未知块 id 的坐标记录，不报错也不删别的', () => {
+  const g = stackGraph();
+  const saved = layout(g, {
+    positions: { 'ghost:9': { x: 1, y: 2 }, 'root:1': { x: 7, y: 8 } }
+  });
+  assert.equal(saved.nodes.some((n) => n.id === 'ghost:9'), false, '幽灵记录被忽略');
+  assert.deepEqual(atOf(saved, 'root:1'), { x: 7, y: 8, moved: true }, '同批里的合法记录照常生效');
+});
+
+test('layout 容忍畸形坐标：非数字就当没给', () => {
+  const g = stackGraph();
+  const auto = layout(g);
+  const saved = layout(g, {
+    positions: { 'root:1': { x: 'no', y: 1 }, 'root:2': null, 'root:3': { x: NaN, y: 3 } }
+  });
+  ['root:1', 'root:2', 'root:3'].forEach((id) => {
+    assert.equal(atOf(saved, id).y, auto.nodes.find((n) => n.id === id).y, id + ' 回到自动位');
+    assert.equal(atOf(saved, id).moved, false);
+  });
+});
+
+test('bounds 把被拖远的块也算进去，适应视图才不会漏掉它', () => {
+  const g = stackGraph();
+  const auto = layout(g);
+  const saved = layout(g, { positions: { 'root:1': { x: 2000, y: 0 } } });
+  assert.ok(bounds(saved.nodes).maxX > bounds(auto.nodes).maxX + 1000);
+});
+
 /* --------------------------------------------------------- 布局常量契约 */
 
 test('默认布局常量与原型一致', () => {

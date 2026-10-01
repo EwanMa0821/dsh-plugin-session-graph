@@ -24,11 +24,18 @@ const T = (n) => [n.x + n.w / 2, n.y];
 
 /**
  * 分层布局。同一列内按家族顺序自上而下堆叠，绝不重叠。
+ *
+ * FR-5：**已拖拽过的块坐标即权威**，自动布局只负责没有坐标的那些。
+ * 这样拖走某一块不会牵动同会话的其它块，新轮次也会落在本会话最下方。
+ * 传入的坐标里若有未知块 id，忽略即可（上层已经按现有块查找）。
+ *
  * @param {object} graph buildGraph 的结果
- * @param {object} [opts] 覆盖 DEFAULT_LAYOUT
+ * @param {object} [opts] 覆盖 DEFAULT_LAYOUT，另可含 `positions`
  */
 export function layout(graph, opts) {
-  const o = { ...DEFAULT_LAYOUT, ...(opts || {}) };
+  const { positions, ...rest } = opts || {};
+  const o = { ...DEFAULT_LAYOUT, ...rest };
+  const saved = positions && typeof positions === 'object' ? positions : {};
   const byId = new Map(graph.sessions.map((s) => [s.id, s]));
 
   /* 列 = 血缘深度；上溯带环保护 */
@@ -79,9 +86,16 @@ export function layout(graph, opts) {
       });
     }
     list.forEach((b, i) => {
+      const p = saved[b.id];
+      const pinned = p && Number.isFinite(p.x) && Number.isFinite(p.y);
       nodes.push({
         id: b.id, kind: 'block', sessionId: sid,
-        x, y: firstBlockY + i * o.pitch, w: o.blockWidth, h: o.blockHeight, block: b
+        x: pinned ? p.x : x,
+        y: pinned ? p.y : firstBlockY + i * o.pitch,
+        w: o.blockWidth, h: o.blockHeight,
+        /* moved 让界面能区分"用户摆过"与"自动落的位" */
+        moved: !!pinned,
+        block: b
       });
     });
 

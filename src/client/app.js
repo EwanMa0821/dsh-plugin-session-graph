@@ -278,6 +278,10 @@ function GraphView(props) {
   const [hidden, setHidden] = React.useState({});
   const [alias, setAlias] = React.useState({});
   const [links, setLinks] = React.useState([]);
+  /* 用户摆过的坐标（FR-5：已拖拽过的块坐标即权威） */
+  const [positions, setPositions] = React.useState({});
+  /* 正在拖动中的块：{ id, x, y }，只在本地生效，松手才落盘 */
+  const [draggingBlock, setDraggingBlock] = React.useState(null);
   const [selectedEdge, setSelectedEdge] = React.useState(null);
   /* 正在改名的块：{ id, value } */
   const [renaming, setRenaming] = React.useState(null);
@@ -354,6 +358,7 @@ function GraphView(props) {
         setHidden(saved && saved.hidden ? saved.hidden : {});
         setAlias(saved && saved.alias ? saved.alias : {});
         setLinks(saved && saved.links ? saved.links : []);
+        setPositions(saved && saved.positions ? saved.positions : {});
         setWritable(data.writable !== false);
         setIncompatible(!!data.incompatible);
         savedViewportRef.current = (saved && saved.viewport) || null;
@@ -444,10 +449,22 @@ function GraphView(props) {
 
   const laid = React.useMemo(() => {
     if (!graph || graph.error) return { nodes: [], headers: new Map(), bounds: null, opts: DEFAULT_LAYOUT };
-    try { return layout(graph); } catch { return { nodes: [], headers: new Map(), bounds: null, opts: DEFAULT_LAYOUT }; }
-  }, [graph]);
+    try {
+      /* 传进已摆过的坐标：布局只负责没有坐标的那些（FR-5） */
+      return layout(graph, { positions });
+    } catch {
+      return { nodes: [], headers: new Map(), bounds: null, opts: DEFAULT_LAYOUT };
+    }
+  }, [graph, positions]);
 
-  const nodeMap = React.useMemo(() => new Map(laid.nodes.map((n) => [n.id, n])), [laid]);
+  /* 拖动中的块就地覆盖坐标：连线跟着走，松手才落盘 */
+  const shownNodes = React.useMemo(() => {
+    if (!draggingBlock) return laid.nodes;
+    return laid.nodes.map((n) => (n.id === draggingBlock.id
+      ? { ...n, x: draggingBlock.x, y: draggingBlock.y } : n));
+  }, [laid, draggingBlock]);
+
+  const nodeMap = React.useMemo(() => new Map(shownNodes.map((n) => [n.id, n])), [shownNodes]);
 
   /* 视口是否被**用户**动过：挂载时把刚恢复的视口原样写回去是纯浪费，
      而且会让「打开一次图谱」产生一次写入。
@@ -512,19 +529,24 @@ function GraphView(props) {
 
   /** 在任何变更**之前**调用 */
   const remember = React.useCallback(() => {
-    historyRef.current.push({ hidden, alias, links });
+    historyRef.current.push({ hidden, alias, links, positions });
     if (historyRef.current.length > 50) historyRef.current.shift();
     setCanUndo(true);
-  }, [hidden, alias, links]);
+  }, [hidden, alias, links, positions]);
 
   /** 把界面与存档一起恢复到某个快照；多出来的连线要显式删掉 */
   const applySnapshot = React.useCallback((snap) => {
     const keep = new Set(snap.links.map((l) => l.id));
     const removeLinkIds = links.filter((l) => !keep.has(l.id)).map((l) => l.id);
+    const nextPositions = snap.positions || {};
     setHidden(snap.hidden);
     setAlias(snap.alias);
     setLinks(snap.links);
-    persist({ hidden: snap.hidden, alias: snap.alias, links: snap.links, removeLinkIds });
+    setPositions(nextPositions);
+    persist({
+      hidden: snap.hidden, alias: snap.alias, links: snap.links,
+      positions: nextPositions, removeLinkIds
+    });
   }, [links, persist]);
 
   const undo = React.useCallback(() => {
@@ -638,13 +660,12 @@ function GraphView(props) {
     /* 在**按下**时选中，而不是等抬起：双击过程中手抖一两个像素很常见，
        若靠"没移动过"来决定选中，双击就会既不选中、又照样分叉 */
     if (hit) setSelected(hit);
-    drag.current = {
-      kind: 'pan',
-      sx: ev.clientX, sy: ev.clientY,
-      px: view.panX, py: view.panY,
-      moved: false,
-      id: hit
-    };
+    const node = hit ? nodeMap.get(hit) : null;
+    /* 拖块 = 移动块，拖空白 = 平移（FR-5）。块上起手不再平移 ——
+       那会让"想挪块"变成"整张图跑掉"。 */
+    drag.current = node && node.kind === 'block'
+      ? { kind: 'move', id: hit, sx: ev.clientX, sy: ev.clientY, ox: node.x, oy: node.y, moved: false, focus: hit }
+      : { kind: 'pan', sx: ev.clientX, sy: ev.clientY, px: view.panX, py: view.panY, moved: false, id: hit };
     setPanning(true);
   }, [nodeMap, view, linking, createLink, say, toWorld, toCanvas]);
 
@@ -652,7 +673,10 @@ function GraphView(props) {
      新建回调、节点表…），直接闭包会读到陈旧值；把最新值放进 ref，
      既不重复注册监听、又永远读到当前值。 */
   const latestRef = React.useRef({});
-  latestRef.current = { linking, createLink, say, toWorld, toCanvas, nodeMap };
+  latestRef.current = {
+    linking, createLink, say, toWorld, toCanvas, nodeMap,
+    draggingBlock, positions, view, remember, persist
+  };
 
   React.useEffect(() => {
     const move = (ev) => {
@@ -670,11 +694,37 @@ function GraphView(props) {
       if (typeof ev.preventDefault === 'function') ev.preventDefault();
       const dx = ev.clientX - d.sx;
       const dy = ev.clientY - d.sy;
-      if (Math.abs(dx) + Math.abs(dy) > 3) { d.moved = true; viewTouchedRef.current = true; }
-      if (d.kind === 'pan') setView((v) => ({ ...v, panX: d.px + dx, panY: d.py + dy, fitted: true }));
+      if (Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
+      if (d.kind === 'move') {
+        /* 坐标按当前缩放换算回世界坐标，块才会贴着指针走 */
+        const k = L.view && L.view.scale ? L.view.scale : 1;
+        setDraggingBlock({ id: d.id, x: Math.round(d.ox + dx / k), y: Math.round(d.oy + dy / k) });
+        return;
+      }
+      if (d.kind === 'pan') {
+        viewTouchedRef.current = true;
+        setView((v) => ({ ...v, panX: d.px + dx, panY: d.py + dy, fitted: true }));
+      }
     };
     const up = (ev) => {
       const L = latestRef.current;
+      const d = drag.current;
+      drag.current = null;
+      setPanning(false);
+
+      /* 松手才落盘（FR-5：松手后写入自有布局），拖动过程中只改本地坐标 */
+      if (d && d.kind === 'move') {
+        const live = L.draggingBlock;
+        setDraggingBlock(null);
+        if (d.moved && live && live.id === d.id) {
+          const next = { ...L.positions, [d.id]: { x: live.x, y: live.y } };
+          L.remember();
+          setPositions(next);
+          L.persist({ positions: next });
+        }
+        return;
+      }
+
       /* 松手落在哪个块上就与它连线；落在空白处取消（FR-9） */
       if (L.linking && L.linking.mode === 'drag') {
         const el = ev && ev.target;
@@ -687,9 +737,7 @@ function GraphView(props) {
         if (L.nodeMap.has(to)) L.createLink(from, to, L.toCanvas(ev));
         return;
       }
-      const d = drag.current;
-      drag.current = null;
-      setPanning(false);
+
       /* 空白处单击（且没拖动）才清选中；点在块上时选中已在按下时给过了 */
       if (d && !d.moved && !d.id) setSelected(null);
     };
@@ -826,7 +874,7 @@ function GraphView(props) {
   }, [exportFmt, exportHidden, exportText, routeUrl, saveUrl, say]);
 
   /* ---- 渲染 ---- */
-  const nodes = showHidden ? laid.nodes : laid.nodes.filter((n) => !(n.kind === 'block' && n.block.hidden));
+  const nodes = showHidden ? shownNodes : shownNodes.filter((n) => !(n.kind === 'block' && n.block.hidden));
   const cell = nodes.map((n) => {
     if (n.kind === 'header') {
       return h('div', {
