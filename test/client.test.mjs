@@ -324,7 +324,10 @@ function fakeCtx() {
     })(),
     workspaces: {
       list: source({ items: [{ workspaceId: 'ws-1', sessionIds: ['root', 'ancor', 'invest'] }] })
-    }
+    },
+    /* cordis 的服务查找入口：插件对**可选**服务只能走这个口，
+       属性访问（ctx.workspaces）在未声明 inject 时会直接抛。 */
+    get(name) { return this[name]; }
   };
   return ctx;
 }
@@ -1955,6 +1958,30 @@ test('sessions= 只报家族内的会话：家族外的会话不该进请求（�
   } finally {
     ctx.sessions.list = savedList;
   }
+});
+
+test('不直接读未 inject 的服务：ctx.workspaces 属性访问抛错时视图照常渲染', () => {
+  /* cordis 的硬规则：没有声明在 inject 里的服务，**属性访问直接抛**
+     `cannot get property "workspaces" without inject`。宿主会把抛错的组件整个卸掉，
+     标签却照常显示 —— 现象就是"图谱标签在、视图一片空白"。
+     这条用例把宿主那条例外原样搬过来，确保我们只走 ctx.get()。 */
+  const strictCtx = {
+    get(name) {
+      if (name === 'workspaces') return { list: { getSnapshot: () => ({ items: [] }), subscribe: () => () => {} } };
+      return undefined;
+    },
+    get workspaces() { throw new Error('cannot get property "workspaces" without inject'); }
+  };
+  const p = {
+    sessionId: 'root',
+    ctx: strictCtx,
+    sessions: { list: { getSnapshot: () => ({ byId: {} }), subscribe: () => () => {} } }
+  };
+  let tree;
+  assert.doesNotThrow(() => { tree = ctx.slots.Component(p); }, '未 inject 的服务只能走 get()');
+  const texts = JSON.stringify(tree);
+  assert.ok(texts.includes('适应视图'), '视图照常渲染（工具条在）');
+  assert.ok(!texts.includes('会话图谱渲染失败'), '不该走到兜底卡片');
 });
 
 /* ============================================================================

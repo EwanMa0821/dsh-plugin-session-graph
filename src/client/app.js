@@ -71,6 +71,24 @@ function viewLabel(ctx) {
   return makeT(activeLocaleOf(ctx), localeResolver(ctx))('view.title');
 }
 
+/**
+ * 读一个**可选**服务，读不到就返回 undefined。
+ *
+ * cordis 对没有声明在 `inject` 里的服务，**属性访问会直接抛**：
+ * `cannot get property "workspaces" without inject`。这条例外一抛就把整个视图变白屏
+ * （宿主会把抛错的组件卸掉，标签却照常显示，看起来只是"没内容"）。
+ * 所以可选能力一律走 `ctx.get(name)`，并且**连 get 本身也守**——
+ * 查不到或它抛错都只是"没有这个能力"，绝不该带走整个视图。
+ */
+function optionalService(ctx, name) {
+  try {
+    if (!ctx || typeof ctx.get !== 'function') return undefined;
+    return ctx.get(name);
+  } catch {
+    return undefined;
+  }
+}
+
 /** 正文渲染：优先用宿主的渲染器，缺失时退回纯文本 */
 function markdownBlock(text, key, labels) {
   if (!MarkdownText) return h('div', { key, className: 'sg-tx' }, text);
@@ -363,7 +381,9 @@ function resolveSessionId(props, snapshot) {
 /** 归属某个会话的工作区 id；拿不到就回落第一个 */
 function workspaceIdOf(ctx, sessionId) {
   try {
-    const snap = ctx && ctx.workspaces && ctx.workspaces.list && ctx.workspaces.list.getSnapshot();
+    /* 可选服务：走 optionalService，别用 ctx.workspaces 属性访问（未 inject 会抛） */
+    const svc = optionalService(ctx, 'workspaces');
+    const snap = svc && svc.list && svc.list.getSnapshot();
     const items = snap && Array.isArray(snap.items) ? snap.items : [];
     const hit = items.find((it) => Array.isArray(it.sessionIds) && it.sessionIds.includes(sessionId));
     return (hit && hit.workspaceId) || (items[0] && items[0].workspaceId) || '';
@@ -377,8 +397,11 @@ function workspaceIdOf(ctx, sessionId) {
 function GraphView(props) {
   const { ctx, target, sessions } = props || {};
   const listSnapshot = useSource(sessions && sessions.list);
-  /* 归档会话在图谱里仍会出现，但**点不动**（FR-14：目标不可用要禁用并说明原因） */
-  const wsSnapshot = useSource(ctx && ctx.workspaces && ctx.workspaces.list);
+  /* 归档会话在图谱里仍会出现，但**点不动**（FR-14：目标不可用要禁用并说明原因）。
+     `workspaces` 是可选服务，只能走 ctx.get —— 属性访问在未 inject 时会抛，
+     而这一抛会让宿主把整个视图卸掉（白屏）。 */
+  const workspacesSvc = optionalService(ctx, 'workspaces');
+  const wsSnapshot = useSource(workspacesSvc && workspacesSvc.list);
   const archivedIds = React.useMemo(
     () => new Set((wsSnapshot && Array.isArray(wsSnapshot.archivedSessionIds))
       ? wsSnapshot.archivedSessionIds : []),
