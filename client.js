@@ -2184,7 +2184,11 @@ const CSS = `
   font-size:11px;white-space:nowrap}
 /* 右栏：元信息与操作**固定**在上，只有正文区滚动。
    正文可能很长，若把它排在前面，元信息和操作会被永远挤出可视区。 */
-.sg-side{flex:0 0 clamp(320px, 26vw, 430px);border-left:.5px solid var(--dsw-alias-border-l1);display:flex;
+/* 宽度对齐原型（prototype/session-graph-interactive.html 里是 width:330px / flex:0 0 330px）。
+   原先的 clamp(320px,26vw,430px) 在窄窗口里会吃掉半个屏幕，画布挤成一条 ——
+   用户看到的就是"侧边栏太宽、看不到对话内容"。窄窗口用 46vw 兜底，保证画布还剩一半。
+   min-height:0 与下面正文区的 overflow 一起，才是"正文能滚、元信息与操作不被挤走"。 */
+.sg-side{flex:0 0 min(330px, 46vw);border-left:.5px solid var(--dsw-alias-border-l1);display:flex;
   flex-direction:column;min-height:0;user-select:text;-webkit-user-select:text}
 .sg-side-hd{padding:13px 15px 11px;border-bottom:.5px solid var(--dsw-alias-border-l1);display:flex;
   align-items:center;gap:8px;flex:0 0 auto}
@@ -2197,8 +2201,11 @@ const CSS = `
 .sg-side-meta{padding:12px 15px 0;flex:0 0 auto}
 .sg-side-acts{padding:12px 15px 13px;flex:0 0 auto;border-top:.5px solid var(--dsw-alias-border-l1);
   margin-top:12px;display:flex;flex-direction:column;gap:7px}
-/* 唯一滚动的区域 */
-.sg-side-bd{flex:1;overflow-y:auto;padding:12px 15px 16px;min-height:0}
+/* 唯一滚动的区域。
+   底部留出输入框的高度：视图根铺满整个对话根（含输入框所在区域），
+   输入框的 z-index 更高，会把正文最后一段盖住 —— 用户看到的就是"看不到对话内容"。
+   把这段高度用 padding 让出来，最后一段就能滚进可视区点得到、看得见。 */
+.sg-side-bd{flex:1;overflow-y:auto;padding:12px 15px 16px;padding-bottom:calc(16px + 96px);min-height:0}
 /* 小标题在正文区与固定区都要用，所以不做后代限定 */
 .sg-lb{font-size:11px;font-weight:600;letter-spacing:.05em;color:var(--dsw-alias-label-caption);
   margin-bottom:6px}
