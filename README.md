@@ -185,9 +185,9 @@ node scripts/build-client.mjs   # 改过 src/ 之后必须跑
 | 客户端 UI 基础件 | `@deepseek-ai/dsh-client-ui-primitives` 是**基线模块**，客户端产物可直接 `require`（`dsh-client-ui-conversation` 自己也这么干，且没有插件把它写进 `dsh.client.external`）。`MarkdownText` 的 props 是 `{text, labels, variant, streaming}`，**`labels` 必给**，否则内部读属性会炸；键只有 6 个。`extractMarkdownPlainText(text, {mode})` 支持 `all` / `first-line` / `first-paragraph` |
 | 主题 | 只用 `--dsw-alias-*` 变量；除 `react` 与上面那个基础件外不 require 任何宿主包 |
 
-### 三个会让插件静默失效的坑
+### 四个会让插件静默失效的坑
 
-`scripts/check-package.mjs` 会拦住前两个。
+`scripts/check-package.mjs` 会拦住其中三个。
 
 1. **`Config` 必须是 Schemastery schema。** 用普通对象声明会让配置校验失败、fiber 被拒，
    **整个 Host 半不加载**，浏览器侧只看到一个 404。
@@ -195,6 +195,19 @@ node scripts/build-client.mjs   # 改过 src/ 之后必须跑
    要用可选服务就写 `ctx.inject([...], cb)`，让插件本体先挂载。
 3. **不要把新的事件 `type` 写进会话日志。** 读取方要求 `ignorable: true`，而 `Session.append()`
    设不了它——写进去会让整个会话打不开。插件只读不写，正是为了绕开这条。
+4. **客户端清单里绝不能写 `dsh.client.immediately: true`。** 宿主把这类条目编进
+   **Vite 壳之前**的 bootstrap 批次，而客户端 runner 挂载插件时会 `await fiber.await()`
+   等它落定；本插件注入的 `uiConversation` / `uiSession` / `uiWorkspace` 都由**非 immediately**
+   的视图插件提供、要等壳起来之后才存在 —— fiber 永远落不定，**整个壳被卡死**：
+   窗口画得出来，但切不了会话、输入框打不了字、也没有任何标签。
+   产品里只有基础设施包声明它（`api-gateway`、`client-locale`、`ui-renderer` 等 10 个），
+   61 个视图插件一个都没声明。同理，客户端 `inject` 里**只列真正必需的服务**：
+   多列一个可选能力的名字（例如 `workspaces`），它缺席时同样会把自己钉在 pending 上。
+
+   还有一条同源的：槽位 `label` 是**由宿主在模块作用域直接调用**的 thunk
+   （`ui-slots` 的 `resolveSlotLabel` 没有兜底），注册时、**切会话时**、换语言时都会跑。
+   它一旦抛错（例如引用了只存在于组件作用域里的 `t`），`activateView` 直接失败 ——
+   又是"切不了会话、打不了字"。所以标签必须按当前语言现取。
 
 ---
 

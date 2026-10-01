@@ -44,6 +44,14 @@ if (pkg) {
   check(client && client.platform === 'web', 'dsh.client.platform 为 web');
   check(client && Array.isArray(client.inject) && client.inject.length > 0,
     'dsh.client.inject 声明了需要先激活的宿主客户端包');
+  /* **绝不能声明 immediately。** 宿主把这类条目编进「Vite 壳之前」的 bootstrap 批次，
+     而客户端 runner 挂载插件时会 await fiber.await()；本插件注入的 uiConversation /
+     uiSession / uiWorkspace 都由非 immediately 的视图插件提供、要等壳起来之后才存在，
+     于是 fiber 永远落不定 → 整个壳被卡死（窗口画得出来，但完全不可交互、也没有标签）。
+     产品里只有基础设施包声明它（api-gateway、client-locale、ui-renderer 等 10 个），
+     61 个视图插件一个都没有。这条断言就是那次"一装插件整个界面就废"的护栏。 */
+  check(client && client.immediately === undefined,
+    'dsh.client 不声明 immediately（视图插件进引导批次会卡死整个壳）');
 
   const ex = pkg.exports || {};
   check(ex['.'] === './index.js', 'exports["."] 指向 Host 半');

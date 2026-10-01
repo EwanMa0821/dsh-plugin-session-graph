@@ -3803,6 +3803,12 @@ function apply(ctx) {
   }, GraphView));
 }
 
-return { inject: ['slots', 'sessions', 'uiSession', 'uiConversation', 'uiWorkspace', 'workspaces'], apply };
+/* 服务依赖。**只列真正必需、且产品自身的视图插件也依赖的服务**：
+   多列一个名字，一旦它没出现，整个插件就会永远停在 pending；而客户端 runner 是
+   `await fiber.await()` 等插件落定的，卡住的不只是本插件（见 README「immediately」那条）。
+   所以 `workspaces`（api-workspace-controller 的服务）不进这张表 —— 只有引用式新建会话
+   会用到它，那里已经退化成"取不到就说明原因"，属于可选能力，不配当启动前提。
+   `locale` 则与产品视图插件一致地列上：标签、Markdown 标签与数字排版都走它。 */
+return { inject: ['slots', 'sessions', 'uiSession', 'uiConversation', 'uiWorkspace', 'locale'], apply };
   }
 });

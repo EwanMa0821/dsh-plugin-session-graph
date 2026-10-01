@@ -15,6 +15,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
+const { readFileSync } = fs;
+
 /* ------------------------------------------------- 最小浏览器环境 */
 
 const registered = [];
@@ -162,9 +164,25 @@ const api = registered[0].factory((name) => {
 });
 
 test('factory 返回 { inject, apply }', () => {
+  /* 只列必需、且产品自身的视图插件也依赖的服务：`workspaces` 这类可选能力的服务一旦缺席，
+     插件会永远停在 pending，而客户端 runner 是 `await fiber.await()` 等它落定的 ——
+     卡住的是整个壳（见 README「immediately」那条）。 */
   assert.deepEqual(api.inject,
-    ['slots', 'sessions', 'uiSession', 'uiConversation', 'uiWorkspace', 'workspaces']);
+    ['slots', 'sessions', 'uiSession', 'uiConversation', 'uiWorkspace', 'locale']);
+  assert.ok(!api.inject.includes('workspaces'), '可选能力的服务不能进 inject');
   assert.equal(typeof api.apply, 'function');
+});
+
+test('客户端清单不得声明 immediately：那会把插件塞进壳之前的引导批次', () => {
+  /* 宿主把 dsh.client.immediately 的条目编入 **Vite 壳之前**的 bootstrap 批次；
+     而客户端 runner 挂载插件时会 await fiber.await()。本插件注入的 uiConversation /
+     uiSession / uiWorkspace 都由**非 immediately** 的视图插件提供、要等壳起来之后才存在，
+     于是 fiber 永远落不定 → 壳被卡死：窗口画得出来，但完全不可交互、也没有任何标签。
+     产品里只有基础设施包（api-gateway / client-locale / ui-renderer 等 10 个）声明它，
+     61 个视图插件一个都没声明。 */
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(pkg.dsh.client.immediately, undefined, 'immediately 只能由基础设施包声明');
+  assert.equal(pkg.dsh.client.platform, 'web');
 });
 
 /* --------------------------------------------------- 假宿主与假数据 */
