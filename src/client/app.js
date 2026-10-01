@@ -119,7 +119,7 @@ const CSS = `
 /* 视图根铺满整个对话根，**包括输入框所占的那一条**。输入框的 z-index 更高，
    所以这里必须给它让位：padding-bottom 让画布与侧栏一起收在输入框之上
    （只给侧栏正文留白是不够的 —— 侧栏最后一段会被压住，正是"看不到对话内容"的成因）。 */
-.sg-root{position:absolute;inset:0;box-sizing:border-box;padding-bottom:var(--sg-composer-reserve, 104px);display:flex;font-family:inherit;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-base);user-select:none;-webkit-user-select:none}
+.sg-root{position:absolute;inset:0;box-sizing:border-box;padding-bottom:var(--sg-composer-reserve, 152px);display:flex;font-family:inherit;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-base);user-select:none;-webkit-user-select:none}
 .sg-canvas-wrap{flex:1;min-width:0;position:relative;overflow:hidden;user-select:none;-webkit-user-select:none;
   cursor:grab;
   background-image:radial-gradient(var(--dsw-alias-border-l2) 1px,transparent 1px);background-size:22px 22px}
@@ -390,9 +390,17 @@ function measureComposer(rootEl) {
     if (!doc || typeof doc.querySelector !== 'function') return;
     const seat = doc.querySelector('[data-conversation-composer-overlay], [class*="composerSeat"]');
     if (!seat || typeof seat.getBoundingClientRect !== 'function') return;
-    const overlap = Math.round(rootEl.getBoundingClientRect().bottom - seat.getBoundingClientRect().top);
-    const reserve = Math.max(0, Math.min(overlap, 400));
-    rootEl.style.setProperty('--sg-composer-reserve', reserve + 'px');
+    /* 变量必须写在**消费它的那个元素**上：CSS 变量只向下继承，
+       写在画布容器（hostRef）上，.sg-root 的 padding-bottom 根本读不到 ——
+       这正是"还是被遮挡"的原因。所以从当前元素往上找到 .sg-root 再写。 */
+    let host = rootEl;
+    while (host && !(typeof host.className === 'string'
+      && host.className.split(' ').indexOf('sg-root') !== -1)) {
+      host = host.parentElement;
+    }
+    const target = host || rootEl;
+    const overlap = Math.round(target.getBoundingClientRect().bottom - seat.getBoundingClientRect().top);
+    target.style.setProperty('--sg-composer-reserve', Math.max(0, Math.min(overlap, 400)) + 'px');
   } catch { /* 量不到就用兜底值，不影响渲染 */ }
 }
 
