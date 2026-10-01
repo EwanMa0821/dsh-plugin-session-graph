@@ -11,7 +11,7 @@
  * 因此首装不需要任何依赖与构建脚本。
  */
 
-import { normalizeSessions, buildGraph } from './src/core/model.js';
+import { normalizeSessions, buildGraph, clip } from './src/core/model.js';
 import { render } from './src/core/export.js';
 import { stateToClient } from './src/core/state.js';
 import { foldTurns, linkForks } from './src/host/fold.js';
@@ -138,6 +138,75 @@ async function readTurns(query, rec) {
   }
 }
 
+/* ---------------------------------------------------- 超规模降级（FR-4） */
+
+/** 骨架块里保留多长的提问预览 —— 需求要「只显示轮次号与提问预览」 */
+export const SKELETON_PREVIEW = 60;
+
+/**
+ * 超出块数预算时把一部分块降级成**骨架块**，而不是让整张图失败。
+ *
+ * 原先这里直接抛 413：一超限就什么都看不到，与 FR-4「未加载轮次显示为骨架块」
+ * 和 FR-13「家族超规模 → 降级提示条」都相反。
+ *
+ * 骨架块保留轮次号、所属会话与**提问预览**（需求明确要求这两样），
+ * 丢掉回答正文 —— 回答才是体积的大头。
+ *
+ * 优先级：当前会话 > 调用方点名的轮次（`full`）> 其余按图顺序。
+ *
+ * @param {Array} blocks 已装配的块
+ * @param {number} budget 预算；为空表示不限制
+ * @param {{currentId?: string, full?: Set<string>}} [opts]
+ * @returns {{blocks: Array, keep: Set<string>, skeleton: number}}
+ */
+export function skeletonize(blocks, budget, opts) {
+  const o = opts || {};
+  const list = Array.isArray(blocks) ? blocks : [];
+  if (!budget || budget <= 0 || list.length <= budget) {
+    return { blocks: list, keep: new Set(list.map((b) => b.id)), skeleton: 0 };
+  }
+  const pinned = o.full instanceof Set ? o.full : new Set(o.full || []);
+
+  /* 点名的块**一定要给**：用户是点着它才发起这次请求的。
+     只调整优先级是不够的 —— 当前会话自己就把预算占满时，点名的块永远挤不进来，
+     「点击骨架块载入」这个功能就等于不存在。点名数量在上游 parseIds 里封了顶。 */
+  const keep = new Set(list.filter((b) => pinned.has(b.id)).map((b) => b.id));
+  const room = Math.max(0, budget - keep.size);
+  const rest = list
+    .filter((b) => !keep.has(b.id))
+    .map((b, i) => ({ b, i, r: b.sessionId === o.currentId ? 0 : 1 }))
+    .sort((x, y) => (x.r - y.r) || (x.i - y.i));
+  rest.slice(0, room).forEach((x) => keep.add(x.b.id));
+
+  let skeleton = 0;
+  const out = list.map((b) => {
+    if (keep.has(b.id)) return b;
+    skeleton += 1;
+    return { ...b, prompt: clip(b.prompt, SKELETON_PREVIEW), response: '', skeleton: true };
+  });
+  return { blocks: out, keep, skeleton };
+}
+
+/**
+ * 轮次明细也要一起降级。
+ *
+ * 客户端会用 `turns` 给家族里其它会话重建块；只降级 `blocks` 而不降级 `turns`，
+ * 客户端一重建就把完整正文又拉回来了，等于没降。
+ */
+export function skeletonizeTurns(turnsBySession, keep) {
+  const out = {};
+  Object.keys(turnsBySession || {}).forEach((sid) => {
+    const list = turnsBySession[sid];
+    if (!Array.isArray(list)) { out[sid] = list; return; }
+    out[sid] = list.map((t) => {
+      const id = `${sid}:${t.turn}`;
+      if (keep.has(id)) return t;
+      return { ...t, prompt: clip(t.prompt, SKELETON_PREVIEW), response: '' };
+    });
+  });
+  return out;
+}
+
 /* ------------------------------------------------------------ 请求处理 */
 
 export async function buildPayload(ctx, params, limits, store) {
@@ -171,9 +240,14 @@ export async function buildPayload(ctx, params, limits, store) {
     sessions, turnsBySession, currentId, includeHidden, hidden, alias, links
   });
 
-  if (limits && limits.maxBlocks && graph.stats.blocks > limits.maxBlocks) {
-    throw Object.assign(new Error(`块数超过上限 ${limits.maxBlocks}`), { status: 413 });
-  }
+  /* 超预算不再抛错，而是降级成骨架块（FR-4） */
+  const budget = limits && limits.maxBlocks ? limits.maxBlocks : 0;
+  const skel = skeletonize(graph.blocks, budget, {
+    currentId,
+    full: parseIds(params.get('full'))
+  });
+  const skeleton = skel.skeleton;
+  const turnsOut = skeleton ? skeletonizeTurns(turnsBySession, skel.keep) : turnsBySession;
 
   if (format === 'json') {
     return {
@@ -184,12 +258,12 @@ export async function buildPayload(ctx, params, limits, store) {
         currentId: graph.currentId,
         order: graph.order,
         notes: graph.notes,
-        stats: graph.stats,
+        stats: { ...graph.stats, blocks: skel.blocks.length, skeleton },
         sessions: graph.sessions,
-        blocks: graph.blocks,
+        blocks: skel.blocks,
         edges: graph.edges,
         /* 各会话的轮次明细，供客户端给"其他会话"也画出块（FR-3） */
-        turns: turnsBySession,
+        turns: turnsOut,
         /* 持久化状态：客户端拿它初始化隐藏/别名/连线/布局；writable 为 false 时只读 */
         state: saved,
         writable: !!(store && stored && stored.writable),
@@ -221,11 +295,18 @@ export function rootOf(sessions, currentId) {
   return cur ? cur.id : currentId;
 }
 
+/** 逗号分隔的块 id 列表 → Set（FR-4 的「点名载入」） */
+function parseIds(value) {
+  const s = typeof value === 'string' ? value : '';
+  if (!s) return null;
+  const ids = s.split(',').map((x) => x.trim()).filter(Boolean);
+  return ids.length ? new Set(ids.slice(0, 400)) : null;
+}
+
 function parseMap(value) {
   if (!value) return {};
   try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === 'object' ? parsed : {};
+    const parsed = JSON.parse(value);    return parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
     throw Object.assign(new Error('hidden / alias 必须是 JSON 对象'), { status: 400 });
   }

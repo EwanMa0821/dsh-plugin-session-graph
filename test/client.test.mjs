@@ -1653,3 +1653,80 @@ test('还在进行中的轮次不算"数据不完整"', async () => {
     serverReply = { ...serverReply, state: null, turns: REMOTE_TURNS };
   }
 });
+
+/* ------------------------------------------ 未载入轮次（FR-4） */
+
+test('骨架块画成骨架样式，保留轮次号与提问预览', async () => {
+  ctx.timeline = NO_TIMELINE;
+  serverReply = {
+    ...serverReply,
+    state: blankState(),
+    turns: {
+      root: [{ turn: 1, startSeq: 10, endSeq: 18, prompt: '提问预览还在', response: '', status: 'done' }],
+      ancor: [], invest: []
+    },
+    blocks: [{ id: 'root:1', sessionId: 'root', turn: 1, skeleton: true }]
+  };
+  try {
+    const tree = await mountLoaded(propsFor('root'));
+    const node = nodeEl(tree, 'root:1');
+    assert.ok(node.props.className.includes('sg-node-skel'), '骨架样式');
+    assert.match(textIn(node), /第 1 轮/, '轮次号还在');
+    assert.match(textIn(node), /提问预览还在/, '提问预览还在');
+    assert.match(textIn(node), /点击载入这一轮的完整内容/, '给出下一步动作');
+
+    const corner = elements(tree).find((n) => n.props && n.props.className === 'sg-corner');
+    assert.ok(corner, '图角有说明');
+    assert.match(String(corner.props.children), /1 个块尚未载入/);
+  } finally {
+    serverReply = { ...serverReply, state: null, turns: REMOTE_TURNS, blocks: undefined };
+    ctx.timeline = TIMELINE;
+  }
+});
+
+test('点骨架块会把这一轮点名要回来（分页载入）', async () => {
+  ctx.timeline = NO_TIMELINE;
+  serverReply = {
+    ...serverReply,
+    state: blankState(),
+    turns: {
+      root: [{ turn: 1, startSeq: 10, endSeq: 18, prompt: '提问预览还在', response: '', status: 'done' }],
+      ancor: [], invest: []
+    },
+    blocks: [{ id: 'root:1', sessionId: 'root', turn: 1, skeleton: true }]
+  };
+  let tree;
+  try {
+    tree = await mountLoaded(propsFor('root'));
+    const before = fetchCalls.length;
+    press(tree, { node: 'root:1' });
+    tree = render(ctx.slots.Component, propsFor('root'));
+    await tick();
+    tree = render(ctx.slots.Component, propsFor('root'));
+
+    assert.ok(fetchCalls.length > before, '重新取数了');
+    const last = String(fetchCalls[fetchCalls.length - 1]);
+    assert.match(last, /[?&]full=root%3A1/, '点名带上了这一轮的 id');
+  } finally {
+    serverReply = { ...serverReply, state: null, turns: REMOTE_TURNS, blocks: undefined };
+    ctx.timeline = TIMELINE;
+  }
+});
+
+test('普通块不会误判成骨架块', async () => {
+  serverReply = {
+    ...serverReply,
+    state: blankState(),
+    turns: REMOTE_TURNS,
+    blocks: [{ id: 'root:1', sessionId: 'root', turn: 1, skeleton: true }]
+  };
+  try {
+    /* Host 说它是骨架，但本地时间线把正文合并回来了 —— 那就按普通块画 */
+    const tree = await mountLoaded(propsFor('root'));
+    const node = nodeEl(tree, 'root:1');
+    assert.ok(!node.props.className.includes('sg-node-skel'), '有正文就不算骨架');
+    assert.ok(!node.props.className.includes('sg-node-thin'), '也不是"数据不完整"');
+  } finally {
+    serverReply = { ...serverReply, state: null, turns: REMOTE_TURNS, blocks: undefined };
+  }
+});

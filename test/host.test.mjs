@@ -11,7 +11,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { foldTurns, isHumanTurn, textOf, forkTurnFromChild, linkForks } from '../src/host/fold.js';
-import { apply, buildPayload, readSessions } from '../index.js';
+import { apply, buildPayload, readSessions, skeletonize, skeletonizeTurns, SKELETON_PREVIEW } from '../index.js';
 
 /* --------------------------------------------------------------- 夹具 */
 
@@ -288,11 +288,14 @@ test('buildPayload 非法 hidden/alias 返回 400', async () => {
   );
 });
 
-test('buildPayload 超过块数上限返回 413', async () => {
-  await assert.rejects(
-    () => buildPayload(fakeCtx(), params({ sessionId: 'root', format: 'json' }), { maxBlocks: 2 }),
-    (e) => e.status === 413
-  );
+test('buildPayload 超上限不再报 413，改为降级返回骨架块（FR-4）', async () => {
+  const ctx = fakeCtx();
+  const out = await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), { maxBlocks: 3 });
+  assert.equal(out.download, false);
+  const data = JSON.parse(out.body);
+  assert.equal(data.stats.skeleton, 1, '4 块里降 1 块');
+  assert.equal(data.blocks.length, 4, '块没有丢，只是有的成了骨架');
+  assert.equal(data.blocks.filter((b) => b.skeleton).length, 1);
 });
 
 test('buildPayload(format=mm) 产出可下载的 .mm，且每个块区分问答', async () => {
@@ -573,4 +576,89 @@ test('导出文件会带上存档里的手动连线（FR-15）', async () => {
   const body = await res.text();
   assert.match(body, /<arrowlink DESTINATION="ID_\d+"/, '手动连线导出成箭头链接');
   assert.match(body, /因为/, '连线标签进了根备注');
+});
+
+/* ------------------------------------------ 超规模降级（FR-4） */
+
+test('skeletonize 优先保留当前会话，其余降级为骨架块', () => {
+  const mk = (sid, turn) => ({
+    id: sid + ':' + turn, sessionId: sid, turn,
+    prompt: 'P'.repeat(200), response: 'R'.repeat(2000)
+  });
+  const blocks = [
+    ...Array.from({ length: 5 }, (_, i) => mk('root', i + 1)),
+    ...Array.from({ length: 5 }, (_, i) => mk('other', i + 1))
+  ];
+  const r = skeletonize(blocks, 6, { currentId: 'root' });
+  assert.deepEqual(r.blocks.filter((b) => !b.skeleton).map((b) => b.id),
+    ['root:1', 'root:2', 'root:3', 'root:4', 'root:5', 'other:1'],
+    '当前会话全保，再按顺序补');
+  assert.equal(r.skeleton, 4);
+  /* 骨架块要留轮次号与提问预览 —— 需求明确要求这两样 */
+  const sk = r.blocks.find((b) => b.id === 'other:5');
+  assert.equal(sk.skeleton, true);
+  assert.equal(sk.turn, 5, '轮次号还在');
+  assert.equal(sk.prompt.length, SKELETON_PREVIEW + 1, 'clip 会补一个省略号');
+  assert.equal(sk.response, '', '回答正文被丢掉 —— 它才是体积大头');
+});
+
+test('skeletonize 不超限时一个都不动', () => {
+  const blocks = [{ id: 'a:1', sessionId: 'a', turn: 1, prompt: 'p', response: 'r' }];
+  const r = skeletonize(blocks, 100, { currentId: 'a' });
+  assert.equal(r.skeleton, 0);
+  assert.deepEqual(r.blocks, blocks);
+  assert.equal(skeletonize(blocks, 0, {}).skeleton, 0, '预算为 0 表示不限制');
+});
+
+test('skeletonize 认调用方点名的轮次，好让点击骨架块能把它换回来', () => {
+  const mk = (sid, turn) => ({ id: sid + ':' + turn, sessionId: sid, turn, prompt: 'p', response: 'r' });
+  const blocks = [
+    ...Array.from({ length: 3 }, (_, i) => mk('root', i + 1)),
+    ...Array.from({ length: 3 }, (_, i) => mk('other', i + 1))
+  ];
+  const r = skeletonize(blocks, 4, { currentId: 'root', full: new Set(['other:3']) });
+  const kept = r.blocks.filter((b) => !b.skeleton).map((b) => b.id);
+  assert.deepEqual(kept, ['root:1', 'root:2', 'root:3', 'other:3'], '点名的排在其余之前');
+});
+
+test('轮次明细要跟着一起降级 —— 否则客户端一重建就把正文拉回来了', () => {
+  const turns = {
+    root: [{ turn: 1, prompt: 'P'.repeat(200), response: 'R'.repeat(2000) }],
+    other: [{ turn: 1, prompt: 'Q'.repeat(200), response: 'S'.repeat(2000) }]
+  };
+  const out = skeletonizeTurns(turns, new Set(['root:1']));
+  assert.equal(out.root[0].response, 'R'.repeat(2000), '保留集里的原样不动');
+  assert.equal(out.other[0].response, '', '没保留的被清空');
+  assert.equal(out.other[0].prompt.length, SKELETON_PREVIEW + 1);
+});
+
+test('超上限不再抛 413，而是降级返回并报出骨架块数', async () => {
+  const ctx = fakeCtx();
+  const out = await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), { maxBlocks: 2 });
+  const data = JSON.parse(out.body);
+  assert.equal(data.stats.skeleton, 2, '4 块里降了 2 块');
+  assert.equal(data.blocks.length, 4, '块一个都没少，只是有的成了骨架');
+  assert.equal(data.blocks.filter((b) => b.skeleton).length, 2);
+  assert.equal(data.stats.blocks, 4);
+});
+
+test('点名 full 参数能把指定的轮次换回完整块', async () => {
+  const ctx = fakeCtx();
+  const first = JSON.parse((await buildPayload(
+    ctx, params({ sessionId: 'root', format: 'json' }), { maxBlocks: 3 })).body);
+  const thin = first.blocks.find((b) => b.skeleton);
+  assert.ok(thin, '有被降级的块');
+
+  const again = JSON.parse((await buildPayload(
+    ctx, params({ sessionId: 'root', format: 'json', full: thin.id }), { maxBlocks: 3 })).body);
+  const now = again.blocks.find((b) => b.id === thin.id);
+  assert.notEqual(now.skeleton, true, '点名的这一轮拿回了完整数据');
+  assert.ok(now.response !== '' || now.prompt !== '', '正文回来了');
+});
+
+test('json 之外仍按 413 语义不可达：格式化导出不受预算影响', async () => {
+  const ctx = fakeCtx();
+  const out = await buildPayload(ctx, params({ sessionId: 'root', format: 'mm' }), { maxBlocks: 2 });
+  assert.equal(out.download, true, '导出走原路径，不受块预算影响');
+  assert.ok(out.body.includes('<map'), '还是完整的 FreeMind');
 });

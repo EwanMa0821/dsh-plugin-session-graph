@@ -66,6 +66,9 @@ const CSS = `
 .sg-label.sg-unavailable{opacity:.45;cursor:not-allowed}
 /* 数据读不出来的块：降级显示，但仍可选中/连线/分叉（FR-13） */
 .sg-node.sg-node-thin{border-style:dashed}
+/* 尚未载入的骨架块（FR-4）：点一下就把这一轮要回来 */
+.sg-node.sg-node-skel{border-style:dashed;background:var(--dsw-alias-bg-base)}
+.sg-node.sg-node-skel .sg-ans{color:var(--dsw-alias-state-business-primary)}
 .sg-node.sg-node-thin .sg-ask{color:var(--dsw-alias-label-caption)}
 /* 图角的状态说明（FR-13） */
 .sg-corner{position:absolute;right:10px;bottom:8px;z-index:6;pointer-events:none;
@@ -401,6 +404,10 @@ function GraphView(props) {
   const [remote, setRemote] = React.useState(null);
   /* 重试计数：改一下就重跑取数 effect（FR-13 的「重试可恢复」） */
   const [reloadNonce, setReloadNonce] = React.useState(0);
+  /* 超规模时被 Host 降级成骨架的块（FR-4）：只显示轮次号与提问预览 */
+  const [skeletonIds, setSkeletonIds] = React.useState(() => new Set());
+  /* 用户点过「载入」的轮次：下次取数点名要它们的完整数据（FR-4 的分页载入） */
+  const [fullIds, setFullIds] = React.useState([]);
   /* 存档里的家族根 id 与视口，写回时要用 */
   const familyRef = React.useRef('');
   const savedViewportRef = React.useRef(null);
@@ -413,7 +420,8 @@ function GraphView(props) {
     const url = '/api/session.graph-export'
       + '?format=json'
       + '&sessionId=' + encodeURIComponent(sessionId)
-      + (sessionKey ? '&sessions=' + encodeURIComponent(sessionKey) : '');
+      + (sessionKey ? '&sessions=' + encodeURIComponent(sessionKey) : '')
+        + (fullIds.length ? '&full=' + encodeURIComponent(fullIds.slice(-400).join(',')) : '');
     const carrier = typeof fetch === 'function' ? fetch : null;
     if (!carrier) { setRouteOk(false); setLoaded(true); return undefined; }
     carrier(url, { credentials: 'same-origin' })
@@ -426,6 +434,10 @@ function GraphView(props) {
         if (!alive) return;
         if (!data) { setLoaded(true); loadedRef.current = true; return; }
         if (data.turns) setRemote(data.turns);
+        /* 哪些块被降级成骨架，由 Host 的权威块表说了算（FR-4） */
+        setSkeletonIds(new Set((Array.isArray(data.blocks) ? data.blocks : [])
+          .filter((b) => b && b.skeleton)
+          .map((b) => b.id)));
         if (typeof data.rootId === 'string') familyRef.current = data.rootId;
         /* 存档是基线，界面上的改动在此之上叠加 */
         const saved = data.state || null;
@@ -446,7 +458,7 @@ function GraphView(props) {
         setLoaded(true);
       });
     return () => { alive = false; };
-  }, [sessionId, sessionKey, reloadNonce]);
+  }, [sessionId, sessionKey, reloadNonce, fullIds]);
 
   /* 重试：清掉旧状态并重新取数（FR-13 验收 3「重试可恢复」） */
   const retry = React.useCallback(() => {
@@ -455,6 +467,11 @@ function GraphView(props) {
     setLoaded(false);
     loadedRef.current = false;
     setReloadNonce((n) => n + 1);
+  }, []);
+
+  /** 点名载入某一轮：下次取数把它的完整数据要回来（FR-4 的分页载入） */
+  const loadTurn = React.useCallback((id) => {
+    setFullIds((list) => (list.indexOf(id) >= 0 ? list : [...list, id]));
   }, []);
 
   /* 写回：交互写入按帧合并后节流提交（§5.3 的写入策略） */
@@ -812,6 +829,12 @@ function GraphView(props) {
     /* 在**按下**时选中，而不是等抬起：双击过程中手抖一两个像素很常见，
        若靠"没移动过"来决定选中，双击就会既不选中、又照样分叉 */
     if (hit) setSelected(hit);
+    /* 骨架块点一下就点名载入（FR-4）；选中照样发生，两个动作不冲突 */
+    const hitNode = hit ? nodeMap.get(hit) : null;
+    if (hitNode && hitNode.kind === 'block' && skeletonIds.has(hit)
+      && !digest(hitNode.block.response)) {
+      loadTurn(hit);
+    }
     const node = hit ? nodeMap.get(hit) : null;
     /* 拖块 = 移动块，拖空白 = 平移（FR-5）。块上起手不再平移 ——
        那会让"想挪块"变成"整张图跑掉"。 */
@@ -819,7 +842,7 @@ function GraphView(props) {
       ? { kind: 'move', id: hit, sx: ev.clientX, sy: ev.clientY, ox: node.x, oy: node.y, moved: false, focus: hit }
       : { kind: 'pan', sx: ev.clientX, sy: ev.clientY, px: view.panX, py: view.panY, moved: false, id: hit };
     setPanning(true);
-  }, [nodeMap, view, linking, createLink, say, toWorld, toCanvas]);
+  }, [nodeMap, view, linking, createLink, say, toWorld, toCanvas, skeletonIds, loadTurn]);
 
   /* 全局监听只在挂载时注册一次。但它要用到每次渲染都可能变的值（连线状态、
      新建回调、节点表…），直接闭包会读到陈旧值；把最新值放进 ref，
@@ -1112,11 +1135,15 @@ function GraphView(props) {
     /* FR-13：部分块数据读不出来时**该块降级**，而不是整张图报错。
        判定与 stats.incomplete 一致：这一轮已结束，但提问与回答都没有文本。 */
     const thin = b.status !== 'open' && !digest(b.prompt) && !digest(b.response);
+    /* FR-4：超规模时 Host 把这个块降成了骨架 —— 有提问预览、没有回答。
+       本地时间线若带着正文，合并之后就不再是骨架，那时按普通块画。 */
+    const skel = !thin && skeletonIds.has(n.id) && !digest(b.response);
     const cls = 'sg-node'
       + (b.current ? ' sg-current' : '')
       + (selected === n.id ? ' sg-selected' : '')
       + (b.hidden && showHidden ? ' sg-hidden' : '')
-      + (thin ? ' sg-node-thin' : '');
+      + (thin ? ' sg-node-thin' : '')
+      + (skel ? ' sg-node-skel' : '');
     const badges = [];
     if (b.toolCalls) badges.push(h('span', { key: 't', className: 'sg-badge' }, '⚙ ' + b.toolCalls));
     if (b.deliverables) badges.push(h('span', { key: 'd', className: 'sg-badge' }, '⧉ ' + b.deliverables));
@@ -1141,7 +1168,7 @@ function GraphView(props) {
         || (thin ? '（这一轮的内容读不出来）' : '（该轮提问尚未载入）'))),
     feats.blockText
       ? h('div', { className: 'sg-ans' }, clip(digest(b.response, 'first-paragraph'), 220)
-        || (thin ? '元数据仍在，可正常连线与分叉' : '（该轮回答尚未载入）'))
+        || (skel ? '点击载入这一轮的完整内容' : thin ? '元数据仍在，可正常连线与分叉' : '（该轮回答尚未载入）'))
       : null,
     /* 连线把手：拖到另一个块即可建立手动边（FR-9）。悬停或选中时才显形。 */
     h('div', {
@@ -1202,6 +1229,9 @@ function GraphView(props) {
 
   /* 图角的状态说明（FR-13）：数据不完整、断裂连线都要报数 */
   const cornerNotes = [];
+  if (!graph.error && skeletonIds.size > 0) {
+    cornerNotes.push(skeletonIds.size + ' 个块尚未载入 · 点击块即可载入');
+  }
   if (!graph.error && graph.stats.incomplete > 0) {
     cornerNotes.push(graph.stats.incomplete + ' 个块数据不完整');
   }
