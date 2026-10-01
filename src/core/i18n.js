@@ -101,6 +101,9 @@ export const UI = {
   'block.noPrompt': { zh: '（该轮提问尚未载入）', en: '(prompt not loaded)' },
   'block.noResponse': { zh: '（该轮回答尚未载入）', en: '(response not loaded)' },
   'block.thin': { zh: '（这一轮的内容读不出来）', en: '(this turn’s content is unreadable)' },
+  /* 还在取数时**不许说"读不出来"**：那是在指控数据丢失，而数据只是还在路上。
+     用中性的载入文案，取数回来自然消失。 */
+  'block.loading': { zh: '载入中…', en: 'Loading…' },
   'block.thinResponse': {
     zh: '元数据仍在，可正常连线与分叉',
     en: 'Metadata is intact; linking and forking still work'

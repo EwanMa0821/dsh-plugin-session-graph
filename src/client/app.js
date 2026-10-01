@@ -129,6 +129,9 @@ const CSS = `
 .sg-label.sg-unavailable{opacity:.45;cursor:not-allowed}
 /* 数据读不出来的块：降级显示，但仍可选中/连线/分叉（FR-13） */
 .sg-node.sg-node-thin{border-style:dashed}
+/* 取数还没落定：虚线示意"还在来"，文案是"载入中" —— 绝不画成"读不出来"那种假坏 */
+.sg-node.sg-node-wait{border-style:dashed;border-color:var(--dsw-alias-border-l2)}
+.sg-node.sg-node-wait .sg-ask{color:var(--dsw-alias-label-tertiary)}
 /* 尚未载入的骨架块（FR-4）：点一下就把这一轮要回来 */
 .sg-node.sg-node-skel{border-style:dashed;background:var(--dsw-alias-bg-base)}
 .sg-node.sg-node-skel .sg-ans{color:var(--dsw-alias-state-business-primary)}
@@ -1502,9 +1505,14 @@ function GraphView(props) {
     const b = n.block;
     /* FR-13：部分块数据读不出来时**该块降级**，而不是整张图报错。
        判定与 stats.incomplete 一致：这一轮已结束，但提问与回答都没有文本。
-       （切视图会有一次重挂载，靠 remoteCache 让首帧就带正文，
-       所以这里不必再按"尚未载入"区分 —— 首帧告警态本身是有意的降级表达。） */
-    const thin = b.status !== 'open' && !digest(b.prompt) && !digest(b.response);
+
+       **但"还没排空取数"不等于"读不出来"**：切回图谱时视图会重新挂载，首帧只有
+       本地时间线（有轮次号、没有正文），此时画告警态就是在指控数据丢失 ——
+       用户看到的就是一闪而过的"假坏"。所以取数未落定（!loaded）时按**载入中**画，
+       排空之后仍无正文，才是真的降级。 */
+    const pending = !loaded;
+    const thin = !pending && b.status !== 'open' && !digest(b.prompt) && !digest(b.response);
+    const waiting = pending && b.status !== 'open' && !digest(b.prompt) && !digest(b.response);
     /* FR-4：超规模时 Host 把这个块降成了骨架 —— 有提问预览、没有回答。
        本地时间线若带着正文，合并之后就不再是骨架，那时按普通块画。 */
     const skel = !thin && skeletonIds.has(n.id) && !digest(b.response);
@@ -1513,6 +1521,7 @@ function GraphView(props) {
       + (selected === n.id ? ' sg-selected' : '')
       + (b.hidden && showHidden ? ' sg-hidden' : '')
       + (thin ? ' sg-node-thin' : '')
+      + (waiting ? ' sg-node-wait' : '')
       + (skel ? ' sg-node-skel' : '');
     const badges = [];
     if (b.toolCalls) badges.push(h('span', { key: 't', className: 'sg-badge' }, '⚙ ' + b.toolCalls));
@@ -1535,7 +1544,7 @@ function GraphView(props) {
       badges),
     h('div', { className: 'sg-ask' + (digest(b.prompt) ? '' : ' sg-empty') },
       b.alias ? '✎ ' + b.alias : (clip(digest(b.prompt), 110)
-        || (thin ? t('block.thin') : t('block.noPrompt')))),
+        || (waiting ? t('block.loading') : (thin ? t('block.thin') : t('block.noPrompt'))))),
     feats.blockText
       ? h('div', { className: 'sg-ans' }, clip(digest(b.response, 'first-paragraph'), 220)
         || (skel ? t('block.loadFull') : thin ? t('block.thinResponse') : t('block.noResponse')))
