@@ -17,10 +17,41 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(here, '..');
 
-const CORE = ['src/core/model.js', 'src/core/graph.js', 'src/core/export.js'];
+const CORE = [
+  'src/core/model.js',
+  'src/core/graph.js',
+  'src/core/export.js',
+  'src/core/state.js'
+];
 const APP = 'src/client/app.js';
 export const OUT = 'client.js';
 export const PKG_NAME = 'dsh-plugin-session-graph';
+
+/** 顶层声明的名字，用来检测跨文件撞名 */
+const TOP_LEVEL = /^(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)/gm;
+
+/**
+ * 撞名检测。
+ *
+ * 内联之后所有核心文件共用**同一个作用域**，两个文件各写一个 `const str`
+ * 就是 `Identifier 'str' has already been declared` —— 而 `node --check` 未必
+ * 在每个环节都跑到，真正暴露它的往往是浏览器里的一片空白。
+ * 与其靠运气，不如在这里直接拦住。
+ */
+function assertNoCollisions(files) {
+  const owner = new Map();
+  const clashes = [];
+  for (const { file, name } of files) {
+    const seen = owner.get(name);
+    if (seen && seen !== file) clashes.push(`${name}（${seen} 与 ${file}）`);
+    else owner.set(name, file);
+  }
+  if (clashes.length) {
+    throw new Error(
+      '内联后顶层声明撞名，请给私有助手加文件前缀：\n  ' + clashes.join('\n  ')
+    );
+  }
+}
 
 /** 把 ESM 源码降级成同作用域的普通语句（去掉 import / export） */
 function flatten(src, file) {
@@ -40,6 +71,15 @@ function flatten(src, file) {
 /** 由 src/ 生成 client.js 的完整内容 */
 export function generateClient() {
   const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+
+  /* 先查撞名，再拼内容 —— 查的是降级之后的真实声明 */
+  const declared = [];
+  CORE.forEach((file) => {
+    const flat = flatten(read(file), file);
+    for (const m of flat.matchAll(TOP_LEVEL)) declared.push({ file, name: m[1] });
+  });
+  assertNoCollisions(declared);
+
   const parts = [];
   parts.push('/* 由 scripts/build-client.mjs 生成 —— 请勿直接编辑；改 src/ 后重新生成。 */');
   parts.push('window.__ModuleLoader__.load({');

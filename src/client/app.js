@@ -110,6 +110,10 @@ const CSS = `
 .sg-hint{position:absolute;left:12px;bottom:12px;font-size:11.5px;color:var(--dsw-alias-label-caption);
   background:var(--dsw-alias-bg-layer-1);border-radius:7px;padding:5px 10px;box-shadow:var(--dsw-elevation-stroke);z-index:8}
 .sg-hint-warn{left:auto;right:12px;bottom:12px;color:var(--dsw-alias-state-warn-primary)}
+/* 只读标记：存储不可用或存档版本不认识时挂在工具条上 */
+.sg-ro{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:5px;
+  background:var(--dsw-alias-state-warn-tertiary);color:var(--dsw-alias-state-warn-primary);
+  font-size:11px;white-space:nowrap}
 /* 右栏：元信息与操作**固定**在上，只有正文区滚动。
    正文可能很长，若把它排在前面，元信息和操作会被永远挤出可视区。 */
 .sg-side{flex:0 0 clamp(320px, 26vw, 430px);border-left:.5px solid var(--dsw-alias-border-l1);display:flex;
@@ -243,6 +247,11 @@ function GraphView(props) {
   const [hidden, setHidden] = React.useState({});
   const [alias, setAlias] = React.useState({});
   const [links, setLinks] = React.useState([]);
+  /* 持久化：存档读回来之后才允许写，避免首帧的空状态把存档冲掉 */
+  const [writable, setWritable] = React.useState(true);
+  const [incompatible, setIncompatible] = React.useState(false);
+  const [saveError, setSaveError] = React.useState('');
+  const [loaded, setLoaded] = React.useState(false);
   const [showHidden, setShowHidden] = React.useState(false);
   const [collapseOthers, setCollapseOthers] = React.useState(false);
   const [view, setView] = React.useState({ scale: 1, panX: 24, panY: 20, fitted: false });
@@ -280,6 +289,12 @@ function GraphView(props) {
   /* 家族里其他会话的轮次要向 Host 取（本地的装配器时间线只覆盖当前会话）。
      取不到就退化成"只有当前会话有块"——家族骨架仍然完整。 */
   const [remote, setRemote] = React.useState(null);
+  /* 存档里的家族根 id 与视口，写回时要用 */
+  const familyRef = React.useRef('');
+  const savedViewportRef = React.useRef(null);
+  /* 存档读回来之前禁止写：否则首帧的空状态会把已存的隐藏/别名冲掉 */
+  const loadedRef = React.useRef(false);
+
   React.useEffect(() => {
     if (!sessionId) return undefined;
     let alive = true;
@@ -288,17 +303,73 @@ function GraphView(props) {
       + '&sessionId=' + encodeURIComponent(sessionId)
       + (sessionKey ? '&sessions=' + encodeURIComponent(sessionKey) : '');
     const carrier = typeof fetch === 'function' ? fetch : null;
-    if (!carrier) { setRouteOk(false); return undefined; }
+    if (!carrier) { setRouteOk(false); setLoaded(true); return undefined; }
     carrier(url, { credentials: 'same-origin' })
       .then((r) => {
         if (!alive) return null;
         setRouteOk(!!(r && r.ok));
         return r && r.ok ? r.json() : null;
       })
-      .then((data) => { if (alive && data && data.turns) setRemote(data.turns); })
-      .catch(() => { if (alive) setRouteOk(false); });
+      .then((data) => {
+        if (!alive) return;
+        if (!data) { setLoaded(true); loadedRef.current = true; return; }
+        if (data.turns) setRemote(data.turns);
+        if (typeof data.rootId === 'string') familyRef.current = data.rootId;
+        /* 存档是基线，界面上的改动在此之上叠加 */
+        const saved = data.state || null;
+        setHidden(saved && saved.hidden ? saved.hidden : {});
+        setAlias(saved && saved.alias ? saved.alias : {});
+        setLinks(saved && saved.links ? saved.links : []);
+        setWritable(data.writable !== false);
+        setIncompatible(!!data.incompatible);
+        savedViewportRef.current = (saved && saved.viewport) || null;
+        loadedRef.current = true;
+        setLoaded(true);
+      })
+      .catch(() => {
+        if (!alive) return;
+        setRouteOk(false);
+        loadedRef.current = true;
+        setLoaded(true);
+      });
     return () => { alive = false; };
   }, [sessionId, sessionKey]);
+
+  /* 写回：交互写入按帧合并后节流提交（§5.3 的写入策略） */
+  const writableRef = React.useRef(true);
+  writableRef.current = writable;
+  const pendingRef = React.useRef(null);
+  const timerRef = React.useRef(null);
+  const persist = React.useCallback((patch) => {
+    if (!loadedRef.current || !writableRef.current) return;
+    const payload = clientPatchToState(patch);
+    if (!Object.keys(payload).length) return;
+    pendingRef.current = { ...(pendingRef.current || {}), ...payload };
+    if (timerRef.current) return;
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null;
+      const body = pendingRef.current;
+      pendingRef.current = null;
+      if (!body || !familyRef.current || typeof fetch !== 'function') return;
+      fetch('/api/session.graph-export', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ familyRootId: familyRef.current, patch: body })
+      }).then((r) => {
+        if (r && r.ok) { setSaveError(''); return; }
+        /* 提交失败：保留内存状态并标记未保存，而不是回滚用户刚做的操作 */
+        setSaveError(r && r.status === 409 ? '存档由更新的版本写入，本次改动未保存' : '改动未能保存');
+        if (r && r.status === 409) setIncompatible(true);
+      }).catch(() => setSaveError('改动未能保存'));
+    }, 400);
+  }, []);
+
+  const clearPending = React.useCallback(() => {
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+    pendingRef.current = null;
+  }, []);
+  React.useEffect(() => () => clearPending(), [clearPending]);
 
   const turnsBySession = React.useMemo(() => {
     const out = { ...(remote || {}) };
@@ -344,14 +415,29 @@ function GraphView(props) {
 
   const nodeMap = React.useMemo(() => new Map(laid.nodes.map((n) => [n.id, n])), [laid]);
 
-  /* 首次有内容时自动适应视图；之后切视图回来不再重算（FR-12） */
+  /* 视口是否被**用户**动过：挂载时把刚恢复的视口原样写回去是纯浪费，
+     而且会让「打开一次图谱」产生一次写入。
+     声明放在最前 —— 下面几个副作用会引用它。 */
+  const viewTouchedRef = React.useRef(false);
+
+  /* 首次适应视图：**等存档回来再定视口**，否则会先按默认位置摆好、
+     存档里的缩放与平移就白存了。 */
   React.useEffect(() => {
-    if (view.fitted || !laid.nodes.length) return;
-    const fit = fitView(laid.nodes, size.w, size.h);
-    setView({ ...fit, fitted: true });
-  }, [laid, size, view.fitted]);
+    if (view.fitted || !laid.nodes.length || !loaded) return;
+    const saved = savedViewportRef.current;
+    if (saved) setView({ scale: saved.zoom, panX: saved.panX, panY: saved.panY, fitted: true });
+    else setView({ ...fitView(laid.nodes, size.w, size.h), fitted: true });
+  }, [laid, size, view.fitted, loaded]);
+
+  /* 视口变化后节流写回；只在**用户动过**之后写，且用取整后的键避免亚像素抖动 */
+  const viewKey = Math.round(view.scale * 1000) + ':' + Math.round(view.panX) + ':' + Math.round(view.panY);
+  React.useEffect(() => {
+    if (!loaded || !view.fitted || !viewTouchedRef.current) return;
+    persist({ viewport: { zoom: view.scale, panX: view.panX, panY: view.panY } });
+  }, [viewKey, loaded, persist]);
 
   const fit = React.useCallback(() => {
+    viewTouchedRef.current = true;
     setView({ ...fitView(laid.nodes, size.w, size.h), fitted: true });
   }, [laid, size]);
 
@@ -366,6 +452,7 @@ function GraphView(props) {
 
   const onWheel = React.useCallback((ev) => {
     ev.preventDefault();
+    viewTouchedRef.current = true;
     const r = hostRef.current ? hostRef.current.getBoundingClientRect() : { left: 0, top: 0 };
     const mx = ev.clientX - r.left;
     const my = ev.clientY - r.top;
@@ -414,7 +501,7 @@ function GraphView(props) {
       if (typeof ev.preventDefault === 'function') ev.preventDefault();
       const dx = ev.clientX - d.sx;
       const dy = ev.clientY - d.sy;
-      if (Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
+      if (Math.abs(dx) + Math.abs(dy) > 3) { d.moved = true; viewTouchedRef.current = true; }
       if (d.kind === 'pan') setView((v) => ({ ...v, panX: d.px + dx, panY: d.py + dy, fitted: true }));
     };
     const up = () => {
@@ -621,6 +708,11 @@ function GraphView(props) {
         '暂时读不到会话内容，只显示了轮次骨架。切到「对话」再切回来可重试。')
     : null;
 
+  /* 改动没存上：说清楚原因，但**不回滚**用户刚做的操作 */
+  const saveHint = saveError
+    ? h('div', { className: 'sg-hint sg-hint-warn' }, saveError + '（改动仍在本页生效）')
+    : null;
+
   const detail = selected ? buildDetail() : h('div', { className: 'sg-emptybox' },
     '家族 ' + (graph.error ? 0 : graph.stats.sessions) + ' 个会话 · ' +
     (graph.error ? 0 : graph.stats.blocks) + ' 个块',
@@ -660,7 +752,12 @@ function GraphView(props) {
         }, '⑂ 从这里分叉'),
         h('button', {
           className: 'sg-act',
-          onClick: () => { setHidden({ ...hidden, [b.id]: !hidden[b.id] }); setShowHidden(true); }
+          onClick: () => {
+            const next = { ...hidden, [b.id]: !hidden[b.id] };
+            setHidden(next);
+            setShowHidden(true);
+            persist({ hidden: next });
+          }
         }, hidden[b.id] ? '⊘ 取消隐藏' : '⊘ 隐藏此块'),
         h('button', {
           className: 'sg-act',
@@ -701,10 +798,19 @@ function GraphView(props) {
           onClick: () => setCollapseOthers(!collapseOthers)
         }, '折叠其他会话'),
         h('button', { className: 'sg-btn', onClick: () => setExportOpen(true) }, '↧ 导出'),
+        (!writable || incompatible)
+          ? h('span', {
+            className: 'sg-ro',
+            title: incompatible
+              ? '存档由更新的版本写入，本版本不会覆盖它'
+              : '存储不可用，改动不会被保存'
+          }, incompatible ? '存档版本不兼容 · 只读' : '只读')
+          : null,
         h('span', { className: 'sg-zoom' }, Math.round(view.scale * 100) + '%')),
       h('div', { className: 'sg-hint' },
         '滚轮缩放 · 拖空白平移 · 单击块看详情 · 双击块分叉 · 方向键移动 · F 适应视图'),
       contentHint,
+      saveHint,
       body),
     h('aside', { className: 'sg-side' }, detail),
     /* 模态与浮层挂在**视图根节点**上，而不是画布容器里 ——

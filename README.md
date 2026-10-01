@@ -142,7 +142,7 @@ src/client/app.js    客户端应用
 ## 开发
 
 ```bash
-node scripts/run-tests.mjs      # 103 项测试，在同一进程内运行
+node scripts/run-tests.mjs      # 138 项测试，在同一进程内运行
 node scripts/check-package.mjs  # 清单、图标、patch、产物是否过期
 node scripts/build-client.mjs   # 改过 src/ 之后必须跑
 ```

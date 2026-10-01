@@ -24,8 +24,8 @@ export const LIMITS = {
   labelLength: 120
 };
 
-const str = (v) => (v === undefined || v === null ? '' : String(v));
-const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const sxStr = (v) => (v === undefined || v === null ? '' : String(v));
+const sxIsObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 export function emptyState(now = 0) {
   return {
@@ -44,7 +44,7 @@ export function emptyState(now = 0) {
 
 /** `sessionId:turn` / `header:sessionId` / `sessionId:empty` → Ref */
 export function idToRef(id) {
-  const s = str(id);
+  const s = sxStr(id);
   if (s === '') return null;
   const cut = s.indexOf(':');
   if (cut <= 0) return null;
@@ -58,8 +58,8 @@ export function idToRef(id) {
 
 /** Ref → 客户端内部 id；认不出来返回空串 */
 export function refToId(ref) {
-  if (!isObject(ref)) return '';
-  const sessionId = str(ref.sessionId);
+  if (!sxIsObject(ref)) return '';
+  const sessionId = sxStr(ref.sessionId);
   if (sessionId === '') return '';
   if (ref.turn === undefined || ref.turn === null) return `header:${sessionId}`;
   const turn = Number(ref.turn);
@@ -68,42 +68,40 @@ export function refToId(ref) {
 
 /* ------------------------------------------------------------ 规整 */
 
-const turnKey = (v) => (/^\d+$/.test(String(v)) ? String(Number(v)) : '');
-
 /** 字符串数组：去空、去重、限长 */
-const uniqStrings = (raw, limit) =>
-  [...new Set((Array.isArray(raw) ? raw : []).map(str).filter(Boolean))].slice(0, limit);
+const sxUniq = (raw, limit) =>
+  [...new Set((Array.isArray(raw) ? raw : []).map(sxStr).filter(Boolean))].slice(0, limit);
 
 /** 干净的初始状态 */
-function capObject(raw, limit, mapValue) {  const out = {};
-  if (!isObject(raw)) return out;
+function sxCapObject(raw, limit, mapValue) {  const out = {};
+  if (!sxIsObject(raw)) return out;
   let n = 0;
   for (const [k, v] of Object.entries(raw)) {
     if (n >= limit) break;
     const value = mapValue(v);
     if (value === null) continue;
-    out[str(k)] = value;
+    out[sxStr(k)] = value;
     n += 1;
   }
   return out;
 }
 
-const sanitizeLink = (raw, now) => {
-  if (!isObject(raw)) return null;
+const sxSanitizeLink = (raw, now) => {
+  if (!sxIsObject(raw)) return null;
   /* 端点两种形态都收：规范的 Ref 对象，或客户端内部用的字符串 id */
-  const fromRef = isObject(raw.from) ? raw.from : idToRef(raw.from);
-  const toRef = isObject(raw.to) ? raw.to : idToRef(raw.to);
-  if (!isObject(fromRef) || !isObject(toRef)) return null;
-  if (!str(fromRef.sessionId) || !str(toRef.sessionId)) return null;
+  const fromRef = sxIsObject(raw.from) ? raw.from : idToRef(raw.from);
+  const toRef = sxIsObject(raw.to) ? raw.to : idToRef(raw.to);
+  if (!sxIsObject(fromRef) || !sxIsObject(toRef)) return null;
+  if (!sxStr(fromRef.sessionId) || !sxStr(toRef.sessionId)) return null;
   const kind = raw.kind === 'reference' ? 'reference' : 'link';
-  const id = str(raw.id)
+  const id = sxStr(raw.id)
     || `${kind}:${refToId(fromRef) || fromRef.sessionId}->${refToId(toRef) || toRef.sessionId}`;
   return {
     id,
     kind,
-    from: { sessionId: str(fromRef.sessionId), ...(fromRef.turn ? { turn: Number(fromRef.turn) } : {}) },
-    to: { sessionId: str(toRef.sessionId), ...(toRef.turn ? { turn: Number(toRef.turn) } : {}) },
-    ...(raw.label ? { label: str(raw.label).slice(0, LIMITS.labelLength) } : {}),
+    from: { sessionId: sxStr(fromRef.sessionId), ...(fromRef.turn ? { turn: Number(fromRef.turn) } : {}) },
+    to: { sessionId: sxStr(toRef.sessionId), ...(toRef.turn ? { turn: Number(toRef.turn) } : {}) },
+    ...(raw.label ? { label: sxStr(raw.label).slice(0, LIMITS.labelLength) } : {}),
     createdAt: Number.isFinite(Number(raw.createdAt)) ? Number(raw.createdAt) : now,
     updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : now
   };
@@ -114,40 +112,40 @@ const sanitizeLink = (raw, now) => {
  * @returns {object|null} 版本不认识时返回 null（调用方据此拒绝应用，而不是猜）
  */
 export function sanitizeState(raw, now = 0) {
-  if (!isObject(raw)) return null;
+  if (!sxIsObject(raw)) return null;
   const version = Number(raw.version);
   if (version !== STATE_VERSION) return null;
 
-  const viewport = isObject(raw.viewport)
+  const viewport = sxIsObject(raw.viewport)
     ? {
-      zoom: clampNumber(raw.viewport.zoom, 0.25, 2, 1),
-      panX: clampNumber(raw.viewport.panX, -1e6, 1e6, 0),
-      panY: clampNumber(raw.viewport.panY, -1e6, 1e6, 0)
+      zoom: sxClamp(raw.viewport.zoom, 0.25, 2, 1),
+      panX: sxClamp(raw.viewport.panX, -1e6, 1e6, 0),
+      panY: sxClamp(raw.viewport.panY, -1e6, 1e6, 0)
     }
     : null;
 
   return {
     version: STATE_VERSION,
     links: (Array.isArray(raw.links) ? raw.links : [])
-      .slice(0, LIMITS.links).map((l) => sanitizeLink(l, now)).filter(Boolean),
-    positions: capObject(raw.positions, LIMITS.positions, (v) => {
-      if (!isObject(v)) return null;
+      .slice(0, LIMITS.links).map((l) => sxSanitizeLink(l, now)).filter(Boolean),
+    positions: sxCapObject(raw.positions, LIMITS.positions, (v) => {
+      if (!sxIsObject(v)) return null;
       const x = Number(v.x);
       const y = Number(v.y);
       return Number.isFinite(x) && Number.isFinite(y) ? { x: Math.round(x), y: Math.round(y) } : null;
     }),
     viewport,
-    collapsedSessions: uniqStrings(raw.collapsedSessions, LIMITS.collapsedSessions),
-    hiddenBlocks: uniqStrings(raw.hiddenBlocks, LIMITS.hiddenBlocks),
-    alias: capObject(raw.alias, LIMITS.alias, (v) => {
-      const text = str(v).trim().slice(0, LIMITS.aliasLength);
+    collapsedSessions: sxUniq(raw.collapsedSessions, LIMITS.collapsedSessions),
+    hiddenBlocks: sxUniq(raw.hiddenBlocks, LIMITS.hiddenBlocks),
+    alias: sxCapObject(raw.alias, LIMITS.alias, (v) => {
+      const text = sxStr(v).trim().slice(0, LIMITS.aliasLength);
       return text === '' ? null : text;
     }),
     updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : now
   };
 }
 
-function clampNumber(v, lo, hi, fallback) {
+function sxClamp(v, lo, hi, fallback) {
   const n = Number(v);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(hi, Math.max(lo, n));
@@ -167,41 +165,41 @@ function clampNumber(v, lo, hi, fallback) {
  */
 export function mergePatch(state, patch, now = 0) {
   const base = sanitizeState(state, now) || emptyState(now);
-  if (!isObject(patch)) return base;
+  if (!sxIsObject(patch)) return base;
   const next = { ...base, version: STATE_VERSION, updatedAt: now };
 
   if ('hiddenBlocks' in patch) {
-    next.hiddenBlocks = uniqStrings(patch.hiddenBlocks, LIMITS.hiddenBlocks);
+    next.hiddenBlocks = sxUniq(patch.hiddenBlocks, LIMITS.hiddenBlocks);
   }
   if ('alias' in patch) {
-    next.alias = capObject(patch.alias, LIMITS.alias, (v) => {
-      const text = str(v).trim().slice(0, LIMITS.aliasLength);
+    next.alias = sxCapObject(patch.alias, LIMITS.alias, (v) => {
+      const text = sxStr(v).trim().slice(0, LIMITS.aliasLength);
       return text === '' ? null : text;
     });
   }
   if ('positions' in patch) {
-    next.positions = capObject(patch.positions, LIMITS.positions, (v) => {
-      if (!isObject(v)) return null;
+    next.positions = sxCapObject(patch.positions, LIMITS.positions, (v) => {
+      if (!sxIsObject(v)) return null;
       const x = Number(v.x);
       const y = Number(v.y);
       return Number.isFinite(x) && Number.isFinite(y) ? { x: Math.round(x), y: Math.round(y) } : null;
     });
   }
   if ('collapsedSessions' in patch) {
-    next.collapsedSessions = uniqStrings(patch.collapsedSessions, LIMITS.collapsedSessions);
+    next.collapsedSessions = sxUniq(patch.collapsedSessions, LIMITS.collapsedSessions);
   }
   if ('viewport' in patch) {
-    next.viewport = isObject(patch.viewport)
+    next.viewport = sxIsObject(patch.viewport)
       ? {
-        zoom: clampNumber(patch.viewport.zoom, 0.25, 2, 1),
-        panX: clampNumber(patch.viewport.panX, -1e6, 1e6, 0),
-        panY: clampNumber(patch.viewport.panY, -1e6, 1e6, 0)
+        zoom: sxClamp(patch.viewport.zoom, 0.25, 2, 1),
+        panX: sxClamp(patch.viewport.panX, -1e6, 1e6, 0),
+        panY: sxClamp(patch.viewport.panY, -1e6, 1e6, 0)
       }
       : null;
   }
   if ('links' in patch) {
     const incoming = (Array.isArray(patch.links) ? patch.links : [])
-      .slice(0, LIMITS.links).map((l) => sanitizeLink(l, now)).filter(Boolean);
+      .slice(0, LIMITS.links).map((l) => sxSanitizeLink(l, now)).filter(Boolean);
     /* 按 id 覆盖式合并：同一 id 视为更新，其它保留 —— 这样客户端可以只发变化的那几条 */
     const byId = new Map(base.links.map((l) => [l.id, l]));
     incoming.forEach((l) => {
@@ -211,7 +209,7 @@ export function mergePatch(state, patch, now = 0) {
     next.links = [...byId.values()].slice(0, LIMITS.links);
   }
   if (Array.isArray(patch.removeLinkIds) && patch.removeLinkIds.length) {
-    const drop = new Set(patch.removeLinkIds.map(str));
+    const drop = new Set(patch.removeLinkIds.map(sxStr));
     next.links = next.links.filter((l) => !drop.has(l.id));
   }
   return next;
@@ -245,14 +243,14 @@ export function stateToClient(state) {
 
 /** 客户端增量 → 持久形态增量 */
 export function clientPatchToState(patch) {
-  if (!isObject(patch)) return {};
+  if (!sxIsObject(patch)) return {};
   const out = {};
   if ('hidden' in patch) {
-    out.hiddenBlocks = Object.entries(isObject(patch.hidden) ? patch.hidden : {})
-      .filter(([, on]) => !!on).map(([id]) => str(id));
+    out.hiddenBlocks = Object.entries(sxIsObject(patch.hidden) ? patch.hidden : {})
+      .filter(([, on]) => !!on).map(([id]) => sxStr(id));
   }
-  if ('alias' in patch) out.alias = isObject(patch.alias) ? patch.alias : {};
-  if ('positions' in patch) out.positions = isObject(patch.positions) ? patch.positions : {};
+  if ('alias' in patch) out.alias = sxIsObject(patch.alias) ? patch.alias : {};
+  if ('positions' in patch) out.positions = sxIsObject(patch.positions) ? patch.positions : {};
   if ('viewport' in patch) out.viewport = patch.viewport;
   if ('collapsedSessions' in patch) {
     out.collapsedSessions = Array.isArray(patch.collapsedSessions) ? patch.collapsedSessions : [];
@@ -260,8 +258,8 @@ export function clientPatchToState(patch) {
   if ('links' in patch) {
     out.links = (Array.isArray(patch.links) ? patch.links : []).map((l) => ({
       ...l,
-      from: isObject(l.from) ? l.from : idToRef(l.from),
-      to: isObject(l.to) ? l.to : idToRef(l.to)
+      from: sxIsObject(l.from) ? l.from : idToRef(l.from),
+      to: sxIsObject(l.to) ? l.to : idToRef(l.to)
     })).filter((l) => l.from && l.to);
   }
   if (Array.isArray(patch.removeLinkIds)) out.removeLinkIds = patch.removeLinkIds;

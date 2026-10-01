@@ -32,6 +32,8 @@ globalThis.document = {
 let slots = [];
 let cursor = 0;
 let pass = 0;
+/** 渲染后排队的副作用 */
+const queued = [];
 
 function createElement(type, props, ...children) {
   return { type, props: { ...(props || {}), children: children.length <= 1 ? children[0] : children } };
@@ -46,11 +48,19 @@ const React = {
     if (s.pending !== undefined) { s.value = s.pending; s.pending = undefined; }
     return [s.value, (next) => { s.pending = typeof next === 'function' ? next(s.value) : next; }];
   },
-  useEffect(fn) {
+  useEffect(fn, deps) {
     const i = cursor++;
-    if (pass > 0) return undefined;              /* 只在首轮跑副作用 */
-    const cleanup = fn();
-    if (typeof cleanup === 'function') slots[i] = { cleanup };
+    const prev = slots[i];
+    /* 真的比较依赖项：否则「等存档到了再定视口」这类依赖变化的副作用永远不跑，
+       桩就会比 React 更宽松，测试也就测不出东西 */
+    if (prev && prev.deps && deps && prev.deps.length === deps.length
+      && deps.every((d, k) => Object.is(d, prev.deps[k]))) {
+      return undefined;
+    }
+    /* 排队到渲染**结束之后**再执行 —— React 就是这个时序。
+       渲染中就跑的话，回调里引用后面才声明的 ref 会踩 TDZ，
+       那是桩的毛病，不是组件的毛病。 */
+    queued.push({ i, fn, deps, prev });
     return undefined;
   },
   useMemo(fn) { cursor++; return fn(); },
@@ -58,10 +68,17 @@ const React = {
   useRef(v) { const i = cursor++; if (slots[i] === undefined) slots[i] = { value: { current: v } }; return slots[i].value; }
 };
 
-/** 渲染一次；cursor 归零，hook 槽位按调用顺序复用 */
+/** 渲染一次；cursor 归零，hook 槽位按调用顺序复用；副作用在渲染后统一执行 */
 function render(component, props) {
   cursor = 0;
+  queued.length = 0;
   const tree = component(props);
+  const batch = queued.splice(0);
+  batch.forEach(({ i, fn, deps, prev }) => {
+    if (prev && typeof prev.cleanup === 'function') prev.cleanup();
+    const cleanup = fn();
+    slots[i] = { deps, cleanup: typeof cleanup === 'function' ? cleanup : undefined };
+  });
   pass += 1;
   return tree;
 }
@@ -70,6 +87,7 @@ function resetComponent() {
   slots = [];
   cursor = 0;
   pass = 0;
+  queued.length = 0;
 }
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
@@ -164,10 +182,23 @@ const TIMELINE = {
 };
 
 const fetchCalls = [];
-globalThis.fetch = (url) => {
+const postCalls = [];
+/** 宿主对 GET 的答复；各用例可临时改写（持久化相关的用例都跑在后面） */
+let serverReply = { turns: REMOTE_TURNS, rootId: 'root', state: null, writable: true, incompatible: false };
+
+globalThis.fetch = (url, init) => {
   fetchCalls.push(String(url));
-  return Promise.resolve({ ok: true, json: async () => ({ turns: REMOTE_TURNS }) });
+  if (init && init.method === 'POST') {
+    postCalls.push(JSON.parse(init.body));
+    return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, writable: true }) });
+  }
+  return Promise.resolve({ ok: true, status: 200, json: async () => serverReply });
 };
+
+const blankState = (over = {}) => ({
+  version: 1, hidden: {}, alias: {}, positions: {},
+  viewport: null, collapsedSessions: [], links: [], ...over
+});
 
 const viewRegistry = { definition: null };
 
@@ -492,4 +523,103 @@ test('块上的提问行不会退化成轮次号', () => {
   const bundle = fs.readFileSync(new URL('../client.js', import.meta.url), 'utf8');
   assert.ok(!bundle.includes("|| '第 ' + b.turn + ' 轮'"), '提问为空时不再兜底成轮次号');
   assert.ok(bundle.includes('（该轮提问尚未载入）'), '改用明确的占位文案');
+});
+
+/* ----------------------------------------------------------- 持久化 */
+
+/** 挂载一次并等存档落地；副作用会在下一轮渲染才落到树上，所以要多渲染一轮 */
+async function mountLoaded() {
+  resetComponent();
+  render(ctx.slots.Component, props);
+  await tick();
+  render(ctx.slots.Component, props);
+  return render(ctx.slots.Component, props);
+}
+
+test('存档里的隐藏与别名在加载时就生效', async () => {
+  serverReply = {
+    ...serverReply,
+    state: blankState({ hidden: { 'root:2': true }, alias: { 'root:1': '被我改过' } })
+  };
+  try {
+    const tree = await mountLoaded();
+    const ids = elements(tree).filter((n) => n.props && n.props['data-sg-node'])
+      .map((n) => n.props['data-sg-node']);
+    assert.ok(!ids.includes('root:2'), '存档里藏起来的块不该出现在画布上');
+
+    const block = elements(tree).find((n) => n.props && n.props['data-sg-node'] === 'root:1');
+    const ask = [].concat(block.props.children || []).find((c) => typeof c.props.className === 'string'
+      && c.props.className.includes('sg-ask'));
+    assert.equal(ask.props.children, '✎ 被我改过', '别名优先于提问原文');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('存档里的视口被恢复，而不是重新适应视图', async () => {
+  serverReply = {
+    ...serverReply,
+    state: blankState({ viewport: { zoom: 1.7, panX: 123, panY: 45 } })
+  };
+  try {
+    const tree = await mountLoaded();
+    const zoom = elements(tree).find((n) => n.props && n.props.className === 'sg-zoom');
+    assert.equal(zoom.props.children, '170%', '用的是存档里的缩放，不是 fitView 的结果');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('隐藏一块会节流写回宿主，载荷是持久形态', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const before = postCalls.length;
+  try {
+    render(ctx.slots.Component, props);
+    await tick();
+    render(ctx.slots.Component, props);
+    const after = selectBlock('root:2');
+    const hide = elements(after).find((n) => n.props && n.props.className === 'sg-act'
+      && String(n.props.children).includes('隐藏此块'));
+    assert.ok(hide, '找得到隐藏按钮');
+    hide.props.onClick();
+
+    await new Promise((r) => setTimeout(r, 520));   /* 等过节流窗口 */
+    assert.equal(postCalls.length, before + 1, '只提交了一次 —— 视口没被用户动过就不该写');
+    const sent = postCalls[postCalls.length - 1];
+    assert.equal(sent.familyRootId, 'root', '按家族根分片');
+    assert.deepEqual(sent.patch.hiddenBlocks, ['root:2'], '提交的是持久形态');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('只读模式下显示标记，且一个字节都不写回', async () => {
+  serverReply = { ...serverReply, state: null, writable: false };
+  const before = postCalls.length;
+  try {
+    const tree = await mountLoaded();
+    const ro = elements(tree).find((n) => n.props && n.props.className === 'sg-ro');
+    assert.ok(ro, '工具条上有只读标记');
+
+    const after = selectBlock('root:2');
+    const hide = elements(after).find((n) => n.props && n.props.className === 'sg-act'
+      && String(n.props.children).includes('隐藏此块'));
+    hide.props.onClick();
+    await new Promise((r) => setTimeout(r, 520));
+    assert.equal(postCalls.length, before, '只读时不该发 POST');
+  } finally {
+    serverReply = { ...serverReply, state: null, writable: true };
+  }
+});
+
+test('存档版本不兼容时明确说明，而不是悄悄只读', async () => {
+  serverReply = { ...serverReply, state: null, writable: false, incompatible: true };
+  try {
+    const tree = await mountLoaded();
+    const ro = elements(tree).find((n) => n.props && n.props.className === 'sg-ro');
+    assert.match(String(ro.props.children), /不兼容/);
+    assert.match(String(ro.props.title), /更新的版本/);
+  } finally {
+    serverReply = { ...serverReply, state: null, writable: true, incompatible: false };
+  }
 });

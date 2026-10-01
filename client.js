@@ -898,6 +898,299 @@ function render(graph, format, options = {}) {
   return format === 'md' ? toMarkdown(graph, options) : toFreeMind(graph, options);
 }
 
+/* ---- src/core/state.js ---- */
+/**
+ * 会话图谱 · 持久化状态
+ *
+ * 纯函数，Host 与客户端两侧共用（客户端侧会被内联进 client.js）。
+ * 职责：把「界面上的偏好」与「用户创建的关系」规整成可持久化的形态，
+ * 并在两个形态之间转换：
+ *
+ *   持久形态   Ref 用对象 `{ sessionId, turn? }`（需求文档 §5.2）
+ *   客户端形态 端点用字符串 id `sessionId:turn` / `header:sessionId`
+ *
+ * 版本演进照 §5.3：`version` 必填；**未知版本拒绝应用并明说不兼容，不猜测性解析**。
+ */
+
+const STATE_VERSION = 1;
+
+/** NFR-1：超限就截断，避免一条癫狂的记录把界面拖死 */
+const LIMITS = {
+  links: 2000,
+  positions: 4000,
+  alias: 2000,
+  hiddenBlocks: 4000,
+  collapsedSessions: 200,
+  aliasLength: 200,
+  labelLength: 120
+};
+
+const sxStr = (v) => (v === undefined || v === null ? '' : String(v));
+const sxIsObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+function emptyState(now = 0) {
+  return {
+    version: STATE_VERSION,
+    links: [],
+    positions: {},
+    viewport: null,
+    collapsedSessions: [],
+    hiddenBlocks: [],
+    alias: {},
+    updatedAt: now
+  };
+}
+
+/* --------------------------------------------------------- id ↔ Ref */
+
+/** `sessionId:turn` / `header:sessionId` / `sessionId:empty` → Ref */
+function idToRef(id) {
+  const s = sxStr(id);
+  if (s === '') return null;
+  const cut = s.indexOf(':');
+  if (cut <= 0) return null;
+  const head = s.slice(0, cut);
+  const tail = s.slice(cut + 1);
+  if (head === 'header') return { sessionId: tail };
+  if (tail === 'empty') return { sessionId: head };
+  const turn = Number(tail);
+  return Number.isInteger(turn) && turn > 0 ? { sessionId: head, turn } : null;
+}
+
+/** Ref → 客户端内部 id；认不出来返回空串 */
+function refToId(ref) {
+  if (!sxIsObject(ref)) return '';
+  const sessionId = sxStr(ref.sessionId);
+  if (sessionId === '') return '';
+  if (ref.turn === undefined || ref.turn === null) return `header:${sessionId}`;
+  const turn = Number(ref.turn);
+  return Number.isInteger(turn) && turn > 0 ? `${sessionId}:${turn}` : '';
+}
+
+/* ------------------------------------------------------------ 规整 */
+
+/** 字符串数组：去空、去重、限长 */
+const sxUniq = (raw, limit) =>
+  [...new Set((Array.isArray(raw) ? raw : []).map(sxStr).filter(Boolean))].slice(0, limit);
+
+/** 干净的初始状态 */
+function sxCapObject(raw, limit, mapValue) {  const out = {};
+  if (!sxIsObject(raw)) return out;
+  let n = 0;
+  for (const [k, v] of Object.entries(raw)) {
+    if (n >= limit) break;
+    const value = mapValue(v);
+    if (value === null) continue;
+    out[sxStr(k)] = value;
+    n += 1;
+  }
+  return out;
+}
+
+const sxSanitizeLink = (raw, now) => {
+  if (!sxIsObject(raw)) return null;
+  /* 端点两种形态都收：规范的 Ref 对象，或客户端内部用的字符串 id */
+  const fromRef = sxIsObject(raw.from) ? raw.from : idToRef(raw.from);
+  const toRef = sxIsObject(raw.to) ? raw.to : idToRef(raw.to);
+  if (!sxIsObject(fromRef) || !sxIsObject(toRef)) return null;
+  if (!sxStr(fromRef.sessionId) || !sxStr(toRef.sessionId)) return null;
+  const kind = raw.kind === 'reference' ? 'reference' : 'link';
+  const id = sxStr(raw.id)
+    || `${kind}:${refToId(fromRef) || fromRef.sessionId}->${refToId(toRef) || toRef.sessionId}`;
+  return {
+    id,
+    kind,
+    from: { sessionId: sxStr(fromRef.sessionId), ...(fromRef.turn ? { turn: Number(fromRef.turn) } : {}) },
+    to: { sessionId: sxStr(toRef.sessionId), ...(toRef.turn ? { turn: Number(toRef.turn) } : {}) },
+    ...(raw.label ? { label: sxStr(raw.label).slice(0, LIMITS.labelLength) } : {}),
+    createdAt: Number.isFinite(Number(raw.createdAt)) ? Number(raw.createdAt) : now,
+    updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : now
+  };
+};
+
+/**
+ * 把任意外来记录规整成合法状态。
+ * @returns {object|null} 版本不认识时返回 null（调用方据此拒绝应用，而不是猜）
+ */
+function sanitizeState(raw, now = 0) {
+  if (!sxIsObject(raw)) return null;
+  const version = Number(raw.version);
+  if (version !== STATE_VERSION) return null;
+
+  const viewport = sxIsObject(raw.viewport)
+    ? {
+      zoom: sxClamp(raw.viewport.zoom, 0.25, 2, 1),
+      panX: sxClamp(raw.viewport.panX, -1e6, 1e6, 0),
+      panY: sxClamp(raw.viewport.panY, -1e6, 1e6, 0)
+    }
+    : null;
+
+  return {
+    version: STATE_VERSION,
+    links: (Array.isArray(raw.links) ? raw.links : [])
+      .slice(0, LIMITS.links).map((l) => sxSanitizeLink(l, now)).filter(Boolean),
+    positions: sxCapObject(raw.positions, LIMITS.positions, (v) => {
+      if (!sxIsObject(v)) return null;
+      const x = Number(v.x);
+      const y = Number(v.y);
+      return Number.isFinite(x) && Number.isFinite(y) ? { x: Math.round(x), y: Math.round(y) } : null;
+    }),
+    viewport,
+    collapsedSessions: sxUniq(raw.collapsedSessions, LIMITS.collapsedSessions),
+    hiddenBlocks: sxUniq(raw.hiddenBlocks, LIMITS.hiddenBlocks),
+    alias: sxCapObject(raw.alias, LIMITS.alias, (v) => {
+      const text = sxStr(v).trim().slice(0, LIMITS.aliasLength);
+      return text === '' ? null : text;
+    }),
+    updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : now
+  };
+}
+
+function sxClamp(v, lo, hi, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(hi, Math.max(lo, n));
+}
+
+/* -------------------------------------------------------- 增量合并 */
+
+/**
+ * 把客户端提交的增量并进状态。**纯函数**，不改原对象。
+ *
+ * 约定：patch 里出现的键才动，未出现的保持不变；
+ * 传 `null` 表示清空该键（例如删除一条连线用 links 的完整列表覆盖）。
+ *
+ * @param {object} state 已规整的状态
+ * @param {object} patch 客户端增量
+ * @param {number} now
+ */
+function mergePatch(state, patch, now = 0) {
+  const base = sanitizeState(state, now) || emptyState(now);
+  if (!sxIsObject(patch)) return base;
+  const next = { ...base, version: STATE_VERSION, updatedAt: now };
+
+  if ('hiddenBlocks' in patch) {
+    next.hiddenBlocks = sxUniq(patch.hiddenBlocks, LIMITS.hiddenBlocks);
+  }
+  if ('alias' in patch) {
+    next.alias = sxCapObject(patch.alias, LIMITS.alias, (v) => {
+      const text = sxStr(v).trim().slice(0, LIMITS.aliasLength);
+      return text === '' ? null : text;
+    });
+  }
+  if ('positions' in patch) {
+    next.positions = sxCapObject(patch.positions, LIMITS.positions, (v) => {
+      if (!sxIsObject(v)) return null;
+      const x = Number(v.x);
+      const y = Number(v.y);
+      return Number.isFinite(x) && Number.isFinite(y) ? { x: Math.round(x), y: Math.round(y) } : null;
+    });
+  }
+  if ('collapsedSessions' in patch) {
+    next.collapsedSessions = sxUniq(patch.collapsedSessions, LIMITS.collapsedSessions);
+  }
+  if ('viewport' in patch) {
+    next.viewport = sxIsObject(patch.viewport)
+      ? {
+        zoom: sxClamp(patch.viewport.zoom, 0.25, 2, 1),
+        panX: sxClamp(patch.viewport.panX, -1e6, 1e6, 0),
+        panY: sxClamp(patch.viewport.panY, -1e6, 1e6, 0)
+      }
+      : null;
+  }
+  if ('links' in patch) {
+    const incoming = (Array.isArray(patch.links) ? patch.links : [])
+      .slice(0, LIMITS.links).map((l) => sxSanitizeLink(l, now)).filter(Boolean);
+    /* 按 id 覆盖式合并：同一 id 视为更新，其它保留 —— 这样客户端可以只发变化的那几条 */
+    const byId = new Map(base.links.map((l) => [l.id, l]));
+    incoming.forEach((l) => {
+      const prev = byId.get(l.id);
+      byId.set(l.id, prev ? { ...prev, ...l, createdAt: prev.createdAt, updatedAt: now } : l);
+    });
+    next.links = [...byId.values()].slice(0, LIMITS.links);
+  }
+  if (Array.isArray(patch.removeLinkIds) && patch.removeLinkIds.length) {
+    const drop = new Set(patch.removeLinkIds.map(sxStr));
+    next.links = next.links.filter((l) => !drop.has(l.id));
+  }
+  return next;
+}
+
+/* ------------------------------------------------- 两侧形态的转换 */
+
+/** 持久形态 → 客户端内部形态（端点换成字符串 id） */
+function stateToClient(state) {
+  const s = sanitizeState(state, 0) || emptyState(0);
+  const hidden = {};
+  s.hiddenBlocks.forEach((id) => { hidden[id] = true; });
+  const positions = {};
+  Object.entries(s.positions).forEach(([id, p]) => { positions[id] = { x: p.x, y: p.y }; });
+  return {
+    version: s.version,
+    hidden,
+    alias: { ...s.alias },
+    positions,
+    viewport: s.viewport ? { ...s.viewport } : null,
+    collapsedSessions: [...s.collapsedSessions],
+    links: s.links.map((l) => ({
+      id: l.id,
+      kind: l.kind,
+      from: refToId(l.from),
+      to: refToId(l.to),
+      ...(l.label ? { label: l.label } : {})
+    }))
+  };
+}
+
+/** 客户端增量 → 持久形态增量 */
+function clientPatchToState(patch) {
+  if (!sxIsObject(patch)) return {};
+  const out = {};
+  if ('hidden' in patch) {
+    out.hiddenBlocks = Object.entries(sxIsObject(patch.hidden) ? patch.hidden : {})
+      .filter(([, on]) => !!on).map(([id]) => sxStr(id));
+  }
+  if ('alias' in patch) out.alias = sxIsObject(patch.alias) ? patch.alias : {};
+  if ('positions' in patch) out.positions = sxIsObject(patch.positions) ? patch.positions : {};
+  if ('viewport' in patch) out.viewport = patch.viewport;
+  if ('collapsedSessions' in patch) {
+    out.collapsedSessions = Array.isArray(patch.collapsedSessions) ? patch.collapsedSessions : [];
+  }
+  if ('links' in patch) {
+    out.links = (Array.isArray(patch.links) ? patch.links : []).map((l) => ({
+      ...l,
+      from: sxIsObject(l.from) ? l.from : idToRef(l.from),
+      to: sxIsObject(l.to) ? l.to : idToRef(l.to)
+    })).filter((l) => l.from && l.to);
+  }
+  if (Array.isArray(patch.removeLinkIds)) out.removeLinkIds = patch.removeLinkIds;
+  /* 落盘前先过一遍规整，别把畸形数据写进去 */
+  const cleaned = {};
+  const normalized = mergePatch(emptyState(0), out, 0);
+  if ('hiddenBlocks' in out) cleaned.hiddenBlocks = normalized.hiddenBlocks;
+  if ('alias' in out) cleaned.alias = normalized.alias;
+  if ('positions' in out) cleaned.positions = normalized.positions;
+  if ('viewport' in out) cleaned.viewport = normalized.viewport;
+  if ('collapsedSessions' in out) cleaned.collapsedSessions = normalized.collapsedSessions;
+  if ('links' in out) cleaned.links = normalized.links;
+  if (out.removeLinkIds) cleaned.removeLinkIds = out.removeLinkIds;
+  return cleaned;
+}
+
+/* ------------------------------------------------------------ 其他 */
+
+/** 状态里引用了哪些会话 —— 家族判定与清理用得上 */
+function sessionsInState(state) {
+  const s = sanitizeState(state, 0);
+  if (!s) return [];
+  const ids = new Set();
+  s.links.forEach((l) => { ids.add(l.from.sessionId); ids.add(l.to.sessionId); });
+  s.hiddenBlocks.forEach((id) => { const r = idToRef(id); if (r) ids.add(r.sessionId); });
+  Object.keys(s.alias).forEach((id) => { const r = idToRef(id); if (r) ids.add(r.sessionId); });
+  s.collapsedSessions.forEach((id) => ids.add(id));
+  return [...ids];
+}
+
 /* ============================================================
    会话图谱 · 客户端应用
    本文件由 scripts/build-client.mjs 原样追加到生成的 client.js 中，
@@ -1010,6 +1303,10 @@ const CSS = `
 .sg-hint{position:absolute;left:12px;bottom:12px;font-size:11.5px;color:var(--dsw-alias-label-caption);
   background:var(--dsw-alias-bg-layer-1);border-radius:7px;padding:5px 10px;box-shadow:var(--dsw-elevation-stroke);z-index:8}
 .sg-hint-warn{left:auto;right:12px;bottom:12px;color:var(--dsw-alias-state-warn-primary)}
+/* 只读标记：存储不可用或存档版本不认识时挂在工具条上 */
+.sg-ro{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:5px;
+  background:var(--dsw-alias-state-warn-tertiary);color:var(--dsw-alias-state-warn-primary);
+  font-size:11px;white-space:nowrap}
 /* 右栏：元信息与操作**固定**在上，只有正文区滚动。
    正文可能很长，若把它排在前面，元信息和操作会被永远挤出可视区。 */
 .sg-side{flex:0 0 clamp(320px, 26vw, 430px);border-left:.5px solid var(--dsw-alias-border-l1);display:flex;
@@ -1143,6 +1440,11 @@ function GraphView(props) {
   const [hidden, setHidden] = React.useState({});
   const [alias, setAlias] = React.useState({});
   const [links, setLinks] = React.useState([]);
+  /* 持久化：存档读回来之后才允许写，避免首帧的空状态把存档冲掉 */
+  const [writable, setWritable] = React.useState(true);
+  const [incompatible, setIncompatible] = React.useState(false);
+  const [saveError, setSaveError] = React.useState('');
+  const [loaded, setLoaded] = React.useState(false);
   const [showHidden, setShowHidden] = React.useState(false);
   const [collapseOthers, setCollapseOthers] = React.useState(false);
   const [view, setView] = React.useState({ scale: 1, panX: 24, panY: 20, fitted: false });
@@ -1180,6 +1482,12 @@ function GraphView(props) {
   /* 家族里其他会话的轮次要向 Host 取（本地的装配器时间线只覆盖当前会话）。
      取不到就退化成"只有当前会话有块"——家族骨架仍然完整。 */
   const [remote, setRemote] = React.useState(null);
+  /* 存档里的家族根 id 与视口，写回时要用 */
+  const familyRef = React.useRef('');
+  const savedViewportRef = React.useRef(null);
+  /* 存档读回来之前禁止写：否则首帧的空状态会把已存的隐藏/别名冲掉 */
+  const loadedRef = React.useRef(false);
+
   React.useEffect(() => {
     if (!sessionId) return undefined;
     let alive = true;
@@ -1188,17 +1496,73 @@ function GraphView(props) {
       + '&sessionId=' + encodeURIComponent(sessionId)
       + (sessionKey ? '&sessions=' + encodeURIComponent(sessionKey) : '');
     const carrier = typeof fetch === 'function' ? fetch : null;
-    if (!carrier) { setRouteOk(false); return undefined; }
+    if (!carrier) { setRouteOk(false); setLoaded(true); return undefined; }
     carrier(url, { credentials: 'same-origin' })
       .then((r) => {
         if (!alive) return null;
         setRouteOk(!!(r && r.ok));
         return r && r.ok ? r.json() : null;
       })
-      .then((data) => { if (alive && data && data.turns) setRemote(data.turns); })
-      .catch(() => { if (alive) setRouteOk(false); });
+      .then((data) => {
+        if (!alive) return;
+        if (!data) { setLoaded(true); loadedRef.current = true; return; }
+        if (data.turns) setRemote(data.turns);
+        if (typeof data.rootId === 'string') familyRef.current = data.rootId;
+        /* 存档是基线，界面上的改动在此之上叠加 */
+        const saved = data.state || null;
+        setHidden(saved && saved.hidden ? saved.hidden : {});
+        setAlias(saved && saved.alias ? saved.alias : {});
+        setLinks(saved && saved.links ? saved.links : []);
+        setWritable(data.writable !== false);
+        setIncompatible(!!data.incompatible);
+        savedViewportRef.current = (saved && saved.viewport) || null;
+        loadedRef.current = true;
+        setLoaded(true);
+      })
+      .catch(() => {
+        if (!alive) return;
+        setRouteOk(false);
+        loadedRef.current = true;
+        setLoaded(true);
+      });
     return () => { alive = false; };
   }, [sessionId, sessionKey]);
+
+  /* 写回：交互写入按帧合并后节流提交（§5.3 的写入策略） */
+  const writableRef = React.useRef(true);
+  writableRef.current = writable;
+  const pendingRef = React.useRef(null);
+  const timerRef = React.useRef(null);
+  const persist = React.useCallback((patch) => {
+    if (!loadedRef.current || !writableRef.current) return;
+    const payload = clientPatchToState(patch);
+    if (!Object.keys(payload).length) return;
+    pendingRef.current = { ...(pendingRef.current || {}), ...payload };
+    if (timerRef.current) return;
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null;
+      const body = pendingRef.current;
+      pendingRef.current = null;
+      if (!body || !familyRef.current || typeof fetch !== 'function') return;
+      fetch('/api/session.graph-export', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ familyRootId: familyRef.current, patch: body })
+      }).then((r) => {
+        if (r && r.ok) { setSaveError(''); return; }
+        /* 提交失败：保留内存状态并标记未保存，而不是回滚用户刚做的操作 */
+        setSaveError(r && r.status === 409 ? '存档由更新的版本写入，本次改动未保存' : '改动未能保存');
+        if (r && r.status === 409) setIncompatible(true);
+      }).catch(() => setSaveError('改动未能保存'));
+    }, 400);
+  }, []);
+
+  const clearPending = React.useCallback(() => {
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+    pendingRef.current = null;
+  }, []);
+  React.useEffect(() => () => clearPending(), [clearPending]);
 
   const turnsBySession = React.useMemo(() => {
     const out = { ...(remote || {}) };
@@ -1244,14 +1608,29 @@ function GraphView(props) {
 
   const nodeMap = React.useMemo(() => new Map(laid.nodes.map((n) => [n.id, n])), [laid]);
 
-  /* 首次有内容时自动适应视图；之后切视图回来不再重算（FR-12） */
+  /* 视口是否被**用户**动过：挂载时把刚恢复的视口原样写回去是纯浪费，
+     而且会让「打开一次图谱」产生一次写入。
+     声明放在最前 —— 下面几个副作用会引用它。 */
+  const viewTouchedRef = React.useRef(false);
+
+  /* 首次适应视图：**等存档回来再定视口**，否则会先按默认位置摆好、
+     存档里的缩放与平移就白存了。 */
   React.useEffect(() => {
-    if (view.fitted || !laid.nodes.length) return;
-    const fit = fitView(laid.nodes, size.w, size.h);
-    setView({ ...fit, fitted: true });
-  }, [laid, size, view.fitted]);
+    if (view.fitted || !laid.nodes.length || !loaded) return;
+    const saved = savedViewportRef.current;
+    if (saved) setView({ scale: saved.zoom, panX: saved.panX, panY: saved.panY, fitted: true });
+    else setView({ ...fitView(laid.nodes, size.w, size.h), fitted: true });
+  }, [laid, size, view.fitted, loaded]);
+
+  /* 视口变化后节流写回；只在**用户动过**之后写，且用取整后的键避免亚像素抖动 */
+  const viewKey = Math.round(view.scale * 1000) + ':' + Math.round(view.panX) + ':' + Math.round(view.panY);
+  React.useEffect(() => {
+    if (!loaded || !view.fitted || !viewTouchedRef.current) return;
+    persist({ viewport: { zoom: view.scale, panX: view.panX, panY: view.panY } });
+  }, [viewKey, loaded, persist]);
 
   const fit = React.useCallback(() => {
+    viewTouchedRef.current = true;
     setView({ ...fitView(laid.nodes, size.w, size.h), fitted: true });
   }, [laid, size]);
 
@@ -1266,6 +1645,7 @@ function GraphView(props) {
 
   const onWheel = React.useCallback((ev) => {
     ev.preventDefault();
+    viewTouchedRef.current = true;
     const r = hostRef.current ? hostRef.current.getBoundingClientRect() : { left: 0, top: 0 };
     const mx = ev.clientX - r.left;
     const my = ev.clientY - r.top;
@@ -1314,7 +1694,7 @@ function GraphView(props) {
       if (typeof ev.preventDefault === 'function') ev.preventDefault();
       const dx = ev.clientX - d.sx;
       const dy = ev.clientY - d.sy;
-      if (Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
+      if (Math.abs(dx) + Math.abs(dy) > 3) { d.moved = true; viewTouchedRef.current = true; }
       if (d.kind === 'pan') setView((v) => ({ ...v, panX: d.px + dx, panY: d.py + dy, fitted: true }));
     };
     const up = () => {
@@ -1521,6 +1901,11 @@ function GraphView(props) {
         '暂时读不到会话内容，只显示了轮次骨架。切到「对话」再切回来可重试。')
     : null;
 
+  /* 改动没存上：说清楚原因，但**不回滚**用户刚做的操作 */
+  const saveHint = saveError
+    ? h('div', { className: 'sg-hint sg-hint-warn' }, saveError + '（改动仍在本页生效）')
+    : null;
+
   const detail = selected ? buildDetail() : h('div', { className: 'sg-emptybox' },
     '家族 ' + (graph.error ? 0 : graph.stats.sessions) + ' 个会话 · ' +
     (graph.error ? 0 : graph.stats.blocks) + ' 个块',
@@ -1560,7 +1945,12 @@ function GraphView(props) {
         }, '⑂ 从这里分叉'),
         h('button', {
           className: 'sg-act',
-          onClick: () => { setHidden({ ...hidden, [b.id]: !hidden[b.id] }); setShowHidden(true); }
+          onClick: () => {
+            const next = { ...hidden, [b.id]: !hidden[b.id] };
+            setHidden(next);
+            setShowHidden(true);
+            persist({ hidden: next });
+          }
         }, hidden[b.id] ? '⊘ 取消隐藏' : '⊘ 隐藏此块'),
         h('button', {
           className: 'sg-act',
@@ -1601,10 +1991,19 @@ function GraphView(props) {
           onClick: () => setCollapseOthers(!collapseOthers)
         }, '折叠其他会话'),
         h('button', { className: 'sg-btn', onClick: () => setExportOpen(true) }, '↧ 导出'),
+        (!writable || incompatible)
+          ? h('span', {
+            className: 'sg-ro',
+            title: incompatible
+              ? '存档由更新的版本写入，本版本不会覆盖它'
+              : '存储不可用，改动不会被保存'
+          }, incompatible ? '存档版本不兼容 · 只读' : '只读')
+          : null,
         h('span', { className: 'sg-zoom' }, Math.round(view.scale * 100) + '%')),
       h('div', { className: 'sg-hint' },
         '滚轮缩放 · 拖空白平移 · 单击块看详情 · 双击块分叉 · 方向键移动 · F 适应视图'),
       contentHint,
+      saveHint,
       body),
     h('aside', { className: 'sg-side' }, detail),
     /* 模态与浮层挂在**视图根节点**上，而不是画布容器里 ——
