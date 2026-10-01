@@ -1712,6 +1712,9 @@ const UI = {
   /* 还在取数时**不许说"读不出来"**：那是在指控数据丢失，而数据只是还在路上。
      用中性的载入文案，取数回来自然消失。 */
   'block.loading': { zh: '载入中…', en: 'Loading…' },
+  /* 详情面板的展开/折叠（与原生 harness 侧栏一致的交互） */
+  'side.collapse': { zh: '收起详情', en: 'Collapse details' },
+  'side.expand': { zh: '详情', en: 'Details' },
   'block.thinResponse': {
     zh: '元数据仍在，可正常连线与分叉',
     en: 'Metadata is intact; linking and forking still work'
@@ -2213,7 +2216,11 @@ const CSS = `
   margin-top:12px;display:flex;flex-direction:column;gap:7px}
 /* 唯一滚动的区域。输入框让位由 .sg-root 的 padding-bottom 统一负责（画布与侧栏一起让开），
    这里不再单独留白，否则侧栏底部会白出一大块。 */
-.sg-side-bd{flex:1;overflow-y:auto;padding:12px 15px 16px;min-height:0}
+/* 详情面板的**阅读优先**顺序：头部/元信息在最上（固定），正文（提问/回答）占满剩余高度，
+   操作按钮压到最后一行。DOM 顺序仍是"固定区在前、滚动区在后"（切会话时元信息不该被正文挤走），
+   这里只改视觉顺序 —— 所以用 flex order，而不是搬 JSX。 */
+.sg-side-bd{flex:1;overflow-y:auto;padding:12px 15px 16px;min-height:0;order:1}
+.sg-side-acts{order:2}
 /* 小标题在正文区与固定区都要用，所以不做后代限定 */
 .sg-lb{font-size:11px;font-weight:600;letter-spacing:.05em;color:var(--dsw-alias-label-caption);
   margin-bottom:6px}
@@ -2306,6 +2313,28 @@ const diagStore = (() => {
     }
   };
 })();
+
+/**
+ * 量出输入框占掉的高度，让视图根把这一条让出来。
+ *
+ * 视图根铺满整个对话根，**包括输入框所占的那一条**；输入框 z-index 更高，
+ * 所以详情面板的正文与底部按钮会被它压住（用户报的"内容还是会被遮挡"）。
+ * 写死一个高度不行：输入框随窗口宽度、工具栏与统计行变化。这里直接量
+ * "视图根底部 − 输入框顶部"，并把结果写进 CSS 变量。
+ *
+ * 找不到输入框就保留 CSS 里的兜底值 —— 宁可多留一点，也不要压住内容。
+ */
+function measureComposer(rootEl) {
+  try {
+    const doc = rootEl && rootEl.ownerDocument;
+    if (!doc || typeof doc.querySelector !== 'function') return;
+    const seat = doc.querySelector('[data-conversation-composer-overlay], [class*="composerSeat"]');
+    if (!seat || typeof seat.getBoundingClientRect !== 'function') return;
+    const overlap = Math.round(rootEl.getBoundingClientRect().bottom - seat.getBoundingClientRect().top);
+    const reserve = Math.max(0, Math.min(overlap, 400));
+    rootEl.style.setProperty('--sg-composer-reserve', reserve + 'px');
+  } catch { /* 量不到就用兜底值，不影响渲染 */ }
+}
 
 /** 记一条降级：给角标留痕，也给控制台留一条 warn（不打断用户） */function degrade(reason, error) {
   diagStore.add(reason, error);
@@ -2489,6 +2518,8 @@ function GraphView(props) {
   const [collapseOthers, setCollapseOthers] = React.useState(false);
   const [view, setView] = React.useState({ scale: 1, panX: 24, panY: 20, fitted: false });
   const [exportOpen, setExportOpen] = React.useState(false);
+  /* 详情面板可折叠（与原生 harness 的侧栏一致）：收起后画布占满，工具条上留一个开回来的入口 */
+  const [sideOpen, setSideOpen] = React.useState(true);
   const [exportFmt, setExportFmt] = React.useState('mm');
   const [exportHidden, setExportHidden] = React.useState(false);
   const [toast, setToast] = React.useState('');
@@ -2508,9 +2539,13 @@ function GraphView(props) {
       if (!el || typeof ResizeObserver === 'undefined') return undefined;
       const ro = new ResizeObserver(() => {
         setSize({ w: el.clientWidth || 900, h: el.clientHeight || 600 });
+        /* 输入框让位要**量**，不能猜：输入框的高度随窗口、工具栏、统计行变化，
+           写死一个值不是被压住、就是白留一块。量出"视图根底部到输入框顶部"的距离。 */
+        measureComposer(el);
       });
       ro.observe(el);
       setSize({ w: el.clientWidth || 900, h: el.clientHeight || 600 });
+      measureComposer(el);
       return () => ro.disconnect();
     } catch (error) {
       degrade('视口尺寸测量失败', error);
@@ -3749,6 +3784,11 @@ function GraphView(props) {
       h('div', { key: 'hd', className: 'sg-side-hd' },
         h('span', { className: 'sg-t' }, t('block.turn', { turn: b.turn })),
         h('span', { className: 'sg-s' }, b.sessionTitle),
+        h('button', {
+          className: 'sg-x',
+          title: t('side.collapse'),
+          onClick: () => setSideOpen(false)
+        }, '»'),
         h('button', { className: 'sg-x', onClick: () => setSelected(null) }, '✕')),
       /* 固定区：元信息 —— 无论正文多长都看得见 */
       h('div', { key: 'meta', className: 'sg-side-meta' },
@@ -3864,6 +3904,14 @@ function GraphView(props) {
       cell,
       edgeLabels),
       h('div', { className: 'sg-tools' },
+        /* 详情面板收起后，这里是把它开回来的入口（与原生侧栏的展开一致） */
+        (selected && !sideOpen)
+          ? h('button', {
+            className: 'sg-btn sg-on',
+            title: t('side.expand'),
+            onClick: () => setSideOpen(true)
+          }, t('side.expand'))
+          : null,
         h('button', { className: 'sg-btn', onClick: fit }, t('toolbar.fit')),
         h('button', {
           className: 'sg-btn' + (showHidden ? ' sg-on' : ''),
@@ -3902,7 +3950,7 @@ function GraphView(props) {
       cornerNote,
       labelInput,
       body),
-    h('aside', { className: 'sg-side' }, detail),
+    sideOpen ? h('aside', { className: 'sg-side' }, detail) : null,
     /* 模态与浮层挂在**视图根节点**上，而不是画布容器里 ——
        否则遮罩只盖住画布，右侧详情面板还露在外面，看着像没做完。 */
     exportOpen ? exportDialog() : null,
