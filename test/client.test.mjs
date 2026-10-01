@@ -13,6 +13,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 
 /* ------------------------------------------------- 最小浏览器环境 */
 
@@ -441,4 +442,54 @@ test('未选中任何块时，画布上不产生富文本开销', () => {
   assert.ok(elements(tree).some((n) => n.props && n.props['data-sg-node']), '块照常画出来');
   assert.equal(elements(tree).filter((n) => n.type === MarkdownText).length, 0,
     '没有选中项时不该渲染 MarkdownText');
+});
+
+/* ----------------------------------------------------- 详情面板的布局 */
+
+/** 选中一个块，返回随后的渲染树 */
+function selectBlock(id) {
+  const tree = render(ctx.slots.Component, props);
+  const wrap = elements(tree).find((n) => typeof n.props.className === 'string'
+    && n.props.className.includes('sg-canvas-wrap'));
+  wrap.props.onMouseDown({
+    button: 0, clientX: 1, clientY: 1,
+    target: { closest: (sel) => (sel === '[data-sg-node]' ? { getAttribute: () => id } : null) },
+    preventDefault: () => {}
+  });
+  return render(ctx.slots.Component, props);
+}
+
+test('详情面板：元信息与操作固定在顶部，只有正文区滚动', async () => {
+  /* 回归：正文排在前面时，长正文会把元信息与操作永远挤出可视区 */
+  resetComponent();
+  render(ctx.slots.Component, props);
+  await tick();
+  render(ctx.slots.Component, props);        /* 让远程轮次落地，invest:2 才存在 */
+  const after = selectBlock('invest:2');
+  const side = elements(after).find((n) => n.props && n.props.className === 'sg-side');
+  assert.ok(side, '有右栏');
+  const classes = [].concat(side.props.children || []).map((k) => k && k.props && k.props.className);
+  assert.deepEqual(classes, ['sg-side-hd', 'sg-side-meta', 'sg-side-acts', 'sg-side-bd'],
+    '固定区在前、滚动区在后');
+
+  const css = String(elements(after).find((n) => n.type === 'style').props.children);
+  assert.match(css, /\.sg-side-bd\{[^}]*overflow-y:auto/, '正文区是唯一的滚动容器');
+  assert.match(css, /\.sg-side-meta\{[^}]*flex:0 0 auto/, '元信息不参与拉伸');
+  assert.match(css, /\.sg-side-acts\{[^}]*flex:0 0 auto/, '操作不参与拉伸');
+  assert.match(css, /\.sg-side\{flex:0 0 clamp\(/, '右栏宽度随窗口伸缩但有上下界');
+});
+
+test('块上的提问行不会退化成轮次号', () => {
+  /* 轮次号已经在 sg-hd 里；sg-ask 再兜底显示一遍就是肉眼可见的重复 */
+  const tree = render(ctx.slots.Component, props);
+  const block = elements(tree).find((n) => n.props && n.props['data-sg-node'] === 'root:1');
+  const ask = [].concat(block.props.children || []).find((c) => c && typeof c.props.className === 'string'
+    && c.props.className.includes('sg-ask'));
+  /* 当前会话是本地与远程的合并结果，本地那份更新，所以这里看到本地文本 */
+  assert.equal(ask.props.children, '本地最新提问', '有提问时显示提问本身');
+  assert.ok(!/^第 \d+ 轮$/.test(String(ask.props.children)));
+
+  const bundle = fs.readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  assert.ok(!bundle.includes("|| '第 ' + b.turn + ' 轮'"), '提问为空时不再兜底成轮次号');
+  assert.ok(bundle.includes('（该轮提问尚未载入）'), '改用明确的占位文案');
 });

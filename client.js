@@ -985,8 +985,10 @@ const CSS = `
 .sg-hd .sg-sp{flex:1}
 .sg-badge{display:inline-flex;align-items:center;gap:3px;height:15px;padding:0 5px;border-radius:4px;
   background:var(--dsw-alias-markdown-tag);font-size:10.5px;color:var(--dsw-alias-label-tertiary)}
+/* 提问行只放提问本身 —— 轮次号已经在上一行的 sg-hd 里了，这里再兜底显示一遍就是重复 */
 .sg-ask{font-size:12.5px;color:var(--dsw-alias-label-primary);line-height:1.35;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
+.sg-ask.sg-empty{color:var(--dsw-alias-label-caption)}
 .sg-ans{font-size:11.5px;color:var(--dsw-alias-label-tertiary);line-height:1.35;overflow:hidden;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
 .sg-label{position:absolute;height:26px;display:flex;align-items:center;gap:7px;padding:0 9px;border-radius:7px;
@@ -1008,20 +1010,28 @@ const CSS = `
 .sg-hint{position:absolute;left:12px;bottom:12px;font-size:11.5px;color:var(--dsw-alias-label-caption);
   background:var(--dsw-alias-bg-layer-1);border-radius:7px;padding:5px 10px;box-shadow:var(--dsw-elevation-stroke);z-index:8}
 .sg-hint-warn{left:auto;right:12px;bottom:12px;color:var(--dsw-alias-state-warn-primary)}
-.sg-side{width:330px;flex:0 0 330px;border-left:.5px solid var(--dsw-alias-border-l1);display:flex;
+/* 右栏：元信息与操作**固定**在上，只有正文区滚动。
+   正文可能很长，若把它排在前面，元信息和操作会被永远挤出可视区。 */
+.sg-side{flex:0 0 clamp(320px, 26vw, 430px);border-left:.5px solid var(--dsw-alias-border-l1);display:flex;
   flex-direction:column;min-height:0;user-select:text;-webkit-user-select:text}
 .sg-side-hd{padding:13px 15px 11px;border-bottom:.5px solid var(--dsw-alias-border-l1);display:flex;
-  align-items:center;gap:8px}
-.sg-side-hd .sg-t{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}
+  align-items:center;gap:8px;flex:0 0 auto}
+.sg-side-hd .sg-t{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);flex:0 0 auto}
 .sg-side-hd .sg-s{font-size:11.5px;color:var(--dsw-alias-label-caption);overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;max-width:150px}
+  white-space:nowrap;min-width:0}
 .sg-x{margin-left:auto;border:none;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;
-  font-size:15px;padding:2px 5px;border-radius:5px}
+  font-size:15px;padding:2px 5px;border-radius:5px;flex:0 0 auto}
 .sg-x:hover{background:var(--dsw-alias-interactive-bg-hover)}
-.sg-side-bd{flex:1;overflow-y:auto;padding:14px 15px;min-height:0}
-.sg-sec{margin-bottom:15px}
-.sg-sec .sg-lb{font-size:11px;font-weight:600;letter-spacing:.05em;color:var(--dsw-alias-label-caption);
+.sg-side-meta{padding:12px 15px 0;flex:0 0 auto}
+.sg-side-acts{padding:12px 15px 13px;flex:0 0 auto;border-top:.5px solid var(--dsw-alias-border-l1);
+  margin-top:12px;display:flex;flex-direction:column;gap:7px}
+/* 唯一滚动的区域 */
+.sg-side-bd{flex:1;overflow-y:auto;padding:12px 15px 16px;min-height:0}
+/* 小标题在正文区与固定区都要用，所以不做后代限定 */
+.sg-lb{font-size:11px;font-weight:600;letter-spacing:.05em;color:var(--dsw-alias-label-caption);
   margin-bottom:6px}
+.sg-sec{margin-bottom:15px}
+.sg-sec .sg-lb{margin-bottom:6px}
 .sg-sec .sg-tx{font-size:12.5px;line-height:1.6;color:var(--dsw-alias-label-secondary);word-break:break-word}
 .sg-sec .sg-tx.sg-strong{color:var(--dsw-alias-label-primary)}
 /* 宿主 markdown 渲染器的容器：面板只有 330px，宽内容要能横向滚而不是撑破布局 */
@@ -1481,7 +1491,8 @@ function GraphView(props) {
       h('span', { className: 'sg-dot' + (b.status === 'open' ? ' sg-open' : b.status === 'failed' ? ' sg-failed' : '') }),
       h('span', { className: 'sg-sp' }),
       badges),
-    h('div', { className: 'sg-ask' }, b.alias ? '✎ ' + b.alias : (clip(digest(b.prompt), 110) || '第 ' + b.turn + ' 轮')),
+    h('div', { className: 'sg-ask' + (digest(b.prompt) ? '' : ' sg-empty') },
+      b.alias ? '✎ ' + b.alias : (clip(digest(b.prompt), 110) || '（该轮提问尚未载入）')),
     h('div', { className: 'sg-ans' }, clip(digest(b.response, 'first-paragraph'), 220) || '（该轮回答尚未载入）'));
   });
 
@@ -1521,42 +1532,48 @@ function GraphView(props) {
     if (!n || n.kind !== 'block') return null;
     const b = n.block;
     const open = b.status === 'open';
+    const total = graph.error ? 0 : graph.blocks.filter((x) => x.sessionId === b.sessionId).length;
     return [
+      /* 固定区：头部 */
       h('div', { key: 'hd', className: 'sg-side-hd' },
         h('span', { className: 'sg-t' }, '第 ' + b.turn + ' 轮'),
         h('span', { className: 'sg-s' }, b.sessionTitle),
         h('button', { className: 'sg-x', onClick: () => setSelected(null) }, '✕')),
+      /* 固定区：元信息 —— 无论正文多长都看得见 */
+      h('div', { key: 'meta', className: 'sg-side-meta' },
+        h('div', { className: 'sg-lb' }, '元信息'),
+        h('div', { className: 'sg-meta' },
+          h('span', { className: 'sg-k' }, '会话'), h('span', { className: 'sg-v' }, b.sessionTitle),
+          h('span', { className: 'sg-k' }, '轮次'), h('span', { className: 'sg-v' },
+            b.turn + (total ? ' / 共 ' + total + ' 轮' : '')),
+          h('span', { className: 'sg-k' }, '状态'), h('span', { className: 'sg-v' },
+            open ? '进行中' : b.status === 'failed' ? '失败' : '已完成'),
+          h('span', { className: 'sg-k' }, '工具调用'), h('span', { className: 'sg-v' }, String(b.toolCalls)),
+          h('span', { className: 'sg-k' }, '交付物'), h('span', { className: 'sg-v' },
+            b.deliverables ? String(b.deliverables) : '—'))),
+      /* 固定区：操作 —— 越长的正文越不该把按钮顶出去 */
+      h('div', { key: 'acts', className: 'sg-side-acts' },
+        h('button', {
+          className: 'sg-act sg-primary', disabled: open,
+          title: open ? '该轮尚未结束' : '也可以直接双击块',
+          onClick: () => doFork(b.sessionId, b.turn)
+        }, '⑂ 从这里分叉'),
+        h('button', {
+          className: 'sg-act',
+          onClick: () => { setHidden({ ...hidden, [b.id]: !hidden[b.id] }); setShowHidden(true); }
+        }, hidden[b.id] ? '⊘ 取消隐藏' : '⊘ 隐藏此块'),
+        h('button', {
+          className: 'sg-act',
+          onClick: () => openSession(b.sessionId)
+        }, '◻ 切换到该会话')),
+      /* 唯一滚动的区域：正文 */
       h('div', { key: 'bd', className: 'sg-side-bd' },
         h('div', { className: 'sg-sec' },
           h('div', { className: 'sg-lb' }, '提问'),
           b.prompt ? markdownBlock(b.prompt, 'q') : h('div', { className: 'sg-tx' }, '（未载入）')),
         h('div', { className: 'sg-sec' },
           h('div', { className: 'sg-lb' }, '回答'),
-          b.response ? markdownBlock(b.response, 'a') : h('div', { className: 'sg-tx' }, '（未载入）')),
-        h('div', { className: 'sg-sec' },
-          h('div', { className: 'sg-lb' }, '元信息'),
-          h('div', { className: 'sg-meta' },
-            h('span', { className: 'sg-k' }, '会话'), h('span', { className: 'sg-v' }, b.sessionTitle),
-            h('span', { className: 'sg-k' }, '状态'), h('span', { className: 'sg-v' },
-              open ? '进行中' : b.status === 'failed' ? '失败' : '已完成'),
-            h('span', { className: 'sg-k' }, '工具调用'), h('span', { className: 'sg-v' }, String(b.toolCalls)),
-            h('span', { className: 'sg-k' }, '交付物'), h('span', { className: 'sg-v' }, String(b.deliverables)))),
-        h('div', { className: 'sg-sec' },
-          h('div', { className: 'sg-lb' }, '操作'),
-          h('div', { className: 'sg-acts' },
-            h('button', {
-              className: 'sg-act sg-primary', disabled: open,
-              title: open ? '该轮尚未结束' : '也可以直接双击块',
-              onClick: () => doFork(b.sessionId, b.turn)
-            }, '⑂ 从这里分叉'),
-            h('button', {
-              className: 'sg-act',
-              onClick: () => { setHidden({ ...hidden, [b.id]: !hidden[b.id] }); setShowHidden(true); }
-            }, hidden[b.id] ? '⊘ 取消隐藏' : '⊘ 隐藏此块'),
-            h('button', {
-              className: 'sg-act',
-              onClick: () => { const s = listOf(listSnapshot).find((x) => x.id === b.sessionId || x.sessionId === b.sessionId); openSession(b.sessionId); }
-            }, '◻ 切换到该会话'))))
+          b.response ? markdownBlock(b.response, 'a') : h('div', { className: 'sg-tx' }, '（未载入）')))
     ];
   }
 
