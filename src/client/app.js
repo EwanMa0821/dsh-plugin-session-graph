@@ -151,8 +151,9 @@ const CSS = `
   background:var(--dsw-alias-bg-layer-1);border-radius:var(--dsw-radius-lg,16px);
   box-shadow:var(--dsw-elevation-prominent);overflow:hidden}
 .sg-dlg-hd{padding:14px 16px 12px;border-bottom:.5px solid var(--dsw-alias-border-l1);display:flex;align-items:center;gap:9px}
-.sg-dlg-hd .sg-t{font-size:13.5px;font-weight:600;color:var(--dsw-alias-label-primary)}
-.sg-dlg-hd .sg-s{font-size:11.5px;color:var(--dsw-alias-label-caption)}
+.sg-dlg-hd .sg-t{font-size:13.5px;font-weight:600;color:var(--dsw-alias-label-primary);flex:0 0 auto}
+.sg-dlg-hd .sg-s{font-size:11.5px;color:var(--dsw-alias-label-caption);min-width:0;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
 .sg-dlg-bd{padding:14px 16px;overflow-y:auto;min-height:0}
 .sg-row{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
 .sg-row .sg-lb{font-size:12px;color:var(--dsw-alias-label-caption);width:56px;flex:0 0 56px}
@@ -162,11 +163,14 @@ const CSS = `
 .sg-seg button[aria-pressed="true"]{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);
   font-weight:600;box-shadow:var(--dsw-elevation-stroke)}
 .sg-chk{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--dsw-alias-label-secondary)}
+/* 长行折行而不是横向裁切：「.mm」的富文本行本来就长，横向滚动读不了 */
 .sg-prev{border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm,8px);
   background:var(--dsw-alias-bg-module-platform);padding:11px 13px;font-family:ui-monospace,Consolas,monospace;
-  font-size:11.5px;line-height:1.65;color:var(--dsw-alias-label-secondary);white-space:pre;overflow:auto;max-height:280px}
+  font-size:11.5px;line-height:1.65;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;
+  overflow-wrap:anywhere;overflow-y:auto;max-height:280px}
 .sg-dlg-ft{padding:11px 16px;border-top:.5px solid var(--dsw-alias-border-l1);display:flex;align-items:center;gap:9px}
-.sg-dlg-ft .sg-hi{flex:1;font-size:11.5px;color:var(--dsw-alias-label-caption)}
+/* min-width:0 是关键：flex 项默认 min-width:auto，长提示会把按钮挤出对话框 */
+.sg-dlg-ft .sg-hi{flex:1;min-width:0;font-size:11.5px;color:var(--dsw-alias-label-caption)}
 .sg-bigbtn{height:32px;padding:0 15px;border-radius:var(--dsw-radius-sm,8px);cursor:pointer;font:inherit;
   font-size:12.5px;border:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);
   color:var(--dsw-alias-label-secondary)}
@@ -684,16 +688,18 @@ function GraphView(props) {
       h('div', { className: 'sg-hint' },
         '滚轮缩放 · 拖空白平移 · 单击块看详情 · 双击块分叉 · 方向键移动 · F 适应视图'),
       contentHint,
-      body,
-      exportOpen ? exportDialog() : null,
-      toast ? h('div', {
-        style: {
-          position: 'absolute', left: '50%', bottom: '14px', transform: 'translateX(-50%)',
-          background: 'var(--dsw-alias-toast-bg)', color: 'var(--dsw-alias-toast-label)',
-          padding: '9px 14px', borderRadius: '8px', fontSize: '12.5px', zIndex: 40
-        }
-      }, toast) : null),
-    h('aside', { className: 'sg-side' }, detail));
+      body),
+    h('aside', { className: 'sg-side' }, detail),
+    /* 模态与浮层挂在**视图根节点**上，而不是画布容器里 ——
+       否则遮罩只盖住画布，右侧详情面板还露在外面，看着像没做完。 */
+    exportOpen ? exportDialog() : null,
+    toast ? h('div', {
+      style: {
+        position: 'absolute', left: '50%', bottom: '14px', transform: 'translateX(-50%)',
+        background: 'var(--dsw-alias-toast-bg)', color: 'var(--dsw-alias-toast-label)',
+        padding: '9px 14px', borderRadius: '8px', fontSize: '12.5px', zIndex: 40
+      }
+    }, toast) : null);
 
   function exportDialog() {
     let preview = '';

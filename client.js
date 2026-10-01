@@ -609,18 +609,17 @@ function inlineHtml(text) {
 const isTableRule = (line) => /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line) && line.includes('-');
 
 /**
- * 把一段 Markdown 正文逐行转成 `<p>`，首行带标签（如「问」）。
+ * 把一段 Markdown 正文逐行转成 `<p>`，首行带标签（如「问」）。返回**数组**，
+ * 由调用方决定怎么分行输出 —— 行拆开之后 `.mm` 才 diff 得动、预览也读得了。
  *
  * 空行与表格分隔行跳过（空 `<p>` 在多数思维导图软件里会渲染成一行空白）；
  * 围栏代码换成等宽段落并丢掉 ``` 标记 —— 在导图里那三个反引号只是噪声，
  * 且围栏内不能再套行内标记，否则代码里的 `**` 会被吃掉。
  */
-function paragraphs(text, label) {
+function paragraphList(text, label) {
   const out = [];
-  let emitted = 0;
   const push = (html) => {
-    const head = emitted === 0 ? `<b>${escXml(label)}</b>　` : '';
-    emitted += 1;
+    const head = out.length === 0 ? `<b>${escXml(label)}</b>　` : '';
     out.push(`<p>${head}${html}</p>`);
   };
 
@@ -637,8 +636,8 @@ function paragraphs(text, label) {
     push(heading ? `<b>${inlineHtml(heading[1])}</b>` : inlineHtml(line.replace(/^>\s?/, '')));
   });
 
-  if (emitted === 0) out.push(`<p><b>${escXml(label)}</b></p>`);   /* 正文为空也要留一格 */
-  return out.join('');
+  if (out.length === 0) out.push(`<p><b>${escXml(label)}</b></p>`);   /* 正文为空也要留一格 */
+  return out;
 }
 
 /** 把多行文本整体缩进 n 个空格，供 Markdown 列表项内部嵌入块内容 */
@@ -741,23 +740,31 @@ function toFreeMind(graph, options = {}) {
   const pad = (d) => '  '.repeat(d);
   const out = [];
 
+  /* 富文本**逐行**输出：整段挤成一行时，文件没法 diff，导出预览也只能横向裁切 */
+  function rich(type, depth, parts) {
+    out.push(`${pad(depth)}<richcontent TYPE="${type}"><html><body>`);
+    parts.forEach((p) => out.push(`${pad(depth + 1)}${p}`));
+    out.push(`${pad(depth)}</body></html></richcontent>`);
+  }
+
   function blockNode(block, depth) {
     const title = block.alias
       ? `✎ ${block.alias}`
       : `第 ${block.turn} 轮 · ${clip(summarize(block.prompt), 24)}`;
     const bg = block.current ? ' BACKGROUND_COLOR="#e4edfd"' : '';
     out.push(`${pad(depth)}<node TEXT="${escXml(title)}" ID="${idOf(block.id)}"${bg}>`);
-    /* 第 1 层：节点富文本里「问」「答」两段。
-       正文是 Markdown，**逐行**成段，别把整段塞进一个 <p> —— 那样换行全丢。 */
-    out.push(`${pad(depth + 1)}<richcontent TYPE="NODE"><html><body>` +
-      paragraphs(block.prompt, '问') + paragraphs(block.response, '答') +
-      `</body></html></richcontent>`);
+    /* 第 1 层：节点富文本里「问」「答」两段（正文里的换行原样保留） */
+    rich('NODE', depth + 1, [
+      ...paragraphList(block.prompt, '问'),
+      ...paragraphList(block.response, '答')
+    ]);
     /* 第 2 层：备注里的全文与元信息 */
-    out.push(`${pad(depth + 1)}<richcontent TYPE="NOTE"><html><body>` +
-      paragraphs(block.prompt, '问：') + paragraphs(block.response, '答：') +
+    rich('NOTE', depth + 1, [
+      ...paragraphList(block.prompt, '问：'),
+      ...paragraphList(block.response, '答：'),
       `<p>元信息：${escXml(block.sessionTitle)} · 第 ${block.turn} 轮 · ` +
-      `${block.toolCalls} 个工具 · ${block.deliverables} 个交付物</p>` +
-      `</body></html></richcontent>`);
+      `${block.toolCalls} 个工具 · ${block.deliverables} 个交付物</p>`
+    ]);
     if (block.status === 'open') out.push(`${pad(depth + 1)}<icon BUILTIN="hourglass"/>`);
     if (block.status === 'failed') out.push(`${pad(depth + 1)}<icon BUILTIN="messagebox_warning"/>`);
     if (block.deliverables) out.push(`${pad(depth + 1)}<icon BUILTIN="attach"/>`);
@@ -809,8 +816,7 @@ function toFreeMind(graph, options = {}) {
   if (graph.stats.hiddenSkipped) note.push(`有 ${graph.stats.hiddenSkipped} 个块因被隐藏而未导出。`);
   tree.keptLinks.forEach((l) => note.push(`连线：${l.from} → ${l.to}${l.label ? `（${l.label}）` : ''}`));
   tree.skipped.forEach((l) => note.push(`未导出的连线：${l.from} → ${l.to}${l.label ? `（${l.label}）` : ''}`));
-  out.push(`  <richcontent TYPE="NOTE"><html><body>` +
-    note.map((n) => `<p>${escXml(n)}</p>`).join('') + `</body></html></richcontent>`);
+  rich('NOTE', 1, note.map((n) => `<p>${escXml(n)}</p>`));
   out.push('</node>');
 
   const content = '<map version="1.0.1">\n' +
@@ -1045,8 +1051,9 @@ const CSS = `
   background:var(--dsw-alias-bg-layer-1);border-radius:var(--dsw-radius-lg,16px);
   box-shadow:var(--dsw-elevation-prominent);overflow:hidden}
 .sg-dlg-hd{padding:14px 16px 12px;border-bottom:.5px solid var(--dsw-alias-border-l1);display:flex;align-items:center;gap:9px}
-.sg-dlg-hd .sg-t{font-size:13.5px;font-weight:600;color:var(--dsw-alias-label-primary)}
-.sg-dlg-hd .sg-s{font-size:11.5px;color:var(--dsw-alias-label-caption)}
+.sg-dlg-hd .sg-t{font-size:13.5px;font-weight:600;color:var(--dsw-alias-label-primary);flex:0 0 auto}
+.sg-dlg-hd .sg-s{font-size:11.5px;color:var(--dsw-alias-label-caption);min-width:0;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
 .sg-dlg-bd{padding:14px 16px;overflow-y:auto;min-height:0}
 .sg-row{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
 .sg-row .sg-lb{font-size:12px;color:var(--dsw-alias-label-caption);width:56px;flex:0 0 56px}
@@ -1056,11 +1063,14 @@ const CSS = `
 .sg-seg button[aria-pressed="true"]{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);
   font-weight:600;box-shadow:var(--dsw-elevation-stroke)}
 .sg-chk{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--dsw-alias-label-secondary)}
+/* 长行折行而不是横向裁切：「.mm」的富文本行本来就长，横向滚动读不了 */
 .sg-prev{border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm,8px);
   background:var(--dsw-alias-bg-module-platform);padding:11px 13px;font-family:ui-monospace,Consolas,monospace;
-  font-size:11.5px;line-height:1.65;color:var(--dsw-alias-label-secondary);white-space:pre;overflow:auto;max-height:280px}
+  font-size:11.5px;line-height:1.65;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;
+  overflow-wrap:anywhere;overflow-y:auto;max-height:280px}
 .sg-dlg-ft{padding:11px 16px;border-top:.5px solid var(--dsw-alias-border-l1);display:flex;align-items:center;gap:9px}
-.sg-dlg-ft .sg-hi{flex:1;font-size:11.5px;color:var(--dsw-alias-label-caption)}
+/* min-width:0 是关键：flex 项默认 min-width:auto，长提示会把按钮挤出对话框 */
+.sg-dlg-ft .sg-hi{flex:1;min-width:0;font-size:11.5px;color:var(--dsw-alias-label-caption)}
 .sg-bigbtn{height:32px;padding:0 15px;border-radius:var(--dsw-radius-sm,8px);cursor:pointer;font:inherit;
   font-size:12.5px;border:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);
   color:var(--dsw-alias-label-secondary)}
@@ -1578,16 +1588,18 @@ function GraphView(props) {
       h('div', { className: 'sg-hint' },
         '滚轮缩放 · 拖空白平移 · 单击块看详情 · 双击块分叉 · 方向键移动 · F 适应视图'),
       contentHint,
-      body,
-      exportOpen ? exportDialog() : null,
-      toast ? h('div', {
-        style: {
-          position: 'absolute', left: '50%', bottom: '14px', transform: 'translateX(-50%)',
-          background: 'var(--dsw-alias-toast-bg)', color: 'var(--dsw-alias-toast-label)',
-          padding: '9px 14px', borderRadius: '8px', fontSize: '12.5px', zIndex: 40
-        }
-      }, toast) : null),
-    h('aside', { className: 'sg-side' }, detail));
+      body),
+    h('aside', { className: 'sg-side' }, detail),
+    /* 模态与浮层挂在**视图根节点**上，而不是画布容器里 ——
+       否则遮罩只盖住画布，右侧详情面板还露在外面，看着像没做完。 */
+    exportOpen ? exportDialog() : null,
+    toast ? h('div', {
+      style: {
+        position: 'absolute', left: '50%', bottom: '14px', transform: 'translateX(-50%)',
+        background: 'var(--dsw-alias-toast-bg)', color: 'var(--dsw-alias-toast-label)',
+        padding: '9px 14px', borderRadius: '8px', fontSize: '12.5px', zIndex: 40
+      }
+    }, toast) : null);
 
   function exportDialog() {
     let preview = '';

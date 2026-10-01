@@ -156,6 +156,46 @@ try {
   problems.push('生成客户端产物失败：' + e.message);
 }
 
+/* ------------------------------------------------- 产物必须真的能装载 */
+
+/* 静态检查看不出「模板字符串被反引号截断」「顶层求值抛错」这类问题，
+   而它们只会在发布物上炸。这里用最小环境把 client.js 真跑一遍。 */
+try {
+  const captured = [];
+  const previous = globalThis.window;
+  globalThis.window = {
+    addEventListener() {}, removeEventListener() {},
+    __ModuleLoader__: { load(reg) { captured.push(reg); } }
+  };
+  try {
+    await import(new URL('../client.js', import.meta.url).href + '?gate=' + Date.now());
+  } finally {
+    globalThis.window = previous;
+  }
+  check(captured.length === 1 && typeof captured[0].factory === 'function',
+    `${OUT} 能被 __ModuleLoader__ 装载并给出 factory`);
+
+  if (captured.length === 1) {
+    const fakeReact = {
+      createElement: (type, props) => ({ type, props: props || {} }),
+      useState: (v) => [typeof v === 'function' ? v() : v, () => {}],
+      useEffect() {}, useMemo: (f) => f(), useCallback: (f) => f, useRef: (v) => ({ current: v })
+    };
+    const api = captured[0].factory((name) => {
+      if (name === 'react') return fakeReact;
+      if (name === '@deepseek-ai/dsh-client-ui-primitives') {
+        return { MarkdownText: () => null, extractMarkdownPlainText: () => '' };
+      }
+      throw new Error('客户端 require 了未预期的模块：' + name);
+    });
+    check(typeof api.apply === 'function', `${OUT} 的 factory 返回 { inject, apply }`);
+    check(Array.isArray(api.inject) && api.inject.includes('slots'),
+      `${OUT} 声明了 slots（否则视图注册不到槽位）`);
+  }
+} catch (e) {
+  problems.push(`${OUT} 无法装载：` + e.message);
+}
+
 /* ------------------------------------------------------------- 输出 */
 
 process.stdout.write(`通过 ${notes.length} 项检查\n`);

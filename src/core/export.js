@@ -44,18 +44,17 @@ function inlineHtml(text) {
 const isTableRule = (line) => /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line) && line.includes('-');
 
 /**
- * 把一段 Markdown 正文逐行转成 `<p>`，首行带标签（如「问」）。
+ * 把一段 Markdown 正文逐行转成 `<p>`，首行带标签（如「问」）。返回**数组**，
+ * 由调用方决定怎么分行输出 —— 行拆开之后 `.mm` 才 diff 得动、预览也读得了。
  *
  * 空行与表格分隔行跳过（空 `<p>` 在多数思维导图软件里会渲染成一行空白）；
  * 围栏代码换成等宽段落并丢掉 ``` 标记 —— 在导图里那三个反引号只是噪声，
  * 且围栏内不能再套行内标记，否则代码里的 `**` 会被吃掉。
  */
-function paragraphs(text, label) {
+function paragraphList(text, label) {
   const out = [];
-  let emitted = 0;
   const push = (html) => {
-    const head = emitted === 0 ? `<b>${escXml(label)}</b>　` : '';
-    emitted += 1;
+    const head = out.length === 0 ? `<b>${escXml(label)}</b>　` : '';
     out.push(`<p>${head}${html}</p>`);
   };
 
@@ -72,8 +71,8 @@ function paragraphs(text, label) {
     push(heading ? `<b>${inlineHtml(heading[1])}</b>` : inlineHtml(line.replace(/^>\s?/, '')));
   });
 
-  if (emitted === 0) out.push(`<p><b>${escXml(label)}</b></p>`);   /* 正文为空也要留一格 */
-  return out.join('');
+  if (out.length === 0) out.push(`<p><b>${escXml(label)}</b></p>`);   /* 正文为空也要留一格 */
+  return out;
 }
 
 /** 把多行文本整体缩进 n 个空格，供 Markdown 列表项内部嵌入块内容 */
@@ -176,23 +175,31 @@ export function toFreeMind(graph, options = {}) {
   const pad = (d) => '  '.repeat(d);
   const out = [];
 
+  /* 富文本**逐行**输出：整段挤成一行时，文件没法 diff，导出预览也只能横向裁切 */
+  function rich(type, depth, parts) {
+    out.push(`${pad(depth)}<richcontent TYPE="${type}"><html><body>`);
+    parts.forEach((p) => out.push(`${pad(depth + 1)}${p}`));
+    out.push(`${pad(depth)}</body></html></richcontent>`);
+  }
+
   function blockNode(block, depth) {
     const title = block.alias
       ? `✎ ${block.alias}`
       : `第 ${block.turn} 轮 · ${clip(summarize(block.prompt), 24)}`;
     const bg = block.current ? ' BACKGROUND_COLOR="#e4edfd"' : '';
     out.push(`${pad(depth)}<node TEXT="${escXml(title)}" ID="${idOf(block.id)}"${bg}>`);
-    /* 第 1 层：节点富文本里「问」「答」两段。
-       正文是 Markdown，**逐行**成段，别把整段塞进一个 <p> —— 那样换行全丢。 */
-    out.push(`${pad(depth + 1)}<richcontent TYPE="NODE"><html><body>` +
-      paragraphs(block.prompt, '问') + paragraphs(block.response, '答') +
-      `</body></html></richcontent>`);
+    /* 第 1 层：节点富文本里「问」「答」两段（正文里的换行原样保留） */
+    rich('NODE', depth + 1, [
+      ...paragraphList(block.prompt, '问'),
+      ...paragraphList(block.response, '答')
+    ]);
     /* 第 2 层：备注里的全文与元信息 */
-    out.push(`${pad(depth + 1)}<richcontent TYPE="NOTE"><html><body>` +
-      paragraphs(block.prompt, '问：') + paragraphs(block.response, '答：') +
+    rich('NOTE', depth + 1, [
+      ...paragraphList(block.prompt, '问：'),
+      ...paragraphList(block.response, '答：'),
       `<p>元信息：${escXml(block.sessionTitle)} · 第 ${block.turn} 轮 · ` +
-      `${block.toolCalls} 个工具 · ${block.deliverables} 个交付物</p>` +
-      `</body></html></richcontent>`);
+      `${block.toolCalls} 个工具 · ${block.deliverables} 个交付物</p>`
+    ]);
     if (block.status === 'open') out.push(`${pad(depth + 1)}<icon BUILTIN="hourglass"/>`);
     if (block.status === 'failed') out.push(`${pad(depth + 1)}<icon BUILTIN="messagebox_warning"/>`);
     if (block.deliverables) out.push(`${pad(depth + 1)}<icon BUILTIN="attach"/>`);
@@ -244,8 +251,7 @@ export function toFreeMind(graph, options = {}) {
   if (graph.stats.hiddenSkipped) note.push(`有 ${graph.stats.hiddenSkipped} 个块因被隐藏而未导出。`);
   tree.keptLinks.forEach((l) => note.push(`连线：${l.from} → ${l.to}${l.label ? `（${l.label}）` : ''}`));
   tree.skipped.forEach((l) => note.push(`未导出的连线：${l.from} → ${l.to}${l.label ? `（${l.label}）` : ''}`));
-  out.push(`  <richcontent TYPE="NOTE"><html><body>` +
-    note.map((n) => `<p>${escXml(n)}</p>`).join('') + `</body></html></richcontent>`);
+  rich('NOTE', 1, note.map((n) => `<p>${escXml(n)}</p>`));
   out.push('</node>');
 
   const content = '<map version="1.0.1">\n' +
