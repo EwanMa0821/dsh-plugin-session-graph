@@ -12,6 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { ROOT, OUT, PKG_NAME, generateClient } from './build-client.mjs';
+import { findServiceViolations } from './lib/service-audit.mjs';
 
 const problems = [];
 const notes = [];
@@ -232,6 +233,36 @@ try {
   }
 } catch (e) {
   problems.push('本地化检查失败：' + e.message);
+}
+
+/* --------------------------------------------- 客户端服务访问审计（白屏护栏） */
+
+/*
+ * cordis 的硬规则：**没有声明在 `inject` 里的服务，属性访问会直接抛**
+ * （`cannot get property "workspaces" without inject`）。
+ * 这条例外如果抛在渲染期，宿主会把整个视图卸掉 —— 表现是"标签在、视图一片白"，
+ * 而且标签是另一个纯 thunk、照常显示，看起来只是"没内容"。这条审计就是那次事故的护栏。
+ *
+ * 判定逻辑（剥注释 + 找越界）在 scripts/lib/service-audit.mjs，由 test/scripts.test.mjs 覆盖 ——
+ * 门禁自己也要被测，否则没人敢信它的红与绿。
+ */
+try {
+  const appSrc = fs.readFileSync(path.join(ROOT, 'src/client/app.js'), 'utf8');
+  const declared = /return \{ inject: \[([^\]]*)\], apply \}/.exec(appSrc);
+  const injected = declared
+    ? declared[1].split(',').map((s) => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean)
+    : [];
+  check(declared !== null, '客户端 inject 列表可解析');
+  check(injected.length > 0, `客户端 inject 列表非空（${injected.join(', ')}）`);
+
+  const offenders = findServiceViolations(appSrc, injected);
+  const detail = [...new Set(offenders.map((o) => `src/client/app.js:${o.line} → ctx.${o.name}`))];
+  check(offenders.length === 0,
+    offenders.length
+      ? `客户端访问了未 inject 的服务（会抛 cannot get property ... without inject）：${detail.join('、')}`
+      : '客户端只访问已 inject 的服务与上下文成员（无属性越界）');
+} catch (e) {
+  problems.push('客户端服务访问审计失败：' + e.message);
 }
 
 /* ------------------------------------------------------------- 输出 */

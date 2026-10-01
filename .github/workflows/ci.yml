@@ -1,0 +1,35 @@
+# 会话图谱插件 · 持续集成
+#
+# 三件事：单元测试、清单/产物门禁、宿主契约检查。
+#
+# 为什么要 CI：client.js 是**提交进仓库的生成产物**，而它由 src/ 生成 ——
+# 改了源码忘了重建，仓库里就是一份与源码不符的产物（这次开发中真的发生过）。
+# check-package 会比对产物与源码，它必须在每次 push 上跑，而不是靠人记得。
+#
+# check-host-contract 在没有 DSH 安装的机器上会**自动跳过并返回 0**，
+# 所以在 runner 上不会失败；它的价值在开发机上（读宿主 asar 核对契约）。
+#
+# 仓库零运行时依赖，所以不需要 install 步骤，任何 node 22+ 都能直接跑。
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 单元测试
+        run: node scripts/run-tests.mjs
+      - name: 清单与产物门禁（含 client.js 与 src 是否同步）
+        run: node scripts/check-package.mjs
+      - name: 宿主契约检查（本机无 DSH 安装时自动跳过）
+        run: node scripts/check-host-contract.mjs

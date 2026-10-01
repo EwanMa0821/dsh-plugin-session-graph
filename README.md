@@ -151,14 +151,35 @@ src/client/app.js    客户端应用
 ## 开发
 
 ```bash
-node scripts/run-tests.mjs      # 272 项测试，在同一进程内运行
-node scripts/check-package.mjs  # 清单、图标、patch、产物是否过期
-node scripts/build-client.mjs   # 改过 src/ 之后必须跑
+node scripts/run-tests.mjs           # 281 项测试，在同一进程内运行
+node scripts/check-package.mjs       # 清单、图标、patch、产物是否过期、服务访问越界
+node scripts/check-host-contract.mjs # 宿主契约核对（本机没装 DSH 就自动跳过）
+node scripts/build-client.mjs        # 改过 src/ 之后必须跑
 ```
 
-测试分三层：`test/core.test.mjs`（纯逻辑）、`test/host.test.mjs`（事件折叠与路由）、
+测试分五层：`test/core.test.mjs`（纯逻辑）、`test/host.test.mjs`（事件折叠与路由）、
 `test/client.test.mjs`（把生成的 `client.js` 装进最小浏览器环境，用带 hook 运行时的小 React
-**真渲染一次**，而不是只断言字符串）。
+**真渲染一次**，而不是只断言字符串）、`test/state.test.mjs`（存档清洗、补丁合并与撤销）、
+`test/scripts.test.mjs`（**门禁脚本自己**：护栏必须抓得住真违规、又放得过注释里的反例）。
+
+三个门禁都在 `.github/workflows/ci.yml` 里跑：单元测试、清单与产物同步、
+宿主契约。仓库零运行时依赖，所以 CI 不需要 install 步骤。
+
+### 宿主契约检查为什么值得单独存在
+
+单元测试跑在**假宿主**上，测的是"我们相信的宿主"。这个插件的两次线上级故障
+（`dsh.client.immediately` 卡死整个壳、`ctx.workspaces` 未 inject 的属性访问导致白屏）
+都不是逻辑错，而是**对宿主契约的假设过期了** —— 那一层单元测试永远够不着。
+
+`scripts/check-host-contract.mjs` 直接读宿主安装里的 `app.asar`，逐条核对：
+存储域名的命名规则、`resolveSlotLabel` 会不会兜底、视图槽位与数据层的注册形状、
+`immediately` 的引导批次语义、cordis 的 inject 守卫、以及
+**我们 inject 的每个服务是否真有产品包在提供**（写错名字 = 永远 pending）。
+契约变了它就变红，比线上白屏便宜得多。装 DSH 的机器上可以这样指定路径：
+
+```bash
+node scripts/check-host-contract.mjs "D:\Software\DeepSeekHarness\resources\app.asar"
+```
 
 ---
 

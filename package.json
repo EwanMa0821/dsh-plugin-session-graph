@@ -18,6 +18,10 @@
     "src",
     "locale",
     "scripts/build-client.mjs",
+    "scripts/check-package.mjs",
+    "scripts/check-host-contract.mjs",
+    "scripts/run-tests.mjs",
+    "scripts/lib",
     "icon.svg",
     "cordis.patch.yml",
     "README.md",
@@ -27,7 +31,8 @@
   "scripts": {
     "test": "node scripts/run-tests.mjs",
     "build:client": "node scripts/build-client.mjs",
-    "check": "node scripts/check-package.mjs"
+    "check": "node scripts/check-package.mjs",
+    "check:contract": "node scripts/check-host-contract.mjs"
   },
   "keywords": [
     "dsh",

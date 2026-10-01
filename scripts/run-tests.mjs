@@ -16,7 +16,8 @@ const suites = [
   '../test/core.test.mjs',
   '../test/state.test.mjs',
   '../test/host.test.mjs',
-  '../test/client.test.mjs'
+  '../test/client.test.mjs',
+  '../test/scripts.test.mjs'
 ];
 
 let failed = false;
