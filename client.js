@@ -1344,6 +1344,7 @@ const CSS = `
   color:var(--dsw-alias-label-primary)}
 .sg-linkdraft-in:focus{outline:none;border-color:var(--dsw-alias-state-business-primary)}
 .sg-linkdraft-in.sg-wide{width:100%}
+.sg-linkdraft-in.sg-rename-in{width:100%}
 .sg-act.sg-danger{color:var(--dsw-alias-state-error-primary)}
 .sg-act.sg-danger:hover{background:var(--dsw-alias-state-error-tertiary)}
 .sg-node{position:absolute;border-radius:var(--dsw-radius-md,12px);background:var(--dsw-alias-bg-layer-1);
@@ -1528,6 +1529,8 @@ function GraphView(props) {
   const [alias, setAlias] = React.useState({});
   const [links, setLinks] = React.useState([]);
   const [selectedEdge, setSelectedEdge] = React.useState(null);
+  /* 正在改名的块：{ id, value } */
+  const [renaming, setRenaming] = React.useState(null);
   /* 持久化：存档读回来之后才允许写，避免首帧的空状态把存档冲掉 */
   const [writable, setWritable] = React.useState(true);
   const [incompatible, setIncompatible] = React.useState(false);
@@ -1750,6 +1753,37 @@ function GraphView(props) {
     return { x: ev.clientX - r.left, y: ev.clientY - r.top };
   }, []);
 
+  /* ------------------------------------------------------------ 撤销 */
+
+  /* 快照式撤销：这三份自有数据就是全部可变状态，量也小，
+     与其为每种操作写一个逆操作，不如存一份快照。上限 50 步。 */
+  const historyRef = React.useRef([]);
+  const [canUndo, setCanUndo] = React.useState(false);
+
+  /** 在任何变更**之前**调用 */
+  const remember = React.useCallback(() => {
+    historyRef.current.push({ hidden, alias, links });
+    if (historyRef.current.length > 50) historyRef.current.shift();
+    setCanUndo(true);
+  }, [hidden, alias, links]);
+
+  /** 把界面与存档一起恢复到某个快照；多出来的连线要显式删掉 */
+  const applySnapshot = React.useCallback((snap) => {
+    const keep = new Set(snap.links.map((l) => l.id));
+    const removeLinkIds = links.filter((l) => !keep.has(l.id)).map((l) => l.id);
+    setHidden(snap.hidden);
+    setAlias(snap.alias);
+    setLinks(snap.links);
+    persist({ hidden: snap.hidden, alias: snap.alias, links: snap.links, removeLinkIds });
+  }, [links, persist]);
+
+  const undo = React.useCallback(() => {
+    const snap = historyRef.current.pop();
+    setCanUndo(historyRef.current.length > 0);
+    if (!snap) { say('没有可撤销的操作'); return; }
+    applySnapshot(snap);
+  }, [applySnapshot, say]);
+
   /** 建立一条手动连线（FR-9），随后弹出标签输入框 */
   const createLink = React.useCallback((from, to, at) => {
     if (!from || !to) return;
@@ -1757,10 +1791,11 @@ function GraphView(props) {
     /* 同一对块之间允许多条（不同标签），所以 id 要唯一而不是由端点决定 */
     const id = `link:${from}->${to}:${Date.now().toString(36)}`;
     const next = [...links, { id, kind: 'link', from, to }];
+    remember();
     setLinks(next);
     persist({ links: next });
     setLinkDraft({ id, value: '', x: at ? at.x : 0, y: at ? at.y : 0 });
-  }, [links, persist, say]);
+  }, [links, persist, say, remember]);
 
   /** 写入某条连线的标签；空字符串即清除标签 */
   const labelLink = React.useCallback((id, value) => {
@@ -1770,17 +1805,31 @@ function GraphView(props) {
       if (text === '') { const { label: _drop, ...rest } = l; return rest; }
       return { ...l, label: text };
     });
+    remember();
     setLinks(next);
     persist({ links: next });
-  }, [links, persist]);
+  }, [links, persist, remember]);
+
+  /** 重命名（FR-11）：写入别名；留空即恢复自动标题 */
+  const renameBlock = React.useCallback((id, value) => {
+    const text = String(value === undefined || value === null ? '' : value).trim().slice(0, 120);
+    const next = { ...alias };
+    if (text === '') delete next[id];
+    else next[id] = text;
+    remember();
+    setAlias(next);
+    persist({ alias: next });
+    setRenaming(null);
+  }, [alias, persist, remember]);
 
   /** 删除一条手动连线 */
   const removeLink = React.useCallback((id) => {
     const next = links.filter((l) => l.id !== id);
+    remember();
     setLinks(next);
     persist({ links: next, removeLinkIds: [id] });
     setSelectedEdge(null);
-  }, [links, persist]);
+  }, [links, persist, remember]);
 
   const onWheel = React.useCallback((ev) => {
     ev.preventDefault();
@@ -1902,6 +1951,7 @@ function GraphView(props) {
       setLinking(null);
       setLinkDraft(null);
       setSelectedEdge(null);
+      setRenaming(null);
     };
     window.addEventListener('mousemove', move);
     window.addEventListener('mouseup', up);
@@ -1917,6 +1967,8 @@ function GraphView(props) {
 
   const onKeyDown = React.useCallback((ev) => {
     const k = ev.key;
+    /* Ctrl/Cmd+Z 撤销（FR-11：每个操作可撤销，可逐步回退） */
+    if ((k === 'z' || k === 'Z') && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); undo(); return; }
     if (k === 'f' || k === 'F') { ev.preventDefault(); fit(); return; }
     if (k === 'Escape') { ev.preventDefault(); setExportOpen(false); setSelected(null); return; }
     if (k.indexOf('Arrow') === 0) {
@@ -1924,7 +1976,7 @@ function GraphView(props) {
       const next = moveSelection(laid.nodes, selected, k);
       if (next) setSelected(next);
     }
-  }, [fit, laid, selected]);
+  }, [fit, laid, selected, undo]);
 
   /* ---- 动作 ---- */
   const doFork = React.useCallback((sid, turn) => {
@@ -2239,6 +2291,28 @@ function GraphView(props) {
         h('button', { className: 'sg-x', onClick: () => setSelected(null) }, '✕')),
       /* 固定区：元信息 —— 无论正文多长都看得见 */
       h('div', { key: 'meta', className: 'sg-side-meta' },
+        renaming && renaming.id === b.id
+          ? h('div', { className: 'sg-sec' },
+            h('div', { className: 'sg-lb' }, '重命名'),
+            h('input', {
+              className: 'sg-linkdraft-in sg-rename-in',
+              autoFocus: true,
+              maxLength: 120,
+              placeholder: '新名称（留空恢复自动标题）',
+              value: renaming.value,
+              onChange: (ev) => {
+                const v = ev.target.value;
+                setRenaming((r) => (r ? { ...r, value: v } : r));
+              },
+              onKeyDown: (ev) => {
+                ev.stopPropagation();
+                if (ev.key === 'Enter') renameBlock(b.id, renaming.value);
+                else if (ev.key === 'Escape') setRenaming(null);
+              },
+              onBlur: () => renameBlock(b.id, renaming.value)
+            }),
+            h('div', { className: 'sg-tx' }, '别名优先于自动标题，图谱上带 ✎ 前缀。'))
+          : null,
         h('div', { className: 'sg-lb' }, '元信息'),
         h('div', { className: 'sg-meta' },
           h('span', { className: 'sg-k' }, '会话'), h('span', { className: 'sg-v' }, b.sessionTitle),
@@ -2262,10 +2336,16 @@ function GraphView(props) {
         }, '→ 连接到…'),
         h('button', {
           className: 'sg-act',
+          onClick: () => setRenaming({ id: b.id, value: alias[b.id] || '' })
+        }, '✎ 重命名'),
+        h('button', {
+          className: 'sg-act',
           onClick: () => {
             const next = { ...hidden, [b.id]: !hidden[b.id] };
+            remember();
             setHidden(next);
-            setShowHidden(true);
+            /* 不要把「显示已隐藏」顺手打开：那会让"隐藏"看起来没生效。
+               想看回来是另一个动作（工具条上的开关，FR-11）。 */
             persist({ hidden: next });
           }
         }, hidden[b.id] ? '⊘ 取消隐藏' : '⊘ 隐藏此块'),
@@ -2325,6 +2405,12 @@ function GraphView(props) {
           onClick: () => setCollapseOthers(!collapseOthers)
         }, '折叠其他会话'),
         h('button', { className: 'sg-btn', onClick: () => setExportOpen(true) }, '↧ 导出'),
+        h('button', {
+          className: 'sg-btn',
+          disabled: !canUndo,
+          title: canUndo ? '撤销上一步（Ctrl+Z）' : '没有可撤销的操作',
+          onClick: undo
+        }, '↶ 撤销'),
         (!writable || incompatible)
           ? h('span', {
             className: 'sg-ro',

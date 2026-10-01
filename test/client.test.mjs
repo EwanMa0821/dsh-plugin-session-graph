@@ -856,6 +856,209 @@ test('连线后弹出标签输入框，Enter 写入标签', async () => {
   }
 });
 
+/* ------------------------------------------------------- 重命名与撤销 */
+
+/** 挂载、选中一个块、点「重命名」，返回（含输入框的）渲染树 */
+async function openRename(blockId) {
+  resetComponent();
+  render(ctx.slots.Component, props);
+  await tick();
+  render(ctx.slots.Component, props);
+  const selectedTree = selectBlock(blockId);
+  const btn = elements(selectedTree).find((n) => n.props && n.props.className === 'sg-act'
+    && String(n.props.children).includes('重命名'));
+  assert.ok(btn, '详情面板有重命名按钮');
+  btn.props.onClick();
+  return render(ctx.slots.Component, props);
+}
+
+const textIn = (tree) => {
+  const out = [];
+  (function walk(node) {
+    if (node === null || node === undefined) return;
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    if (typeof node === 'string' || typeof node === 'number') { out.push(String(node)); return; }
+    if (typeof node !== 'object') return;
+    if (node.type) { walk(node.props && node.props.children); return; }
+  })(tree);
+  return out.join(' | ');
+};
+
+test('重命名写入别名，图谱上带 ✎ 前缀', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const before = postCalls.length;
+  try {
+    let tree = await openRename('root:1');
+    const input = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-rename-in'));
+    assert.ok(input, '弹出重命名输入框');
+
+    input.props.onChange({ target: { value: '先做需求文档' } });
+    tree = render(ctx.slots.Component, props);
+    const again = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-rename-in'));
+    again.props.onKeyDown({ key: 'Enter', stopPropagation() {} });
+    tree = render(ctx.slots.Component, props);
+
+    assert.ok(!elements(tree).some((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-rename-in')), '确认后输入框收起');
+    const block = elements(tree).find((n) => n.props && n.props['data-sg-node'] === 'root:1');
+    assert.match(textIn(block), /✎ 先做需求文档/, '别名优先于自动标题');
+
+    await new Promise((r) => setTimeout(r, 520));
+    const sent = postCalls.slice(before).find((p) => p.patch.alias);
+    assert.ok(sent, '别名写回宿主');
+    assert.equal(sent.patch.alias['root:1'], '先做需求文档');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('别名留空即恢复自动标题', async () => {
+  serverReply = { ...serverReply, state: blankState({ alias: { 'root:1': '旧名' } }) };
+  try {
+    let tree = await openRename('root:1');
+    const input = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-rename-in'));
+    assert.equal(input.props.value, '旧名', '输入框预填当前别名');
+    input.props.onChange({ target: { value: '   ' } });
+    tree = render(ctx.slots.Component, props);
+    elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-rename-in'))
+      .props.onKeyDown({ key: 'Enter', stopPropagation() {} });
+    tree = render(ctx.slots.Component, props);
+
+    const block = elements(tree).find((n) => n.props && n.props['data-sg-node'] === 'root:1');
+    assert.ok(!textIn(block).includes('✎'), '回到自动标题');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('撤销能逐步回退：重命名 → 隐藏', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  try {
+    /* 第一步：重命名 root:1 */
+    let tree = await openRename('root:1');
+    const input = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-rename-in'));
+    input.props.onChange({ target: { value: '第一步' } });
+    tree = render(ctx.slots.Component, props);
+    elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-rename-in'))
+      .props.onKeyDown({ key: 'Enter', stopPropagation() {} });
+    tree = render(ctx.slots.Component, props);
+
+    /* 第二步：把 root:2 藏起来 */
+    tree = selectBlock('root:2');
+    elements(tree).find((n) => n.props && n.props.className === 'sg-act'
+      && String(n.props.children).includes('隐藏此块')).props.onClick();
+    tree = render(ctx.slots.Component, props);
+    assert.ok(!elements(tree).some((n) => n.props && n.props['data-sg-node'] === 'root:2'),
+      'root:2 已从画布上消失');
+
+    const undoBtn = () => elements(tree).find((n) => n.props && n.props.className === 'sg-btn'
+      && String(n.props.children).includes('撤销'));
+    assert.equal(undoBtn().props.disabled, false, '有可撤销的操作');
+
+    /* 撤销一次：隐藏被回退 */
+    undoBtn().props.onClick();
+    tree = render(ctx.slots.Component, props);
+    assert.ok(elements(tree).some((n) => n.props && n.props['data-sg-node'] === 'root:2'),
+      'root:2 回来了');
+    const block = elements(tree).find((n) => n.props && n.props['data-sg-node'] === 'root:1');
+    assert.match(textIn(block), /✎ 第一步/, '重命名还在');
+
+    /* 再撤销一次：重命名被回退 */
+    elements(tree).find((n) => n.props && n.props.className === 'sg-btn'
+      && String(n.props.children).includes('撤销')).props.onClick();
+    tree = render(ctx.slots.Component, props);
+    assert.ok(!textIn(elements(tree).find((n) => n.props && n.props['data-sg-node'] === 'root:1'))
+      .includes('✎'), '别名也回退了');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('撤销新建的连线时显式上报删除，而不是整表覆盖', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const before = postCalls.length;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    press(tree, { handle: 'root:1' });
+    render(ctx.slots.Component, props);
+    releaseOver('ancor:1');
+    tree = render(ctx.slots.Component, props);
+
+    const link = elements(tree).find((n) => n.props && String(n.props['data-sg-edge'] || '').startsWith('link:'));
+    assert.ok(link, '连线已建立');
+
+    elements(tree).find((n) => n.props && n.props.className === 'sg-btn'
+      && String(n.props.children).includes('撤销')).props.onClick();
+    tree = render(ctx.slots.Component, props);
+    assert.ok(!elements(tree).some((n) => n.props
+      && String(n.props['data-sg-edge'] || '').startsWith('link:')), '连线被撤销掉');
+
+    await new Promise((r) => setTimeout(r, 520));
+    const sent = postCalls.slice(before).find((p) => p.patch.removeLinkIds);
+    assert.ok(sent, '删除按 id 上报');
+    assert.match(sent.patch.removeLinkIds[0], /^link:root:1->ancor:1:/);
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('Ctrl+Z 与工具条按钮等价；没得撤销时按钮禁用', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    const undoBtn = () => elements(tree).find((n) => n.props && n.props.className === 'sg-btn'
+      && String(n.props.children).includes('撤销'));
+    assert.equal(undoBtn().props.disabled, true, '一开始没有可撤销的');
+
+    /* 藏一块，制造一步历史 */
+    tree = selectBlock('root:2');
+    elements(tree).find((n) => n.props && n.props.className === 'sg-act'
+      && String(n.props.children).includes('隐藏此块')).props.onClick();
+    tree = render(ctx.slots.Component, props);
+    assert.equal(undoBtn().props.disabled, false);
+
+    canvasOf(tree).props.onKeyDown({ key: 'z', ctrlKey: true, preventDefault() {} });
+    tree = render(ctx.slots.Component, props);
+    assert.ok(elements(tree).some((n) => n.props && n.props['data-sg-node'] === 'root:2'),
+      'Ctrl+Z 撤销了隐藏');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('Esc 取消重命名且不写入', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const before = postCalls.length;
+  try {
+    let tree = await openRename('root:1');
+    const input = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-rename-in'));
+    input.props.onChange({ target: { value: '不要这个' } });
+    fire('keydown', { key: 'Escape' });
+    tree = render(ctx.slots.Component, props);
+    assert.ok(!elements(tree).some((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-rename-in')), '输入框收起');
+    assert.ok(!textIn(tree).includes('不要这个'), '没有写进去');
+
+    await new Promise((r) => setTimeout(r, 520));
+    assert.equal(postCalls.slice(before).filter((p) => p.patch.alias).length, 0);
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
 test('点边标签即选中该连线，可改标签也可删除', async () => {
   serverReply = {
     ...serverReply,
