@@ -326,7 +326,17 @@ function textsOf(tree) {
   return out;
 }
 
-const props = ctx.slots.options.inject('root');
+/* openView / viewRequest 由 ui-slots 在渲染时注入，不是 inject 的产物；
+   这里手动补上，才能测到 FR-14 的视图切换。 */
+const viewOpens = [];
+const slotKit = () => ({
+  openView: (view, focus) => { viewOpens.push({ view, focus }); },
+  viewRequest: null,
+  completeViewRequest: () => {},
+  bindDraftMirror: () => () => {}
+});
+
+const props = { ...ctx.slots.options.inject('root'), ...slotKit() };
 
 test('首轮渲染：本地时间线立即可用，并向 Host 请求家族数据', async () => {
   const first = render(ctx.slots.Component, props);
@@ -1238,7 +1248,7 @@ test('点边标签即选中该连线，可改标签也可删除', async () => {
 /* ------------------------------------------------- 规模降级（NFR-1） */
 
 /** 用某个会话作为当前会话渲染（当前会话影响骨架档的取舍） */
-const propsFor = (sid) => ctx.slots.options.inject(sid);
+const propsFor = (sid) => ({ ...ctx.slots.options.inject(sid), ...slotKit() });
 
 const classCount = (tree, frag) => elements(tree).filter((n) => typeof n.props.className === 'string'
   && n.props.className.includes(frag)).length;
@@ -1390,6 +1400,113 @@ test('找不到工作区时直接说明，不去猜', async () => {
     assert.equal(postCalls.slice(before).filter((p) => p.patch.links).length, 0);
   } finally {
     ctx.workspaces = savedWs;
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+/* ------------------------------- 跨会话跳转与定位（FR-14） */
+
+const wsSource = (archived) => source({
+  items: [{ workspaceId: 'ws-1', sessionIds: ['root', 'ancor', 'invest'] }],
+  archivedSessionIds: archived || []
+});
+
+test('定位该轮：本会话内切到对话视图，并如实说明不能自动滚动', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  viewOpens.length = 0;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    const btn = elements(selectBlock('root:1')).find((n) => n.props && n.props.className === 'sg-act'
+      && String(n.props.children).includes('在对话视图中定位该轮'));
+    assert.ok(btn, '详情面板有定位入口');
+    btn.props.onClick();
+    tree = render(ctx.slots.Component, props);
+
+    assert.deepEqual(viewOpens.map((v) => v.view), ['transcript-view'], '切到对话视图');
+    assert.equal(viewOpens[0].focus, undefined,
+      '**不传 focus** —— 对话视图不认它，传了就是造一个假入口');
+    assert.match(textIn(tree), /无法自动滚动，请找第 1 轮/, '把能力缺口说出来');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('定位该轮：跨会话时先切会话，挂载后再切视图', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  viewOpens.length = 0;
+  delete ctx.opened;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    const btn = elements(selectBlock('ancor:1')).find((n) => n.props && n.props.className === 'sg-act'
+      && String(n.props.children).includes('在对话视图中定位该轮'));
+    btn.props.onClick();
+    tree = render(ctx.slots.Component, props);
+    assert.equal(ctx.opened, 'ancor', '先切到目标会话');
+    assert.equal(viewOpens.length, 0, '此时视图还没挂出来，不能急着切');
+
+    /* 目标会话的视图挂出来之后，待办才执行 */
+    const target = propsFor('ancor');
+    tree = render(ctx.slots.Component, target);
+    assert.deepEqual(viewOpens.map((v) => v.view), ['transcript-view'], '挂载后补上切视图');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('归档会话的会话头可点击被禁用，并说明原因', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const saved = ctx.workspaces;
+  ctx.workspaces = { list: wsSource(['invest']) };
+  delete ctx.opened;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    const tree = render(ctx.slots.Component, props);
+    const head = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-label')
+      && String(n.props.className).includes('sg-unavailable'));
+    assert.ok(head, '归档会话拿到禁用样式');
+    assert.equal(head.props.onClick, undefined, '点了也没有处理函数');
+    assert.equal(head.props['aria-disabled'], 'true');
+    assert.match(String(head.props.title), /已归档，无法切换/);
+
+    /* 没归档的照常可点 */
+    const normal = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-label') && n.props.className.includes('sg-current'));
+    assert.equal(typeof normal.props.onClick, 'function');
+  } finally {
+    ctx.workspaces = saved;
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('切换会话失败时提示，且不改变当前会话', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const saved = ctx.uiWorkspace;
+  ctx.uiWorkspace = { openSession() { throw new Error('载体不可连'); } };
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    const head = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-label') && !n.props.className.includes('sg-current')
+      && typeof n.props.onClick === 'function');
+    head.props.onClick();
+    tree = render(ctx.slots.Component, props);
+    assert.match(textIn(tree), /切换会话失败：载体不可连/, '把原因说出来');
+    const cur = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-current'));
+    assert.ok(cur, '当前会话保持不变');
+  } finally {
+    ctx.uiWorkspace = saved;
     serverReply = { ...serverReply, state: null };
   }
 });

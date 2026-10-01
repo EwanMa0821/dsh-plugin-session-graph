@@ -62,6 +62,8 @@ const CSS = `
   background-image:radial-gradient(var(--dsw-alias-border-l2) 1px,transparent 1px);background-size:22px 22px}
 .sg-canvas-wrap.sg-panning{cursor:grabbing}
 .sg-canvas-wrap.sg-linking{cursor:crosshair}
+/* 归档会话：看得到、点不动，悬停说明原因（FR-14） */
+.sg-label.sg-unavailable{opacity:.45;cursor:not-allowed}
 .sg-world{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform}
 .sg-world svg{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}
 .sg-e-branch{fill:none;stroke:var(--dsw-alias-label-dimmed);stroke-width:1.6}
@@ -289,6 +291,13 @@ function workspaceIdOf(ctx, sessionId) {
 function GraphView(props) {
   const { ctx, target, sessions } = props || {};
   const listSnapshot = useSource(sessions && sessions.list);
+  /* 归档会话在图谱里仍会出现，但**点不动**（FR-14：目标不可用要禁用并说明原因） */
+  const wsSnapshot = useSource(ctx && ctx.workspaces && ctx.workspaces.list);
+  const archivedIds = React.useMemo(
+    () => new Set((wsSnapshot && Array.isArray(wsSnapshot.archivedSessionIds))
+      ? wsSnapshot.archivedSessionIds : []),
+    [wsSnapshot]
+  );
   const sessionId = resolveSessionId(props, listSnapshot);
   const [selected, setSelected] = React.useState(null);
   const [hidden, setHidden] = React.useState({});
@@ -298,8 +307,7 @@ function GraphView(props) {
   const [positions, setPositions] = React.useState({});
   /* 正在拖动中的块：{ id, x, y }，只在本地生效，松手才落盘 */
   const [draggingBlock, setDraggingBlock] = React.useState(null);
-  /* 骨架档下用户显式展开的会话（NFR-1：其余按需展开） */
-  const [expandedSessions, setExpandedSessions] = React.useState([]);
+  /* 骨架档下用户显式展开的会话（NFR-1：其余按需展开） */  const [expandedSessions, setExpandedSessions] = React.useState([]);
   const isExpanded = React.useCallback(
     (sid) => expandedSessions.indexOf(sid) >= 0,
     [expandedSessions]
@@ -311,6 +319,8 @@ function GraphView(props) {
   }, []);
   /* 上一次布局耗时，供慢布局提示用 */
   const lastLayoutMsRef = React.useRef(0);
+  /* 跨会话定位的待办：切完会话后还要切视图（FR-14） */
+  const pendingLocateRef = React.useRef(null);
   const [selectedEdge, setSelectedEdge] = React.useState(null);
   /* 正在改名的块：{ id, value } */
   const [renaming, setRenaming] = React.useState(null);
@@ -899,10 +909,55 @@ function GraphView(props) {
   }, [ctx, graph, say]);
 
   const openSession = React.useCallback((sid) => {
-    if (typeof ctx.sessions.retain === 'function') { try { ctx.sessions.retain(sid); } catch { /* 已保留 */ } }
-    if (typeof props.onOpenSession === 'function') props.onOpenSession(sid);
-    else say('请在左侧会话列表中选择该会话');
-  }, [ctx, props, say]);
+    if (!sid || sid === sessionId) return;
+    /* FR-14：目标不可用时不跳转，并说明原因 */
+    if (archivedIds.has(sid)) { say('该会话已归档，无法切换'); return; }
+    /* 优先用宿主的标准导航：侧栏、标题栏、面包屑都会跟着变 */
+    const nav = ctx && ctx.uiWorkspace;
+    if (nav && typeof nav.openSession === 'function') {
+      try {
+        nav.openSession(sid);
+      } catch (e) {
+        say('切换会话失败：' + ((e && e.message) || e));
+      }
+      return;
+    }
+    if (typeof props.onOpenSession === 'function') { props.onOpenSession(sid); return; }
+    say('当前宿主没有暴露切换会话的能力');
+  }, [ctx, props, say, sessionId, archivedIds]);
+
+  /**
+   * 在对话视图中定位该轮（FR-14）。
+   *
+   * 能做到：切到目标会话、切到对话视图。
+   * **做不到：滚动到指定的那一轮。** 宿主没有公开的"滚动到某轮"入口 ——
+   * 视图切换请求里的 `focus` 只有轨迹视图会读，对话视图不认。
+   * 所以这里不传 focus（传了也是被静默忽略，等于造一个假入口），
+   * 改为明确告诉用户该去找第几轮。
+   */
+  const locateInConversation = React.useCallback((b) => {
+    if (!b) return;
+    const note = '已切到对话视图；本版本无法自动滚动，请找第 ' + b.turn + ' 轮';
+    if (b.sessionId !== sessionId) {
+      /* 换会话要重新挂载视图，切视图得等挂载后再做 */
+      pendingLocateRef.current = { sessionId: b.sessionId, note };
+      openSession(b.sessionId);
+      return;
+    }
+    if (typeof props.openView !== 'function') { say('当前宿主没有暴露切换视图的能力'); return; }
+    props.openView('transcript-view');
+    say(note);
+  }, [props, sessionId, openSession, say]);
+
+  /* 跨会话定位的第二步：目标会话的视图挂出来之后再切视图 */
+  React.useEffect(() => {
+    const p = pendingLocateRef.current;
+    if (!p || p.sessionId !== sessionId) return;
+    pendingLocateRef.current = null;
+    if (typeof props.openView !== 'function') return;
+    props.openView('transcript-view');
+    say(p.note);
+  }, [sessionId, props, say]);
 
   /* 导出：生成内容 → 不挂到 body 的 anchor 触发下载 */
   const exportText = React.useCallback((fmt, includeHidden) => {
@@ -980,12 +1035,15 @@ function GraphView(props) {
   });
   const cell = nodes.map((n) => {
     if (n.kind === 'header') {
+      const gone = archivedIds.has(n.sessionId);
       return h('div', {
         key: n.id,
-        className: 'sg-label' + (n.sessionId === sessionId ? ' sg-current' : ''),
+        className: 'sg-label' + (n.sessionId === sessionId ? ' sg-current' : '')
+          + (gone ? ' sg-unavailable' : ''),
         style: { left: n.x, top: n.y, minWidth: n.w, height: n.h },
-        title: '点击切换到这个会话',
-        onClick: () => openSession(n.sessionId)
+        title: gone ? '该会话已归档，无法切换' : '点击切换到这个会话',
+        'aria-disabled': gone ? 'true' : undefined,
+        onClick: gone ? undefined : () => openSession(n.sessionId)
       },
       h('span', { className: 'sg-sdot' }),
       h('span', { className: 'sg-st' }, n.title),
@@ -1256,6 +1314,10 @@ function GraphView(props) {
           className: 'sg-act',
           onClick: () => setLinking({ from: b.id, mode: 'click' })
         }, '→ 连接到…'),
+        h('button', {
+          className: 'sg-act',
+          onClick: () => locateInConversation(b)
+        }, '⌖ 在对话视图中定位该轮'),
         h('button', {
           className: 'sg-act',
           onClick: () => { void createRefSession(b); }

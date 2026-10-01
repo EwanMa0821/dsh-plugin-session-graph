@@ -901,6 +901,33 @@ test('timedLayout 不吞异常：布局炸了要让上层知道', () => {
   assert.throws(() => timedLayout(() => { throw new Error('boom'); }, () => 0), /boom/);
 });
 
+/* --------------------------------------- 家族范围稳定性（FR-14） */
+
+test('家族范围不随当前会话变化', () => {
+  const sessions = normalizeSessions(RAW_SESSIONS);
+  const a = familyOf(sessions, 'root');
+  const b = familyOf(sessions, 'ancor');
+  const c = familyOf(sessions, 'invest');
+
+  assert.equal(a.rootId, b.rootId, '血缘根一致');
+  assert.equal(a.rootId, c.rootId);
+  assert.deepEqual([...b.order].sort(), [...a.order].sort(), '成员集合一致');
+  assert.deepEqual([...c.order].sort(), [...a.order].sort());
+});
+
+test('切换当前会话后装配出的图规模一致，只有 current 变', () => {
+  const sessions = normalizeSessions(RAW_SESSIONS);
+  const mk = (currentId) => buildGraph({ sessions, turnsBySession: TURNS, currentId });
+  const g1 = mk('root');
+  const g2 = mk('ancor');
+
+  assert.equal(g1.stats.sessions, g2.stats.sessions, '会话数不变');
+  assert.equal(g1.stats.blocks, g2.stats.blocks, '块数不变');
+  assert.deepEqual(g1.order.slice().sort(), g2.order.slice().sort(), '顺序集合不变');
+  assert.equal(g1.currentId, 'root');
+  assert.equal(g2.currentId, 'ancor', '变的只有高亮');
+});
+
 /* --------------------------------------------------------- 布局常量契约 */
 
 test('默认布局常量与原型一致', () => {
