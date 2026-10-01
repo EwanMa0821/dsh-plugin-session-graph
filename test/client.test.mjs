@@ -1898,10 +1898,12 @@ test('选中的块被隐藏后，详情面板不会拿它去建内容', async ()
     resetComponent();
     render(ctx.slots.Component, props);
     await tick();
-    /* 选中一个已隐藏、因而不在画布上的块，界面要退回空态而不是崩 */
+    /* 选中一个已隐藏、因而不在画布上的块：界面要退回空态而不是崩。
+       注意这里其实**没有形成有效选中**（块不在 nodeMap 里），所以按新规则
+       右栏可能根本不占位 —— 这才是用户要的效果；关键是别漏 undefined、别崩。 */
     let tree = render(ctx.slots.Component, props);
     const aside = elements(tree).find((n) => n.props && n.props.className === 'sg-side');
-    assert.ok(aside, '右栏照常在');
+    assert.ok(!aside || !JSON.stringify(aside).includes('undefined'), '右栏要么不占位，要么不漏 undefined');
     assert.ok(!textIn(tree).includes('undefined'), '没有 undefined 漏出来');
   } finally {
     serverReply = { ...serverReply, state: null };

@@ -3715,15 +3715,22 @@ function GraphView(props) {
      统一退回空态说明，右侧永远有内容。 */
   const selectedNode = selected ? nodeMap.get(selected) : null;
   const selectedIsBlock = !!(selectedNode && selectedNode.kind === 'block');
+  /* **什么都没选中时不占右侧那一列**：用户的原话是"右侧这一块没什么存在的意义了"。
+     但"选中了东西却建不出面板"（块被隐藏、或整体装配失败）仍给一句解释性空态 ——
+     否则右栏无声消失，用户不知道发生了什么。 */
   const detail = selectedEdge
     ? buildEdgeDetail()
-    : (selectedIsBlock ? buildDetail() : h('div', { className: 'sg-emptybox' },
-      t('side.empty', {
-        sessions: fmtNum(graph.error ? 0 : graph.stats.sessions),
-        blocks: fmtNum(graph.error ? 0 : graph.stats.blocks)
-      }),
-      h('br'), h('br'),
-      t('side.emptyHint')));
+    : (selectedIsBlock
+      ? buildDetail()
+      : (selected
+        ? h('div', { className: 'sg-emptybox' },
+          t('side.empty', {
+            sessions: fmtNum(graph.error ? 0 : graph.stats.sessions),
+            blocks: fmtNum(graph.error ? 0 : graph.stats.blocks)
+          }),
+          h('br'), h('br'),
+          t('side.emptyHint'))
+        : null));
 
   function buildEdgeDetail() {
     const e = edgeList.find((x) => x.id === selectedEdge);
@@ -3958,7 +3965,7 @@ function GraphView(props) {
       cornerNote,
       labelInput,
       body),
-    sideOpen ? h('aside', { className: 'sg-side' }, detail) : null,
+    (sideOpen && detail) ? h('aside', { className: 'sg-side' }, detail) : null,
     /* 模态与浮层挂在**视图根节点**上，而不是画布容器里 ——
        否则遮罩只盖住画布，右侧详情面板还露在外面，看着像没做完。 */
     exportOpen ? exportDialog() : null,
