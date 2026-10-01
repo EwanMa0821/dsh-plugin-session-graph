@@ -125,8 +125,8 @@ const CSS = `
   background-image:radial-gradient(var(--dsw-alias-border-l2) 1px,transparent 1px);background-size:22px 22px}
 .sg-canvas-wrap.sg-panning{cursor:grabbing}
 .sg-canvas-wrap.sg-linking{cursor:crosshair}
-/* 归档会话：看得到、点不动，悬停说明原因（FR-14） */
-.sg-label.sg-unavailable{opacity:.45;cursor:not-allowed}
+/* 归档会话**不进图**（FR-14）：连"看得到、点不动"的灰卡片也不再画，
+   所以这里没有禁用态样式 —— 少一种状态，就少一处需要解释的东西。 */
 /* 数据读不出来的块：降级显示，但仍可选中/连线/分叉（FR-13） */
 .sg-node.sg-node-thin{border-style:dashed}
 /* 取数还没落定：虚线示意"还在来"，文案是"载入中" —— 绝不画成"读不出来"那种假坏 */
@@ -687,13 +687,14 @@ function GraphView(props) {
   const familyKey = React.useMemo(() => {
     if (!sessionId) return '';
     try {
-      const order = familyOf(sessionsNorm, sessionId).order;
+      /* 已归档的家族成员**不点名**：它们不进图，取它们的轮次纯属白读 */
+      const order = familyOf(sessionsNorm, sessionId).order.filter((id) => !archivedIds.has(id));
       return order.length ? order.join(',') : sessionKey;
     } catch (error) {
       degrade('家族计算失败', error);
       return sessionKey;                     /* 家族算不出来时退回全量，宁可慢不要漏 */
     }
-  }, [sessionsNorm, sessionId, sessionKey]);
+  }, [sessionsNorm, sessionId, sessionKey, archivedIds]);
   const localTurns = React.useMemo(() => attempt(
     '本地时间线读取失败',
     () => turnsFromTimeline(graphSnapshot && graphSnapshot.timeline),
@@ -929,12 +930,14 @@ function GraphView(props) {
         turnsBySession,
         currentId: sessionId,
         hidden, alias, links,
-        includeHidden: showHidden
+        includeHidden: showHidden,
+        /* 已归档的会话不进图：不建卡片、不建立关联（FR-14 的"归档"语义） */
+        archived: archivedIds
       });
     } catch (e) {
       return { error: e };
     }
-  }, [norm, sessionsNorm, turnsBySession, sessionId, hidden, alias, links, showHidden]);
+  }, [norm, sessionsNorm, turnsBySession, sessionId, hidden, alias, links, showHidden, archivedIds]);
 
   const laid = React.useMemo(() => {
     if (!graph || graph.error) {
@@ -1265,8 +1268,8 @@ function GraphView(props) {
       return;
     }
 
-    /* 在**按下**时选中，而不是等抬起：双击过程中手抖一两个像素很常见，
-       若靠"没移动过"来决定选中，双击就会既不选中、又照样分叉 */
+    /* 在**按下**时选中，而不是等抬起：手抖一两个像素很常见，
+       若靠"没移动过"来决定选中，想要"点一下看看"就会经常落空 */
     if (hit) setSelected(hit);
     /* 骨架块点一下就点名载入（FR-4）；选中照样发生，两个动作不冲突 */
     const hitNode = hit ? nodeMap.get(hit) : null;
@@ -1480,11 +1483,13 @@ function GraphView(props) {
   const exportText = React.useCallback((fmt, includeHidden) => {
     const g = buildGraph({
       sessions: sessionsNorm, turnsBySession, currentId: sessionId,
-      hidden, alias, links, includeHidden
+      hidden, alias, links, includeHidden,
+      /* 归档会话不进图：导出与画布必须同一口径，否则文件里会多出一张画布上没有的卡片 */
+      archived: archivedIds
     });
     const out = render(g, fmt, { links, stamp: stamp(new Date()) });
     return { ...out, hiddenSkipped: g.stats.hiddenSkipped };
-  }, [sessionsNorm, turnsBySession, sessionId, hidden, alias, links]);
+  }, [sessionsNorm, turnsBySession, sessionId, hidden, alias, links, archivedIds]);
 
   /* 导出（FR-15）：优先走 Host 路由——先 HEAD 预检，通过后交给浏览器下载管理器；
      路由不可用时回落到本地生成 + Blob，保证功能不因为接线问题而消失。
@@ -1498,8 +1503,10 @@ function GraphView(props) {
       + (includeHidden ? '&includeHidden=true' : '')
       + (Object.keys(hidden).length ? '&hidden=' + encodeURIComponent(JSON.stringify(hidden)) : '')
       + (Object.keys(alias).length ? '&alias=' + encodeURIComponent(JSON.stringify(alias)) : '')
-      + (links.length ? '&links=' + encodeURIComponent(JSON.stringify(links)) : '');
-  }, [familyKey, sessionId, hidden, alias, links]);
+      + (links.length ? '&links=' + encodeURIComponent(JSON.stringify(links)) : '')
+      /* 归档名单也要发：Host 侧渲染的导出文件必须与画布同一口径，否则会多出归档会话的卡片 */
+      + (archivedIds.size ? '&archived=' + encodeURIComponent(JSON.stringify([...archivedIds])) : '');
+  }, [familyKey, sessionId, hidden, alias, links, archivedIds]);
 
   const saveUrl = React.useCallback((url, filename) => {
     /* 与产品既有会话日志导出同一手法：anchor 不挂到 document.body，直接 click() */
@@ -1555,19 +1562,17 @@ function GraphView(props) {
   });
   const cell = nodes.map((n) => {
     if (n.kind === 'header') {
-      const gone = archivedIds.has(n.sessionId);
+      /* 已归档的会话不进图（见 buildGraph），所以这里不会出现"点不动的归档卡片" */
       const collapsible = (feats.skeletonOnly || collapseOthers || collapsedSessions.length > 0)
         && n.sessionId !== sessionId && !!n.turnCount;
       return h('div', {
         key: n.id,
-        className: 'sg-label' + (n.sessionId === sessionId ? ' sg-current' : '')
-          + (gone ? ' sg-unavailable' : ''),
+        className: 'sg-label' + (n.sessionId === sessionId ? ' sg-current' : ''),
         style: { left: n.x, top: n.y, minWidth: n.w, height: n.h },
-        title: gone ? t('head.archived') : t('head.switchTip'),
-        'aria-disabled': gone ? 'true' : undefined,
+        title: t('head.switchTip'),
         /* 拖会话头是平移画布（所有非块节点都走平移），松手时浏览器还会补一个 click。
            不平移过的才当"切换会话"，否则一拖就跳走 —— 块上早就这么防了，会话头漏了。 */
-        onClick: gone ? undefined : () => {
+        onClick: () => {
           if (suppressClickRef.current) { suppressClickRef.current = false; return; }
           openSession(n.sessionId);
         }
@@ -1637,7 +1642,8 @@ function GraphView(props) {
          只用于块 id、分叉切点与"去对话视图找第 N 轮"的指路。 */
       'aria-label': t('block.ariaLabel', { turn: b.index, prompt: clip(digest(b.prompt), 120) }),
       style: { left: n.x, top: n.y, width: n.w, minHeight: n.h },
-      onDoubleClick: (e) => { e.stopPropagation(); doFork(b.sessionId, b.turn); },
+      /* 双击**不再**分叉：它太容易误触（想选中/想看清文字都会双击），
+         分叉只走右栏「⑂ 从这里分叉」这一个明确的入口。 */
       onKeyDown: (e) => { if (e.key === 'Enter') { e.stopPropagation(); setSelected(n.id); } }
     },
     h('div', { className: 'sg-hd' },
@@ -1755,6 +1761,10 @@ function GraphView(props) {
       }).join('\n'),
       onClick: retry
     }, t('corner.unread', { n: fmtNum(unreadInfo.length) })));
+  }
+  /* 已归档的家族成员没进图：说一句，免得看起来像"我的会话不见了"（归档是用户自己的动作） */
+  if (!graph.error && graph.stats.archivedSkipped > 0) {
+    cornerNotes.push(t('corner.archived', { n: fmtNum(graph.stats.archivedSkipped) }));
   }
 
   /* 降级留痕（见 degrade）：角标给数字与最近一条原因，悬停看全部。

@@ -71,9 +71,31 @@ export function layout(graph, opts) {
     const top = cursor.get(col) || 0;
     const firstBlockY = top + o.headerHeight + o.headerGap;
 
+    /* 每块的落点：拖过的坐标即权威（FR-5），其余按本会话的顺序排 */
+    const placed = list.map((b, i) => {
+      const p = saved[b.id];
+      const pinned = p && Number.isFinite(p.x) && Number.isFinite(p.y);
+      return {
+        b,
+        x: pinned ? p.x : x,
+        y: pinned ? p.y : firstBlockY + i * o.pitch,
+        moved: !!pinned
+      };
+    });
+
+    /* 会话头**跟着自己最上面那块走**。
+       块被拖走之后，头若留在原来的槽位，"这块属于哪个会话"就只能靠猜 ——
+       实测最糟的形态是：一个会话的块正压在另一个会话的头上面（同列的两个会话
+       深度相同、共用 x，纵向先后一乱，看着就像下面那个会话的块）。
+       纯自动布局时最上面那块就在 `firstBlockY`，算出来与原来的槽位**完全一致**，
+       所以这条规则只在"用户摆过"时才改变结果。
+       没有块的会话（空子会话）仍留在槽位，否则那块空框会没有头。 */
+    const topBlockY = placed.length ? Math.min(...placed.map((p) => p.y)) : null;
+    const headerY = topBlockY === null ? top : topBlockY - o.headerGap - o.headerHeight;
+
     const header = {
       id: `header:${sid}`, kind: 'header', sessionId: sid,
-      x, y: top, w: o.blockWidth, h: o.headerHeight,
+      x, y: headerY, w: o.blockWidth, h: o.headerHeight,
       title: s.title, current: sid === graph.currentId, turnCount: list.length
     };
     nodes.push(header);
@@ -85,17 +107,13 @@ export function layout(graph, opts) {
         x, y: firstBlockY, w: o.blockWidth, h: o.blockHeight
       });
     }
-    list.forEach((b, i) => {
-      const p = saved[b.id];
-      const pinned = p && Number.isFinite(p.x) && Number.isFinite(p.y);
+    placed.forEach((p) => {
       nodes.push({
-        id: b.id, kind: 'block', sessionId: sid,
-        x: pinned ? p.x : x,
-        y: pinned ? p.y : firstBlockY + i * o.pitch,
-        w: o.blockWidth, h: o.blockHeight,
+        id: p.b.id, kind: 'block', sessionId: sid,
+        x: p.x, y: p.y, w: o.blockWidth, h: o.blockHeight,
         /* moved 让界面能区分"用户摆过"与"自动落的位" */
-        moved: !!pinned,
-        block: b
+        moved: p.moved,
+        block: p.b
       });
     });
 

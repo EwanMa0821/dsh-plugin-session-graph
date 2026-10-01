@@ -27,8 +27,8 @@ export const UI = {
 
   /* ---- 提示条 ---- */
   'hint.idle': {
-    zh: '滚轮缩放 · 拖空白平移 · 单击块看详情 · 双击块分叉 · 拖块右下圆点连线 · F 适应视图',
-    en: 'Scroll to zoom · drag empty space to pan · click a block for details · double-click to fork · drag the corner dot to link · F to fit'
+    zh: '滚轮缩放 · 拖空白平移 · 单击块看详情 · 拖块右下圆点连线 · F 适应视图',
+    en: 'Scroll to zoom · drag empty space to pan · click a block for details · drag the corner dot to link · F to fit'
   },
   'hint.linkingDrag': {
     zh: '拖到另一个块并松手建立连线 · 松在空白处取消 · Esc 取消',
@@ -91,7 +91,7 @@ export const UI = {
   'fork.failed': { zh: '分叉失败：{msg}', en: 'Fork failed: {msg}' },
   'fork.done': { zh: '已从第 {turn} 轮分叉', en: 'Forked from turn {turn}' },
   'fork.action': { zh: '⑂ 从这里分叉', en: '⑂ Fork from here' },
-  'fork.hint': { zh: '也可以直接双击块', en: 'You can also double-click the block' },
+  'fork.hint': { zh: '从这一轮的结束边界切出新会话（继承到这一轮为止的历史）', en: 'Cut a new session from this turn’s end boundary (inherits history up to here)' },
   'fork.turnOpen': { zh: '该轮尚未结束', en: 'This turn is still running' },
 
   /* ---- 块与详情 ---- */
@@ -136,8 +136,8 @@ export const UI = {
     en: '{sessions} sessions · {blocks} blocks in this family'
   },
   'side.emptyHint': {
-    zh: '点一个块看它的提问与回答；双击块从那里分叉。',
-    en: 'Click a block to see its prompt and response; double-click to fork from it.'
+    zh: '点一个块看它的提问与回答；要分叉就在右栏点「⑂ 从这里分叉」。',
+    en: 'Click a block to see its prompt and response; to fork, use “⑂ Fork from here” on the right.'
   },
 
   /* ---- 操作 ---- */
@@ -173,6 +173,11 @@ export const UI = {
   'corner.unread': {
     zh: '{n} 个会话的轮次没读到 · 点此重试',
     en: '{n} sessions could not be read · click to retry'
+  },
+  /* 已归档的会话不进图（FR-14）：说一句，免得看起来像"我的会话不见了" */
+  'corner.archived': {
+    zh: '{n} 个已归档的会话未画入图谱',
+    en: '{n} archived sessions are not drawn'
   },
   /* 降级留痕：宿主形状对不上时插件会退一步继续，这里把"退过"说出来 */
   'corner.degraded': {

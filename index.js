@@ -395,6 +395,8 @@ export async function buildPayload(ctx, params, limits, store) {
      永远不落盘 —— 只认存档的话，导出文件里一条手动连线都没有，而导出对话框的预览
      （客户端本地 render）里明明有。参数按 id 覆盖存档，导出的 .mm/.md 用合并结果。 */
   const links = mergeLinks(saved && saved.links, parseLinks(params.get('links')));
+  /* 归档会话由客户端告知（只有它的 workspace 快照里有这份名单）：导出的文件要与画布同口径 */
+  const archived = parseArchived(params.get('archived'));
 
   const query = service(ctx, 'sessionQuery');
   const scope = turnScopeOf(raw, { currentId, named: ids, links });
@@ -405,7 +407,7 @@ export async function buildPayload(ctx, params, limits, store) {
   const sessions = assembleSessions(raw, turnsBySession);
 
   const graph = buildGraph({
-    sessions, turnsBySession, currentId, includeHidden, hidden, alias, links
+    sessions, turnsBySession, currentId, includeHidden, hidden, alias, links, archived
   });
 
   /* 超预算不再抛错，而是降级成骨架块（FR-4） */
@@ -504,6 +506,28 @@ function parseLinks(value) {
   }
   /* 与存档同一条 NFR-1 上限：不让一个癫狂的查询串把图撑爆 */
   return parsed.slice(0, LIMITS.links);
+}
+
+/**
+ * `archived=` 查询参数：已归档的会话 id 列表（JSON 数组）。
+ *
+ * 导出的 Host 侧渲染必须与画布**同一口径**：画布不画归档会话，文件里也不该多出卡片。
+ * 归档信息只有客户端知道（它来自 workspace 快照），所以由它随请求带上。
+ * 与 `links=` 同样口径：只有"不是 JSON 数组"才判参数非法。
+ */
+function parseArchived(value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw Object.assign(new Error('archived 必须是 JSON 数组'), { status: 400 });
+  }
+  if (!Array.isArray(parsed)) {
+    throw Object.assign(new Error('archived 必须是 JSON 数组'), { status: 400 });
+  }
+  return parsed.map((x) => String(x)).filter(Boolean).slice(0, LIMITS.links);
 }
 
 /**

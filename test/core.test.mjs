@@ -934,6 +934,42 @@ test('bounds 把被拖远的块也算进去，适应视图才不会漏掉它', (
   assert.ok(bounds(saved.nodes).maxX > bounds(auto.nodes).maxX + 1000);
 });
 
+test('会话头跟着自己最上面那块走：块被拖到哪，头就跟到哪', () => {
+  const g = graphOf();
+  const { headerGap, headerHeight } = DEFAULT_LAYOUT;
+  const auto = layout(g);
+  const autoHeader = auto.nodes.find((n) => n.id === 'header:root');
+  const autoBlock = auto.nodes.find((n) => n.id === 'root:1');
+  assert.equal(autoHeader.y, autoBlock.y - headerGap - headerHeight,
+    '纯自动布局时，头就在自己第一块的正上方（与旧行为一致）');
+
+  /* 把第一块拖到会话头上方（实测踩到过：那块会压在**别的**会话的头上面） */
+  const saved = layout(g, { positions: { 'root:1': { x: 0, y: -106 } } });
+  const head = saved.nodes.find((n) => n.id === 'header:root');
+  assert.equal(head.y, -106 - headerGap - headerHeight, '头跟着块一起上去了');
+  assert.equal(head.y < -106, true, '头在块的上方，不会压住块');
+  /* 别的会话的头不受影响 */
+  assert.equal(saved.nodes.find((n) => n.id === 'header:ancor').y,
+    auto.nodes.find((n) => n.id === 'header:ancor').y);
+});
+
+test('空子会话没有块可跟，头仍留在槽位（否则空框会没有头）', () => {
+  const g = buildGraph({
+    sessions: normalizeSessions([
+      { id: 'root', title: '根会话' },
+      { id: 'kid', title: '空子会话', parentId: 'root' }
+    ]),
+    turnsBySession: { root: [turn(1, 'Q', 'A')] },      /* kid 一轮都没有 */
+    currentId: 'root'
+  });
+  const laid = layout(g);
+  const empty = laid.nodes.find((n) => n.kind === 'empty');
+  const head = laid.nodes.find((n) => n.id === `header:${empty.sessionId}`);
+  assert.ok(empty && head, '空子会话的头与空框都在');
+  assert.equal(head.y, empty.y - DEFAULT_LAYOUT.headerGap - DEFAULT_LAYOUT.headerHeight,
+    '头在自己的槽位上，空框在它正下方');
+});
+
 /* ------------------------------------------- 数据不完整（FR-13） */
 
 test('提问与回答都读不出来且已结束 → 计入 incomplete', () => {
@@ -1411,6 +1447,47 @@ test('导出与画布同口径：继承轮次不出现，轮次号按会话内�
   assert.ok(mm.includes('第 1 轮 · 新问'), '子会话那块按会话内序号命名');
 });
 
+test('客户端拿不到 forkAtTurn 时，用继承前缀的最后一轮反推分叉源（FR-8 的起点）', () => {
+  /* 客户端会话项里**没有** inheritedEventCount，所以子会话的 forkAtTurn 恒为空；
+     不兜底的话，一个会话分出的多条分支会全部从**会话头**拉线 —— 看着像"只连了一条"。 */
+  const inherited = (t) => ({ ...t, inherited: true });
+  const g = buildGraph({
+    sessions: normalizeSessions([
+      { id: 'root', title: '根会话' },
+      { id: 'a', title: '分支 A', parentId: 'root' },
+      { id: 'b', title: '分支 B', parentId: 'root' }
+    ]),
+    turnsBySession: {
+      root: [turn(1, '根问一', '根答一'), turn(2, '根问二', '根答二')],
+      a: [inherited(turn(1, '根问一', '根答一')), turn(2, 'A 的新问题', 'A 的回答')],
+      b: [inherited(turn(1, '根问一', '根答一')), turn(2, 'B 的新问题', 'B 的回答')]
+    },
+    currentId: 'root'
+  });
+  const branches = g.edges.filter((e) => e.kind === 'branch');
+  assert.equal(branches.length, 2, '一个会话分两个分支，就有两条派生边');
+  assert.deepEqual(branches.map((e) => e.from), ['root:1', 'root:1'],
+    '两条都从**分叉的那一轮**出发，而不是从会话头');
+  assert.deepEqual(branches.map((e) => e.to).sort(), ['a:2', 'b:2'], '各自指向自己的首个自有轮次');
+  /* 会话对象上也补一份：派生边与导出共用同一个源 */
+  assert.equal(g.sessions.find((s) => s.id === 'a').forkAtTurn, 1);
+  assert.match(toMarkdown(g).content, /第 1 轮[\s\S]*⑂ 分叉 → 分支 A/, '导出里也挂在那一轮之下');
+});
+
+test('没有任何继承标记时仍然退回会话头：判不出来不猜', () => {
+  const g = buildGraph({
+    sessions: normalizeSessions([
+      { id: 'root', title: '根会话' },
+      { id: 'kid', title: '子会话', parentId: 'root' }
+    ]),
+    turnsBySession: { root: [turn(1, '根问', '根答')], kid: [turn(1, '子问', '子答')] },
+    currentId: 'root'
+  });
+  const branch = g.edges.find((e) => e.kind === 'branch');
+  assert.equal(branch.from, 'header:root');
+  assert.equal(g.sessions.find((s) => s.id === 'kid').forkAtTurn, null, '判不出来就保持"没有源轮次"');
+});
+
 test('本地时间线若已判过 inherited 就原样传下去（两端都传），没判过就不写字段', () => {
   const withFlag = turnsFromTimeline({
     turnOrder: ['a'], turns: { a: { turn: 2, inherited: true, end: { seq: 9 } } }
@@ -1426,4 +1503,91 @@ test('本地时间线若已判过 inherited 就原样传下去（两端都传）
     turnOrder: ['a'], turns: { a: { turn: 1, end: { seq: 9 } } }
   });
   assert.equal('inherited' in plainTurn[0], false, '没判过就不写字段');
+});
+
+/* ------------------------------------------------ 已归档的会话不进图（FR-14）
+ *
+ * 归档的意思是"别再让它参与"：所以它不建会话头、不建块，也不建立任何关联 ——
+ * 血缘断在它这里，手动/引用连线也不画。缺口由 familyOf 的说明与图角计数交代。
+ */
+
+test('已归档的会话不进图：不建卡片、不建块、不建立关联', () => {
+  const sessions = normalizeSessions([
+    { id: 'root', title: '根会话' },
+    { id: 'sub', title: '活跃分支', parentId: 'root' },
+    { id: 'gone', title: '已归档的分支', parentId: 'root' }
+  ]);
+  const g = buildGraph({
+    sessions,
+    turnsBySession: {
+      root: [turn(1, '根问', '根答')],
+      sub: [turn(1, '活跃问', '活跃答')],
+      gone: [turn(1, '归档问', '归档答')]
+    },
+    currentId: 'sub',
+    links: [{ id: 'L1', kind: 'link', from: 'root:1', to: 'gone:1', label: '手工连线' }],
+    archived: ['gone']
+  });
+  assert.deepEqual(g.blocks.map((b) => b.id), ['root:1', 'sub:1'], '归档会话的块不画');
+  assert.equal(g.sessions.some((s) => s.id === 'gone'), false, '它整个不在图里');
+  assert.equal(g.order.indexOf('gone') < 0, true);
+  assert.equal(g.edges.some((e) => e.id === 'L1'), false, '指向归档块的连线不画');
+  assert.equal(g.stats.archivedSkipped, 1, '图角要说得清少了什么');
+  assert.equal(g.stats.archivedEdges, 1);
+  /* 不标 broken：块还在、只是归档了，"指向已不存在的块"是错的指控 */
+  assert.equal(g.edges.some((e) => e.broken), false);
+});
+
+test('归档掉中间会话：它下面的分支降级为根，并说明原因', () => {
+  const sessions = normalizeSessions([
+    { id: 'root', title: '根会话' },
+    { id: 'mid', title: '被归档的中间层', parentId: 'root' },
+    { id: 'leaf', title: '下层分支', parentId: 'mid' }
+  ]);
+  const g = buildGraph({
+    sessions,
+    turnsBySession: {
+      root: [turn(1, '根问', '根答')],
+      mid: [turn(1, '中间问', '中间答')],
+      leaf: [turn(1, '下层问', '下层答')]
+    },
+    currentId: 'leaf',
+    archived: ['mid']
+  });
+  assert.deepEqual(g.blocks.map((b) => b.id), ['leaf:1'], '只剩它自己这一族');
+  assert.ok(g.notes.some((n) => n.includes('已作为根显示')), '结构被改了就要说一声');
+  assert.equal(g.stats.archivedSkipped, 1);
+  /* 归档的既不建卡片，也不把别的会话连起来 */
+  assert.equal(g.sessions.some((s) => s.id === 'mid'), false);
+  assert.equal(g.edges.length, 0);
+});
+
+test('没传 archived 时行为与以前完全一致', () => {
+  const sessions = normalizeSessions([
+    { id: 'root', title: '根会话' },
+    { id: 'sub', title: '分支', parentId: 'root' }
+  ]);
+  const g = buildGraph({
+    sessions,
+    turnsBySession: { root: [turn(1, '根问', '根答')], sub: [turn(1, '子问', '子答')] },
+    currentId: 'root'
+  });
+  assert.deepEqual(g.blocks.map((b) => b.id), ['root:1', 'sub:1']);
+  assert.equal(g.stats.archivedSkipped, 0);
+  assert.equal(g.stats.archivedEdges, 0);
+});
+
+test('archived 传成 Set 也认', () => {
+  const sessions = normalizeSessions([
+    { id: 'root', title: '根会话' },
+    { id: 'gone', title: '归档', parentId: 'root' }
+  ]);
+  const g = buildGraph({
+    sessions,
+    turnsBySession: { root: [turn(1, '根问', '根答')], gone: [turn(1, '归档问', '归档答')] },
+    currentId: 'root',
+    archived: new Set(['gone'])
+  });
+  assert.deepEqual(g.blocks.map((b) => b.id), ['root:1']);
+  assert.equal(g.stats.archivedSkipped, 1);
 });

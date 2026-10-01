@@ -373,6 +373,16 @@ export function familyOf(sessions, currentId) {
 }
 
 /**
+ * 把 id 集合规整成 `Set<string>`：数组、Set 都认，其余当成空集（防御性读取）。
+ * 只用于**排除**类输入（已归档的会话），所以认不出来时宁可不排除。
+ */
+function idSetOf(value) {
+  if (value instanceof Set) return new Set([...value].map(str));
+  if (Array.isArray(value)) return new Set(value.map(str));
+  return new Set();
+}
+
+/**
  * 装配图模型：块 + 派生边 + 家族顺序。
  *
  * @param {object} input
@@ -382,10 +392,11 @@ export function familyOf(sessions, currentId) {
  * @param {Record<string, boolean>} [input.hidden] 隐藏的块
  * @param {Record<string, string>} [input.alias]   块别名
  * @param {boolean} [input.includeHidden]     是否把隐藏块也纳入（导出时用）
+ * @param {Iterable<string>} [input.archived] 已归档的会话 id：**不进图**（见下）
  * @returns {object} Graph
  */
 export function buildGraph(input) {
-  const sessions = input.sessions || [];
+  const allSessions = input.sessions || [];
   const turnsBySession = input.turnsBySession || {};
   const hidden = input.hidden || {};
   const alias = input.alias || {};
@@ -393,9 +404,24 @@ export function buildGraph(input) {
   const includeHidden = !!input.includeHidden;
   const currentId = input.currentId;
 
+  /* 已归档的会话**不进图**：归档的意思是"别再让它参与"，所以它不建会话头、不建块，
+     也不建立任何关联（血缘断在这里，手动/引用连线也不画）。挂在它下面的分支会因此
+     成为根，由 familyOf 给出"父会话已不可见，已作为根显示"的说明 —— 不静默改结构。 */
+  const archivedIds = idSetOf(input.archived);
+  const sessions = archivedIds.size
+    ? allSessions.filter((s) => !archivedIds.has(s.id))
+    : allSessions;
+
   const byId = new Map(sessions.map((s) => [s.id, s]));
   const fam = familyOf(sessions, currentId);
   const scopedIds = new Set(fam.order);
+
+  /* 排除掉的那些归档会话里，有多少本来是这一族的成员 —— 图角据此说清"少了什么"。
+     族范围按**含归档**的原始列表算，否则"归档的父会话"连计数都进不来。 */
+  const archivedSkipped = archivedIds.size
+    ? familyOf(allSessions, currentId).order.filter((id) => archivedIds.has(id)).length
+    : 0;
+  let archivedEdges = 0;
 
   /* 引用式会话不在血缘家族里，但被引用连线拉进范围（FR-7）。
      终点可能是某个块（`sid:turn`），也可能是整个会话（`header:sid`）——
@@ -428,6 +454,9 @@ export function buildGraph(input) {
      `turn` 仍是日志里的真实轮次号 —— 块 id、分叉切点、导出的树结构全靠它。 */
   const allBySession = new Map();
   const inheritedIds = new Set();
+  /* 每个会话"继承前缀的最后一轮"：客户端拿不到 `inheritedEventCount` 时，
+     靠它反推分叉源轮次（见下面的 forkAtTurn 兜底）。 */
+  const lastInheritedTurn = new Map();
   let inheritedSkipped = 0;
   let inheritedEdges = 0;
   scoped.forEach((s) => {
@@ -437,6 +466,7 @@ export function buildGraph(input) {
       if (isInheritedTurn(t, boundary)) {
         inheritedSkipped += 1;
         inheritedIds.add(blockId(s.id, t.turn));
+        lastInheritedTurn.set(s.id, Number(t.turn));
         return;
       }
       own.push({ ...t, index: own.length + 1, id: blockId(s.id, t.turn) });
@@ -444,11 +474,24 @@ export function buildGraph(input) {
     allBySession.set(s.id, own);
   });
 
+  /* 分叉源轮次（FR-8：派生边起点 = **源会话中该轮次的块**）。
+     上游给了 `forkAtTurn` 就用它；没给时用"子会话继承前缀的最后一轮"反推 ——
+     继承前缀本来就是父会话那几轮的副本、轮次号也接着排，所以两者等同。
+     这条兜底很要紧：客户端拿不到 `inheritedEventCount`，没有它就只剩"从会话头拉线"，
+     一个会话分出的多条分支会全部挤在会话头上，看着像"只连了一条"。
+
+     补进会话对象本身（而不是只在画边时用一下），派生边与导出的树才共用同一个源。 */
+  const linked = scoped.map((s) => {
+    if (s.forkAtTurn !== null && s.forkAtTurn !== undefined) return s;
+    const derived = lastInheritedTurn.get(s.id);
+    return derived === undefined ? s : { ...s, forkAtTurn: derived };
+  });
+
   /* 块 */
   const blocks = [];
   const blocksBySession = new Map();
   let hiddenSkipped = 0;
-  scoped.forEach((s) => {
+  linked.forEach((s) => {
     const list = [];
     allBySession.get(s.id).forEach((t) => {
       const isHidden = !!hidden[t.id];
@@ -484,7 +527,7 @@ export function buildGraph(input) {
               所以 `mineAll[0]` 就是它）；子会话无自有轮次时用空子会话节点
      任一端点被隐藏时整条边一并消失（FR-11），而不是改挂到会话头 */
   const edges = [];
-  scoped.forEach((s) => {
+  linked.forEach((s) => {
     if (!s.parentId || !byId.has(s.parentId) || !scopedIds.has(s.parentId)) return;
     const parentAll = allBySession.get(s.parentId) || [];
     const mineAll = allBySession.get(s.id) || [];
@@ -534,6 +577,12 @@ export function buildGraph(input) {
        与"端点被隐藏"同样处理，整条边不画，**但数据照样留在存档里**，不替用户删。
        这里**不受** `includeHidden` 影响：继承块是任何开关都调不出来的。 */
     if (inheritedIds.has(from) || inheritedIds.has(to)) { inheritedEdges += 1; return; }
+    /* 端点属于**已归档的会话**：那块不进图，关联也就不建立 —— 整条边不画、计数上报。
+       不标 broken：块还在、只是归档了，画一条"指向已不存在的块"的红线是错的指控。 */
+    if (archivedIds.has(sessionOfId(from)) || archivedIds.has(sessionOfId(to))) {
+      archivedEdges += 1;
+      return;
+    }
     if (!includeHidden && (hidden[from] || hidden[to])) return;
     edges.push({
       id: str(l.id) || `${l.kind}:${from}->${to}`,
@@ -562,7 +611,11 @@ export function buildGraph(input) {
        单独报出来是因为它**不能**混进 hiddenSkipped：那是一件用户能撤销的事，
        而继承块是任何开关都调不出来的；排查与将来的角标提示要靠这两个数。 */
     inheritedSkipped,
-    inheritedEdges
+    inheritedEdges,
+    /* 因为已归档而没进图的会话（个）与连线（条）—— 用户自己归档的，但"少了什么"
+       仍要说得清，否则界面上就是"我的会话不见了"。 */
+    archivedSkipped,
+    archivedEdges
   };
 
   return {
@@ -572,7 +625,8 @@ export function buildGraph(input) {
     order,
     referenced: referencedIds,
     notes: fam.notes,
-    sessions: scoped,
+    /* 用补过 `forkAtTurn` 的那一份：调用方（含导出）拿到的分叉源口径必须一致 */
+    sessions: linked,
     blocks,
     edges,
     stats

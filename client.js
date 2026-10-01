@@ -380,6 +380,16 @@ function familyOf(sessions, currentId) {
 }
 
 /**
+ * 把 id 集合规整成 `Set<string>`：数组、Set 都认，其余当成空集（防御性读取）。
+ * 只用于**排除**类输入（已归档的会话），所以认不出来时宁可不排除。
+ */
+function idSetOf(value) {
+  if (value instanceof Set) return new Set([...value].map(str));
+  if (Array.isArray(value)) return new Set(value.map(str));
+  return new Set();
+}
+
+/**
  * 装配图模型：块 + 派生边 + 家族顺序。
  *
  * @param {object} input
@@ -389,10 +399,11 @@ function familyOf(sessions, currentId) {
  * @param {Record<string, boolean>} [input.hidden] 隐藏的块
  * @param {Record<string, string>} [input.alias]   块别名
  * @param {boolean} [input.includeHidden]     是否把隐藏块也纳入（导出时用）
+ * @param {Iterable<string>} [input.archived] 已归档的会话 id：**不进图**（见下）
  * @returns {object} Graph
  */
 function buildGraph(input) {
-  const sessions = input.sessions || [];
+  const allSessions = input.sessions || [];
   const turnsBySession = input.turnsBySession || {};
   const hidden = input.hidden || {};
   const alias = input.alias || {};
@@ -400,9 +411,24 @@ function buildGraph(input) {
   const includeHidden = !!input.includeHidden;
   const currentId = input.currentId;
 
+  /* 已归档的会话**不进图**：归档的意思是"别再让它参与"，所以它不建会话头、不建块，
+     也不建立任何关联（血缘断在这里，手动/引用连线也不画）。挂在它下面的分支会因此
+     成为根，由 familyOf 给出"父会话已不可见，已作为根显示"的说明 —— 不静默改结构。 */
+  const archivedIds = idSetOf(input.archived);
+  const sessions = archivedIds.size
+    ? allSessions.filter((s) => !archivedIds.has(s.id))
+    : allSessions;
+
   const byId = new Map(sessions.map((s) => [s.id, s]));
   const fam = familyOf(sessions, currentId);
   const scopedIds = new Set(fam.order);
+
+  /* 排除掉的那些归档会话里，有多少本来是这一族的成员 —— 图角据此说清"少了什么"。
+     族范围按**含归档**的原始列表算，否则"归档的父会话"连计数都进不来。 */
+  const archivedSkipped = archivedIds.size
+    ? familyOf(allSessions, currentId).order.filter((id) => archivedIds.has(id)).length
+    : 0;
+  let archivedEdges = 0;
 
   /* 引用式会话不在血缘家族里，但被引用连线拉进范围（FR-7）。
      终点可能是某个块（`sid:turn`），也可能是整个会话（`header:sid`）——
@@ -435,6 +461,9 @@ function buildGraph(input) {
      `turn` 仍是日志里的真实轮次号 —— 块 id、分叉切点、导出的树结构全靠它。 */
   const allBySession = new Map();
   const inheritedIds = new Set();
+  /* 每个会话"继承前缀的最后一轮"：客户端拿不到 `inheritedEventCount` 时，
+     靠它反推分叉源轮次（见下面的 forkAtTurn 兜底）。 */
+  const lastInheritedTurn = new Map();
   let inheritedSkipped = 0;
   let inheritedEdges = 0;
   scoped.forEach((s) => {
@@ -444,6 +473,7 @@ function buildGraph(input) {
       if (isInheritedTurn(t, boundary)) {
         inheritedSkipped += 1;
         inheritedIds.add(blockId(s.id, t.turn));
+        lastInheritedTurn.set(s.id, Number(t.turn));
         return;
       }
       own.push({ ...t, index: own.length + 1, id: blockId(s.id, t.turn) });
@@ -451,11 +481,24 @@ function buildGraph(input) {
     allBySession.set(s.id, own);
   });
 
+  /* 分叉源轮次（FR-8：派生边起点 = **源会话中该轮次的块**）。
+     上游给了 `forkAtTurn` 就用它；没给时用"子会话继承前缀的最后一轮"反推 ——
+     继承前缀本来就是父会话那几轮的副本、轮次号也接着排，所以两者等同。
+     这条兜底很要紧：客户端拿不到 `inheritedEventCount`，没有它就只剩"从会话头拉线"，
+     一个会话分出的多条分支会全部挤在会话头上，看着像"只连了一条"。
+
+     补进会话对象本身（而不是只在画边时用一下），派生边与导出的树才共用同一个源。 */
+  const linked = scoped.map((s) => {
+    if (s.forkAtTurn !== null && s.forkAtTurn !== undefined) return s;
+    const derived = lastInheritedTurn.get(s.id);
+    return derived === undefined ? s : { ...s, forkAtTurn: derived };
+  });
+
   /* 块 */
   const blocks = [];
   const blocksBySession = new Map();
   let hiddenSkipped = 0;
-  scoped.forEach((s) => {
+  linked.forEach((s) => {
     const list = [];
     allBySession.get(s.id).forEach((t) => {
       const isHidden = !!hidden[t.id];
@@ -491,7 +534,7 @@ function buildGraph(input) {
               所以 `mineAll[0]` 就是它）；子会话无自有轮次时用空子会话节点
      任一端点被隐藏时整条边一并消失（FR-11），而不是改挂到会话头 */
   const edges = [];
-  scoped.forEach((s) => {
+  linked.forEach((s) => {
     if (!s.parentId || !byId.has(s.parentId) || !scopedIds.has(s.parentId)) return;
     const parentAll = allBySession.get(s.parentId) || [];
     const mineAll = allBySession.get(s.id) || [];
@@ -541,6 +584,12 @@ function buildGraph(input) {
        与"端点被隐藏"同样处理，整条边不画，**但数据照样留在存档里**，不替用户删。
        这里**不受** `includeHidden` 影响：继承块是任何开关都调不出来的。 */
     if (inheritedIds.has(from) || inheritedIds.has(to)) { inheritedEdges += 1; return; }
+    /* 端点属于**已归档的会话**：那块不进图，关联也就不建立 —— 整条边不画、计数上报。
+       不标 broken：块还在、只是归档了，画一条"指向已不存在的块"的红线是错的指控。 */
+    if (archivedIds.has(sessionOfId(from)) || archivedIds.has(sessionOfId(to))) {
+      archivedEdges += 1;
+      return;
+    }
     if (!includeHidden && (hidden[from] || hidden[to])) return;
     edges.push({
       id: str(l.id) || `${l.kind}:${from}->${to}`,
@@ -569,7 +618,11 @@ function buildGraph(input) {
        单独报出来是因为它**不能**混进 hiddenSkipped：那是一件用户能撤销的事，
        而继承块是任何开关都调不出来的；排查与将来的角标提示要靠这两个数。 */
     inheritedSkipped,
-    inheritedEdges
+    inheritedEdges,
+    /* 因为已归档而没进图的会话（个）与连线（条）—— 用户自己归档的，但"少了什么"
+       仍要说得清，否则界面上就是"我的会话不见了"。 */
+    archivedSkipped,
+    archivedEdges
   };
 
   return {
@@ -579,7 +632,8 @@ function buildGraph(input) {
     order,
     referenced: referencedIds,
     notes: fam.notes,
-    sessions: scoped,
+    /* 用补过 `forkAtTurn` 的那一份：调用方（含导出）拿到的分叉源口径必须一致 */
+    sessions: linked,
     blocks,
     edges,
     stats
@@ -659,9 +713,31 @@ function layout(graph, opts) {
     const top = cursor.get(col) || 0;
     const firstBlockY = top + o.headerHeight + o.headerGap;
 
+    /* 每块的落点：拖过的坐标即权威（FR-5），其余按本会话的顺序排 */
+    const placed = list.map((b, i) => {
+      const p = saved[b.id];
+      const pinned = p && Number.isFinite(p.x) && Number.isFinite(p.y);
+      return {
+        b,
+        x: pinned ? p.x : x,
+        y: pinned ? p.y : firstBlockY + i * o.pitch,
+        moved: !!pinned
+      };
+    });
+
+    /* 会话头**跟着自己最上面那块走**。
+       块被拖走之后，头若留在原来的槽位，"这块属于哪个会话"就只能靠猜 ——
+       实测最糟的形态是：一个会话的块正压在另一个会话的头上面（同列的两个会话
+       深度相同、共用 x，纵向先后一乱，看着就像下面那个会话的块）。
+       纯自动布局时最上面那块就在 `firstBlockY`，算出来与原来的槽位**完全一致**，
+       所以这条规则只在"用户摆过"时才改变结果。
+       没有块的会话（空子会话）仍留在槽位，否则那块空框会没有头。 */
+    const topBlockY = placed.length ? Math.min(...placed.map((p) => p.y)) : null;
+    const headerY = topBlockY === null ? top : topBlockY - o.headerGap - o.headerHeight;
+
     const header = {
       id: `header:${sid}`, kind: 'header', sessionId: sid,
-      x, y: top, w: o.blockWidth, h: o.headerHeight,
+      x, y: headerY, w: o.blockWidth, h: o.headerHeight,
       title: s.title, current: sid === graph.currentId, turnCount: list.length
     };
     nodes.push(header);
@@ -673,17 +749,13 @@ function layout(graph, opts) {
         x, y: firstBlockY, w: o.blockWidth, h: o.blockHeight
       });
     }
-    list.forEach((b, i) => {
-      const p = saved[b.id];
-      const pinned = p && Number.isFinite(p.x) && Number.isFinite(p.y);
+    placed.forEach((p) => {
       nodes.push({
-        id: b.id, kind: 'block', sessionId: sid,
-        x: pinned ? p.x : x,
-        y: pinned ? p.y : firstBlockY + i * o.pitch,
-        w: o.blockWidth, h: o.blockHeight,
+        id: p.b.id, kind: 'block', sessionId: sid,
+        x: p.x, y: p.y, w: o.blockWidth, h: o.blockHeight,
         /* moved 让界面能区分"用户摆过"与"自动落的位" */
-        moved: !!pinned,
-        block: b
+        moved: p.moved,
+        block: p.b
       });
     });
 
@@ -1721,8 +1793,8 @@ const UI = {
 
   /* ---- 提示条 ---- */
   'hint.idle': {
-    zh: '滚轮缩放 · 拖空白平移 · 单击块看详情 · 双击块分叉 · 拖块右下圆点连线 · F 适应视图',
-    en: 'Scroll to zoom · drag empty space to pan · click a block for details · double-click to fork · drag the corner dot to link · F to fit'
+    zh: '滚轮缩放 · 拖空白平移 · 单击块看详情 · 拖块右下圆点连线 · F 适应视图',
+    en: 'Scroll to zoom · drag empty space to pan · click a block for details · drag the corner dot to link · F to fit'
   },
   'hint.linkingDrag': {
     zh: '拖到另一个块并松手建立连线 · 松在空白处取消 · Esc 取消',
@@ -1785,7 +1857,7 @@ const UI = {
   'fork.failed': { zh: '分叉失败：{msg}', en: 'Fork failed: {msg}' },
   'fork.done': { zh: '已从第 {turn} 轮分叉', en: 'Forked from turn {turn}' },
   'fork.action': { zh: '⑂ 从这里分叉', en: '⑂ Fork from here' },
-  'fork.hint': { zh: '也可以直接双击块', en: 'You can also double-click the block' },
+  'fork.hint': { zh: '从这一轮的结束边界切出新会话（继承到这一轮为止的历史）', en: 'Cut a new session from this turn’s end boundary (inherits history up to here)' },
   'fork.turnOpen': { zh: '该轮尚未结束', en: 'This turn is still running' },
 
   /* ---- 块与详情 ---- */
@@ -1830,8 +1902,8 @@ const UI = {
     en: '{sessions} sessions · {blocks} blocks in this family'
   },
   'side.emptyHint': {
-    zh: '点一个块看它的提问与回答；双击块从那里分叉。',
-    en: 'Click a block to see its prompt and response; double-click to fork from it.'
+    zh: '点一个块看它的提问与回答；要分叉就在右栏点「⑂ 从这里分叉」。',
+    en: 'Click a block to see its prompt and response; to fork, use “⑂ Fork from here” on the right.'
   },
 
   /* ---- 操作 ---- */
@@ -1867,6 +1939,11 @@ const UI = {
   'corner.unread': {
     zh: '{n} 个会话的轮次没读到 · 点此重试',
     en: '{n} sessions could not be read · click to retry'
+  },
+  /* 已归档的会话不进图（FR-14）：说一句，免得看起来像"我的会话不见了" */
+  'corner.archived': {
+    zh: '{n} 个已归档的会话未画入图谱',
+    en: '{n} archived sessions are not drawn'
   },
   /* 降级留痕：宿主形状对不上时插件会退一步继续，这里把"退过"说出来 */
   'corner.degraded': {
@@ -2167,8 +2244,8 @@ const CSS = `
   background-image:radial-gradient(var(--dsw-alias-border-l2) 1px,transparent 1px);background-size:22px 22px}
 .sg-canvas-wrap.sg-panning{cursor:grabbing}
 .sg-canvas-wrap.sg-linking{cursor:crosshair}
-/* 归档会话：看得到、点不动，悬停说明原因（FR-14） */
-.sg-label.sg-unavailable{opacity:.45;cursor:not-allowed}
+/* 归档会话**不进图**（FR-14）：连"看得到、点不动"的灰卡片也不再画，
+   所以这里没有禁用态样式 —— 少一种状态，就少一处需要解释的东西。 */
 /* 数据读不出来的块：降级显示，但仍可选中/连线/分叉（FR-13） */
 .sg-node.sg-node-thin{border-style:dashed}
 /* 取数还没落定：虚线示意"还在来"，文案是"载入中" —— 绝不画成"读不出来"那种假坏 */
@@ -2729,13 +2806,14 @@ function GraphView(props) {
   const familyKey = React.useMemo(() => {
     if (!sessionId) return '';
     try {
-      const order = familyOf(sessionsNorm, sessionId).order;
+      /* 已归档的家族成员**不点名**：它们不进图，取它们的轮次纯属白读 */
+      const order = familyOf(sessionsNorm, sessionId).order.filter((id) => !archivedIds.has(id));
       return order.length ? order.join(',') : sessionKey;
     } catch (error) {
       degrade('家族计算失败', error);
       return sessionKey;                     /* 家族算不出来时退回全量，宁可慢不要漏 */
     }
-  }, [sessionsNorm, sessionId, sessionKey]);
+  }, [sessionsNorm, sessionId, sessionKey, archivedIds]);
   const localTurns = React.useMemo(() => attempt(
     '本地时间线读取失败',
     () => turnsFromTimeline(graphSnapshot && graphSnapshot.timeline),
@@ -2971,12 +3049,14 @@ function GraphView(props) {
         turnsBySession,
         currentId: sessionId,
         hidden, alias, links,
-        includeHidden: showHidden
+        includeHidden: showHidden,
+        /* 已归档的会话不进图：不建卡片、不建立关联（FR-14 的"归档"语义） */
+        archived: archivedIds
       });
     } catch (e) {
       return { error: e };
     }
-  }, [norm, sessionsNorm, turnsBySession, sessionId, hidden, alias, links, showHidden]);
+  }, [norm, sessionsNorm, turnsBySession, sessionId, hidden, alias, links, showHidden, archivedIds]);
 
   const laid = React.useMemo(() => {
     if (!graph || graph.error) {
@@ -3307,8 +3387,8 @@ function GraphView(props) {
       return;
     }
 
-    /* 在**按下**时选中，而不是等抬起：双击过程中手抖一两个像素很常见，
-       若靠"没移动过"来决定选中，双击就会既不选中、又照样分叉 */
+    /* 在**按下**时选中，而不是等抬起：手抖一两个像素很常见，
+       若靠"没移动过"来决定选中，想要"点一下看看"就会经常落空 */
     if (hit) setSelected(hit);
     /* 骨架块点一下就点名载入（FR-4）；选中照样发生，两个动作不冲突 */
     const hitNode = hit ? nodeMap.get(hit) : null;
@@ -3522,11 +3602,13 @@ function GraphView(props) {
   const exportText = React.useCallback((fmt, includeHidden) => {
     const g = buildGraph({
       sessions: sessionsNorm, turnsBySession, currentId: sessionId,
-      hidden, alias, links, includeHidden
+      hidden, alias, links, includeHidden,
+      /* 归档会话不进图：导出与画布必须同一口径，否则文件里会多出一张画布上没有的卡片 */
+      archived: archivedIds
     });
     const out = render(g, fmt, { links, stamp: stamp(new Date()) });
     return { ...out, hiddenSkipped: g.stats.hiddenSkipped };
-  }, [sessionsNorm, turnsBySession, sessionId, hidden, alias, links]);
+  }, [sessionsNorm, turnsBySession, sessionId, hidden, alias, links, archivedIds]);
 
   /* 导出（FR-15）：优先走 Host 路由——先 HEAD 预检，通过后交给浏览器下载管理器；
      路由不可用时回落到本地生成 + Blob，保证功能不因为接线问题而消失。
@@ -3540,8 +3622,10 @@ function GraphView(props) {
       + (includeHidden ? '&includeHidden=true' : '')
       + (Object.keys(hidden).length ? '&hidden=' + encodeURIComponent(JSON.stringify(hidden)) : '')
       + (Object.keys(alias).length ? '&alias=' + encodeURIComponent(JSON.stringify(alias)) : '')
-      + (links.length ? '&links=' + encodeURIComponent(JSON.stringify(links)) : '');
-  }, [familyKey, sessionId, hidden, alias, links]);
+      + (links.length ? '&links=' + encodeURIComponent(JSON.stringify(links)) : '')
+      /* 归档名单也要发：Host 侧渲染的导出文件必须与画布同一口径，否则会多出归档会话的卡片 */
+      + (archivedIds.size ? '&archived=' + encodeURIComponent(JSON.stringify([...archivedIds])) : '');
+  }, [familyKey, sessionId, hidden, alias, links, archivedIds]);
 
   const saveUrl = React.useCallback((url, filename) => {
     /* 与产品既有会话日志导出同一手法：anchor 不挂到 document.body，直接 click() */
@@ -3597,19 +3681,17 @@ function GraphView(props) {
   });
   const cell = nodes.map((n) => {
     if (n.kind === 'header') {
-      const gone = archivedIds.has(n.sessionId);
+      /* 已归档的会话不进图（见 buildGraph），所以这里不会出现"点不动的归档卡片" */
       const collapsible = (feats.skeletonOnly || collapseOthers || collapsedSessions.length > 0)
         && n.sessionId !== sessionId && !!n.turnCount;
       return h('div', {
         key: n.id,
-        className: 'sg-label' + (n.sessionId === sessionId ? ' sg-current' : '')
-          + (gone ? ' sg-unavailable' : ''),
+        className: 'sg-label' + (n.sessionId === sessionId ? ' sg-current' : ''),
         style: { left: n.x, top: n.y, minWidth: n.w, height: n.h },
-        title: gone ? t('head.archived') : t('head.switchTip'),
-        'aria-disabled': gone ? 'true' : undefined,
+        title: t('head.switchTip'),
         /* 拖会话头是平移画布（所有非块节点都走平移），松手时浏览器还会补一个 click。
            不平移过的才当"切换会话"，否则一拖就跳走 —— 块上早就这么防了，会话头漏了。 */
-        onClick: gone ? undefined : () => {
+        onClick: () => {
           if (suppressClickRef.current) { suppressClickRef.current = false; return; }
           openSession(n.sessionId);
         }
@@ -3679,7 +3761,8 @@ function GraphView(props) {
          只用于块 id、分叉切点与"去对话视图找第 N 轮"的指路。 */
       'aria-label': t('block.ariaLabel', { turn: b.index, prompt: clip(digest(b.prompt), 120) }),
       style: { left: n.x, top: n.y, width: n.w, minHeight: n.h },
-      onDoubleClick: (e) => { e.stopPropagation(); doFork(b.sessionId, b.turn); },
+      /* 双击**不再**分叉：它太容易误触（想选中/想看清文字都会双击），
+         分叉只走右栏「⑂ 从这里分叉」这一个明确的入口。 */
       onKeyDown: (e) => { if (e.key === 'Enter') { e.stopPropagation(); setSelected(n.id); } }
     },
     h('div', { className: 'sg-hd' },
@@ -3797,6 +3880,10 @@ function GraphView(props) {
       }).join('\n'),
       onClick: retry
     }, t('corner.unread', { n: fmtNum(unreadInfo.length) })));
+  }
+  /* 已归档的家族成员没进图：说一句，免得看起来像"我的会话不见了"（归档是用户自己的动作） */
+  if (!graph.error && graph.stats.archivedSkipped > 0) {
+    cornerNotes.push(t('corner.archived', { n: fmtNum(graph.stats.archivedSkipped) }));
   }
 
   /* 降级留痕（见 degrade）：角标给数字与最近一条原因，悬停看全部。

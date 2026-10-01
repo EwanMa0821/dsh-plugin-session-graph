@@ -488,6 +488,30 @@ test('buildPayload 非法 hidden/alias 返回 400', async () => {
   );
 });
 
+test('导出与画布同一口径：archived= 里点名的会话不进导出文件', async () => {
+  const ctx = fakeCtx();
+  const withGone = await buildPayload(ctx, params({
+    sessionId: 'root', format: 'mm', archived: JSON.stringify(['child'])
+  }), {});
+  assert.ok(withGone.body.includes('根会话'), '没归档的照常导出');
+  assert.ok(!withGone.body.includes('子会话'), '归档的会话不该出现在文件里');
+  assert.ok(!withGone.body.includes('子会话提问'), '它的块也不该出现');
+
+  /* 不带这个参数时行为不变（老客户端 / 别的调用方） */
+  const plain = await buildPayload(ctx, params({ sessionId: 'root', format: 'mm' }), {});
+  assert.ok(plain.body.includes('子会话'), '不传 archived 就照旧全都导出');
+});
+
+test('archived= 不是 JSON 数组时返回 400', async () => {
+  for (const bad of ['{oops', '{"a":1}']) {
+    await assert.rejects(
+      () => buildPayload(fakeCtx(), params({ sessionId: 'root', format: 'mm', archived: bad }), {}),
+      (e) => e.status === 400,
+      `archived=${bad} 应当判参数非法`
+    );
+  }
+});
+
 /* ------------------------------------------------------------------ 标题 */
 
 test('会话标题走 sessionQuery.readTitle：header 里根本没有 title 字段', async () => {

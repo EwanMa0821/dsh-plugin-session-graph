@@ -482,24 +482,31 @@ test('块上带可键盘聚焦与可读标签（NFR-5）', async () => {
   });
 });
 
-test('双击块会以正确的 atSeq 发起分叉（FR-6）', async () => {
+test('双击块**不再**分叉：误触不该起新会话，入口只留右栏按钮', async () => {
   const tree = render(ctx.slots.Component, props);
   const block = elements(tree).find((n) => n.props && n.props['data-sg-node'] === 'ancor:1');
   assert.ok(block, '找得到锚定第 1 轮');
-  block.props.onDoubleClick({ stopPropagation() {} });
-  assert.ok(ctx.forked, '调用了 sessions.fork');
+  assert.equal(block.props.onDoubleClick, undefined,
+    '块上不再挂双击分叉 —— 想选中、想看清文字都会双击，太容易误触');
+
+  /* 明确的入口还在：右栏「⑂ 从这里分叉」 */
+  const btn = elements(selectBlock('ancor:1')).find((n) => n.props
+    && n.props.className === 'sg-act sg-primary');
+  assert.ok(btn, '右栏有分叉按钮');
+  btn.props.onClick();
   assert.equal(ctx.forked.sessionId, 'ancor');
   assert.equal(ctx.forked.atSeq, 18, '切点取该块的结束边界序号（turnsOf 里 endSeq = n*10+8）');
   assert.equal(ctx.forked.increaseTitle, true);
 });
 
-test('进行中的块拒绝分叉', async () => {
+test('进行中的轮次分不开叉：按钮就是禁用的', async () => {
   const saved = { ...ctx.forked };
-  const tree = render(ctx.slots.Component, props);
-  const openBlock = elements(tree).find((n) => n.props && n.props['data-sg-node'] === 'root:2');
-  assert.ok(openBlock, '找得到进行中的那一块');
-  openBlock.props.onDoubleClick({ stopPropagation() {} });
-  assert.deepEqual(ctx.forked, saved, 'fork 没有被再次调用');
+  const btn = elements(selectBlock('root:2')).find((n) => n.props
+    && n.props.className === 'sg-act sg-primary');
+  assert.ok(btn, '右栏有分叉按钮');
+  assert.equal(btn.props.disabled, true, '未结束的轮次没有可用切点');
+  if (typeof btn.props.onClick === 'function') btn.props.onClick();
+  assert.deepEqual(ctx.forked, saved, 'fork 没有被调用');
 });
 
 test('拖空白不会拉出原生选区，但详情面板仍可选中复制', () => {
@@ -532,7 +539,7 @@ test('画布按下即掐掉默认行为，并立刻选中块', () => {
 
   const after = render(ctx.slots.Component, props);
   assert.ok(textsOf(after).some((t) => t.includes('本地第二轮进行中')),
-    '在按下时选中，不等抬起 —— 双击时手抖一两个像素也不会丢选中');
+    '在按下时选中，不等抬起 —— 手抖一两个像素也不会丢掉选中');
 });
 
 test('右键不进入拖拽状态，也不拦默认行为', () => {
@@ -1573,7 +1580,7 @@ test('定位该轮：跨会话时先切会话，挂载后再切视图', async ()
   }
 });
 
-test('归档会话的会话头可点击被禁用，并说明原因', async () => {
+test('已归档的会话不进图：不画卡片、不建立关联，并在图角说明', async () => {
   serverReply = { ...serverReply, state: blankState() };
   const saved = ctx.workspaces;
   ctx.workspaces = { list: wsSource(['invest']) };
@@ -1583,18 +1590,37 @@ test('归档会话的会话头可点击被禁用，并说明原因', async () =>
     render(ctx.slots.Component, props);
     await tick();
     const tree = render(ctx.slots.Component, props);
-    const head = elements(tree).find((n) => typeof n.props.className === 'string'
-      && n.props.className.includes('sg-label')
-      && String(n.props.className).includes('sg-unavailable'));
-    assert.ok(head, '归档会话拿到禁用样式');
-    assert.equal(head.props.onClick, undefined, '点了也没有处理函数');
-    assert.equal(head.props['aria-disabled'], 'true');
-    assert.match(String(head.props.title), /已归档，无法切换/);
 
-    /* 没归档的照常可点 */
-    const normal = elements(tree).find((n) => typeof n.props.className === 'string'
-      && n.props.className.includes('sg-label') && n.props.className.includes('sg-current'));
+    /* 归档的会话连会话头都没有（以前是画一张点不动的灰卡片） */
+    const heads = elements(tree).filter((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-label'));
+    assert.equal(heads.some((n) => String(n.props.title).includes('已归档')), false,
+      '不再画"已归档、点不动"的卡片');
+    /* 它的块也不画 */
+    assert.equal(elements(tree).some((n) => n.props && n.props['data-sg-node'] === 'invest:1'), false);
+    assert.match(textIn(tree), /1 个已归档的会话未画入图谱/, '图角说清少了什么');
+
+    /* 没归档的会话照常可点 */
+    const normal = heads.find((n) => n.props.className.includes('sg-current'));
     assert.equal(typeof normal.props.onClick, 'function');
+  } finally {
+    ctx.workspaces = saved;
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('归档会话不参与取数：sessions= 里不再点名它', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const saved = ctx.workspaces;
+  ctx.workspaces = { list: wsSource(['invest']) };
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    render(ctx.slots.Component, props);
+    const url = fetchCalls[fetchCalls.length - 1];
+    assert.match(url, /sessions=root%2Cancor/, '家族里没归档的照常点名');
+    assert.ok(!url.includes('invest'), '归档的不点名：它的轮次没必要读，也没必要回传');
   } finally {
     ctx.workspaces = saved;
     serverReply = { ...serverReply, state: null };
