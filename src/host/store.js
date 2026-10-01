@@ -18,7 +18,19 @@
 
 import { STATE_VERSION, emptyState, sanitizeState, mergePatch } from '../core/state.js';
 
-export const DOMAIN_NAME = 'session-graph';
+/**
+ * 领域名。**必须是 `[a-z][a-z0-9_]*`，不能有连字符。**
+ *
+ * 宿主对领域名/表名有硬约束（`@deepseek-ai/dsh-storage` 的 `UNIT_NAME_RE = /^[a-z][a-z0-9_]*$/`），
+ * 由后端在 `kv.open()` 里校验（json 后端：`validateDescriptor` → `malformed-medium`）。
+ * 而 `storageDomain.open(spec)` 只按结构读 spec、**不调用** `defineDomain`，
+ * 所以名字写错不会在加载时炸，只会在打开存储时静默失败 —— 界面表现为"永远只读"。
+ *
+ * 这里原本叫 `session-graph`（带连字符），于是持久化从未生效过：
+ * open 抛错 → `openStore` 返回 null → 每次写入都 503、每次读取都 `writable:false`。
+ * 改名后记录布局不变（仍是 per-record，键仍是家族根会话 id），只是单元目录名变了。
+ */
+export const DOMAIN_NAME = 'session_graph';
 export const TABLE_NAME = 'families';
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -135,13 +147,21 @@ export function createStore(domain, now = () => Date.now()) {
  * 打开存储；任何一步失败都只返回 null，绝不抛到调用方。
  *
  * §5.3：存储域不可用时图谱退化为**只读模式** —— 能看、能分叉，只是不能保存。
+ *
+ * @param {object} storageDomain `ctx.storageDomain`
+ * @param {() => number} [now]
+ * @param {(error: any) => void} [onError] 可选上报口。降级是设计的一部分，
+ *        但**失败原因不能一起消失** —— 只读却查不出为什么，正是上一版踩过的坑。
  */
-export async function openStore(storageDomain, now) {
+export async function openStore(storageDomain, now, onError) {
   if (!storageDomain || typeof storageDomain.open !== 'function') return null;
   try {
     const domain = await storageDomain.open(DOMAIN_SPEC);
     return createStore(domain, now);
-  } catch {
+  } catch (error) {
+    if (typeof onError === 'function') {
+      try { onError(error); } catch { /* 上报失败不影响降级 */ }
+    }
     return null;
   }
 }

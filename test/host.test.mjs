@@ -521,6 +521,57 @@ test('压根没有存储域时同样是只读，而不是报错', async () => {
   assert.equal((await res.json()).writable, false);
 });
 
+test('存储域句柄随插件卸载归还：重载后不会以 already-open 卡成永久只读', async () => {
+  /* 回归：句柄的生命周期归调用方。不关的话域一直开着、名字一直占着，
+     插件重载时 open() 抛 already-open，又被 openStore 吞掉 —— 永久只读。 */
+  const records = new Map();
+  let openedCount = 0;
+  let closedCount = 0;
+  const disposers = [];
+  const facility = {
+    open: async () => {
+      openedCount += 1;
+      /* 真实设施对同一域名只留一个活句柄：上一个没关就抛 already-open */
+      if (closedCount < openedCount - 1) {
+        throw Object.assign(new Error("domain 'session_graph' is already open"), { code: 'already-open' });
+      }
+      return {
+        table: () => ({
+          get: (k) => records.get(k),
+          put: async (k, v) => { records.set(k, v); },
+          delete: async (k) => records.delete(k)
+        }),
+        close: async () => { closedCount += 1; }
+      };
+    }
+  };
+  const mount = () => {
+    const registered = [];
+    apply(fakeCtx({
+      connection: { fetch: { register: (o) => { registered.push(o); return () => {}; } } },
+      storageDomain: facility,
+      effect(cb) { disposers.push(cb()); }
+    }), {});
+    return registered[0];
+  };
+
+  const first = mount();
+  await settle();
+  const write1 = await first.fetch(postBody({ familyRootId: 'root', patch: { hiddenBlocks: ['root:1'] } }));
+  assert.equal(write1.status, 200, '第一次挂载即可写');
+
+  /* 宿主卸载插件时会跑 effect 返回的 disposer */
+  disposers.splice(0).forEach((dispose) => dispose());
+  assert.equal(closedCount, 1, '域句柄在卸载时被关闭');
+
+  const second = mount();
+  await settle();
+  const write2 = await second.fetch(postBody({ familyRootId: 'root', patch: { alias: { 'root:2': '二' } } }));
+  assert.equal(write2.status, 200, '重载后仍然可写（而不是 already-open 后静默只读）');
+  assert.deepEqual(records.get('root').hiddenBlocks, ['root:1'], '上次写的数据还在');
+  assert.deepEqual(records.get('root').alias, { 'root:2': '二' });
+});
+
 test('未来版本的记录：报不兼容且拒绝覆盖', async () => {
   const future = { version: 99, links: [], positions: {}, alias: {}, hiddenBlocks: [] };
   const domain = fakeStorageDomain(new Map([['root', future]]));

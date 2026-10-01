@@ -180,6 +180,27 @@ test('领域 spec 形状正确，且不需要 defineDomain 也合法', () => {
   assert.equal(typeof DOMAIN_SPEC.tables[TABLE_NAME].valueSchema.safeParse, 'function');
 });
 
+/* 回归：域名里带连字符时，宿主的后端会在 kv.open 里拒收（malformed-medium），
+   而 open() 不跑 defineDomain、名字错误无处报错 —— 结果是"永远只读"。
+   这条断言把宿主的命名规则搬进测试，让同类错误在测试阶段就炸，而不是上线后靠猜。 */
+test('领域名与表名符合宿主后端的命名规则（连字符会让存储永远打不开）', () => {
+  const UNIT_NAME_RE = /^[a-z][a-z0-9_]*$/;   /* @deepseek-ai/dsh-storage */
+  assert.ok(UNIT_NAME_RE.test(DOMAIN_NAME), `领域名 ${DOMAIN_NAME} 必须匹配 ${UNIT_NAME_RE}`);
+  assert.ok(UNIT_NAME_RE.test(TABLE_NAME), `表名 ${TABLE_NAME} 必须匹配 ${UNIT_NAME_RE}`);
+  assert.ok(!DOMAIN_NAME.includes('-'), '连字符正是当初让持久化从未生效的原因');
+});
+
+test('名字不合法时，像宿主那样校验的后端会拒绝本 spec（同一回归的另一面）', async () => {
+  const UNIT_NAME_RE = /^[a-z][a-z0-9_]*$/;
+  const strictBackend = {
+    open: async (spec) => {
+      if (!UNIT_NAME_RE.test(spec.name)) throw new Error(`invalid unit name '${spec.name}'`);
+      return fakeDomain();
+    }
+  };
+  assert.notEqual(await openStore(strictBackend), null, '本插件声明的领域必须能被真后端接受');
+});
+
 test('记录 schema 只做结构校验，由 sanitizeState 管版本', () => {
   const ok = { version: 1, links: [], positions: {}, alias: {}, hiddenBlocks: [] };
   assert.equal(familyRecordSchema.safeParse(ok).success, true);
@@ -266,6 +287,18 @@ test('领域设施不可用时 openStore 返回 null，绝不抛（§5.3 只读�
   assert.equal(await openStore(null), null);
   assert.equal(await openStore({}), null);
   assert.equal(await openStore({ open: async () => { throw new Error('backend-not-found'); } }), null);
+});
+
+test('openStore 把失败原因交给调用方，但仍然只返回 null', async () => {
+  const seen = [];
+  const boom = Object.assign(new Error("invalid unit name 'session-graph'"), { code: 'malformed-medium' });
+  const store = await openStore({ open: async () => { throw boom; } }, undefined, (e) => seen.push(e));
+  assert.equal(store, null, '降级行为不变');
+  assert.deepEqual(seen, [boom], '失败原因不能跟着一起消失 —— 只读的成因必须看得见');
+
+  /* 上报口自己抛错也不能把降级路径带崩 */
+  const again = await openStore({ open: async () => { throw boom; } }, undefined, () => { throw new Error('logger down'); });
+  assert.equal(again, null);
 });
 
 test('openStore 把领域打开成 store，并使用同一个 spec', async () => {

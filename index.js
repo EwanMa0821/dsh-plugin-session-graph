@@ -15,7 +15,7 @@ import { normalizeSessions, buildGraph, clip } from './src/core/model.js';
 import { render } from './src/core/export.js';
 import { stateToClient } from './src/core/state.js';
 import { foldTurns, linkForks } from './src/host/fold.js';
-import { openStore } from './src/host/store.js';
+import { openStore, DOMAIN_NAME } from './src/host/store.js';
 
 export const name = 'dsh-plugin-session-graph';
 
@@ -344,9 +344,45 @@ export function apply(ctx, config) {
         return new Response(null, { status: response.status, headers: response.headers });
       }
     });
-    /* 路由已在位，再去开存储；失败只是降级为只读，不影响上面这条注册 */
-    void openStore(service(scoped, 'storageDomain')).then((store) => {
-      holder.store = store;
+    /* 路由已在位，再去开存储；失败只是降级为只读，不影响上面这条注册。
+       句柄的生命周期**归调用方**：宿主的领域设施不替消费者关闭它
+       （`dsh-storage-domain` 明说 "the CALLER owns the returned handle"）。
+       不关的后果不是"泄漏一点内存"这么轻：那个域在 json 后端里一直开着、
+       名字也一直占着，插件重载/热更时再 open 会以 `already-open` 失败 ——
+       又是一次静默只读。所以先把 disposer 挂上，再异步打开，两种先后顺序都收得住。 */
+    let store = null;
+    let disposed = false;
+    const closeStore = () => {
+      const opened = store;
+      store = null;
+      holder.store = null;
+      if (opened && typeof opened.close === 'function') {
+        try { void opened.close(); } catch { /* 关闭失败没有补救手段 */ }
+      }
+    };
+    const logger = (scoped && scoped.logger) || (ctx && ctx.logger) || null;
+    const onDispose = () => { disposed = true; closeStore(); };
+    if (typeof scoped.effect === 'function') scoped.effect(() => onDispose);
+    else if (typeof ctx.effect === 'function') ctx.effect(() => onDispose);
+
+    void openStore(service(scoped, 'storageDomain'), undefined, (error) => {
+      /* 打开失败以前是完全静默的：界面只会一直显示"只读"，没人知道为什么。
+         把原因写进日志，这类问题下次不必再靠读宿主的正则才能定位。 */
+      try {
+        if (logger && typeof logger.warn === 'function') {
+          logger.warn(`会话图谱：存储域 ${DOMAIN_NAME} 打不开，已降级为只读。原因：${String((error && error.message) || error)}`);
+        }
+      } catch { /* 日志不可用不影响主流程 */ }
+    }).then((opened) => {
+      /* 已经卸载了才等到结果：立刻还回去，别把域留在打开状态 */
+      if (disposed) {
+        if (opened && typeof opened.close === 'function') {
+          try { void opened.close(); } catch { /* 同上 */ }
+        }
+        return;
+      }
+      store = opened;
+      holder.store = opened;
       holder.ready = true;
     });
   };
