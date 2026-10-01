@@ -2063,6 +2063,31 @@ test('取数未落定时不画"假坏"：说"载入中"，不说"读不出来"',
   assert.ok(!text.includes('元数据仍在'), '也不该带降级的补充说明');
 });
 
+test('会话目录没到时先不发请求：避免两次取数把图"跳两次"', async () => {
+  /* 根因：`sessions=`/familyKey 依赖会话列表。目录未到时发一次（残缺家族），
+     目录到了 effect 再跑一次（完整家族）—— 两次布局不同，用户就看到图跳两次。
+     要求：等第一份快照，只发一次。 */
+  const savedList = ctx.sessions.list;
+  const before = fetchCalls.length;
+  try {
+    ctx.sessions.list = { getSnapshot: () => undefined, subscribe: () => () => {} };
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    assert.equal(fetchCalls.length, before, '目录未到不该发请求');
+
+    ctx.sessions.list = savedList;
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    const mine = fetchCalls.slice(before);
+    assert.equal(mine.length, 1, '目录到了只发一次：' + mine.join(' | '));
+    assert.match(mine[0], /sessions=/, '而且这次带着家族：' + mine[0]);
+  } finally {
+    ctx.sessions.list = savedList;
+  }
+});
+
 /* ============================================================================
    回归：这一批是"装完插件整个界面坏掉"以及若干静默失效的直接原因
    ============================================================================ */

@@ -2648,6 +2648,13 @@ function GraphView(props) {
        原先这里直接 return，`loaded` 永远是 false，而空家族的骨架屏判定
        `!loaded && blocks === 0` 恒成立 —— 界面就一直转，什么都不会发生。 */
     if (!sessionId) { loadedRef.current = true; setLoaded(true); return undefined; }
+    /* **会话目录还没到就先不发。** `sessions=`/`familyKey` 依赖会话列表：目录未到时
+       发出的是"不带家族"的那一次，取回的是残缺家族；目录一到 effect 又跑一次、
+       取回完整家族 —— 两次结果不同，图就会**跳两次**（用户报的切视图现象）。
+       这里只等第一份快照（`listSnapshot === undefined` 表示还没拿到），
+       拿到之后只发一次；没有 sessions 服务时照发，不会卡住。 */
+    const listPending = !!(sessions && sessions.list && listSnapshot === undefined);
+    if (listPending) return undefined;
     let alive = true;
     const url = '/api/session.graph-export'
       + '?format=json'
