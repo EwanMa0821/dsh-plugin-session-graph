@@ -1963,7 +1963,15 @@ function GraphView(props) {
     },
       h('div', {
         className: 'sg-world',
-        style: { transform: 'translate(' + view.panX + 'px,' + view.panY + 'px) scale(' + view.scale + ')' }
+        style: {
+          transform: 'translate(' + view.panX + 'px,' + view.panY + 'px) scale(' + view.scale + ')',
+          /* 首屏适配之前**别把图亮出来**：挂载时先按默认视口（scale=1、pan 偏移）画一帧，
+             loaded 后才 fit 一次，图就从"错误缩放"跳到"适配后" —— 这正是切视图的"跳"。
+             这里在 fit 完成前淡出世界层（工具条与角标不受影响），适配好再淡入，
+             跳就变成一次平滑显现；淡出期间由 body 里的骨架/载入态给反馈。 */
+          opacity: view.fitted ? 1 : 0,
+          transition: 'opacity 140ms ease'
+        }
       },
       h('svg', { width: Math.max(1200, (laid.bounds ? laid.bounds.maxX + 160 : 1200)),
                  height: Math.max(760, (laid.bounds ? laid.bounds.maxY + 120 : 760)) },
