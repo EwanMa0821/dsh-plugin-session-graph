@@ -144,7 +144,7 @@ src/client/app.js    客户端应用
 ## 开发
 
 ```bash
-node scripts/run-tests.mjs      # 196 项测试，在同一进程内运行
+node scripts/run-tests.mjs      # 203 项测试，在同一进程内运行
 node scripts/check-package.mjs  # 清单、图标、patch、产物是否过期
 node scripts/build-client.mjs   # 改过 src/ 之后必须跑
 ```
@@ -208,6 +208,7 @@ node scripts/build-client.mjs   # 改过 src/ 之后必须跑
 | 导出 | FreeMind `.mm` 与 Markdown `.md`，块内分段区分问与答 |
 | 跨会话跳转 | 点会话头切换；归档会话禁用并说明原因；家族范围不随当前会话变化 |
 | 引用式新建会话 | 详情面板「⧉ 新建引用式会话」：建一个**不继承历史**的独立会话，记一条引用边（点线 + 空心箭头）并切过去 |
+| 空/加载/错误态 | 空态给「去对话视图开始提问」入口；首次装配骨架屏；装配失败可重试且不影响其余功能；单块数据读不出来时该块降级并在图角报数 |
 | 规模降级 | 按块数分档：>800 省略块内正文与边标签，>3000 只画骨架 + 当前会话（可 ▸ 就地展开）；布局超预算时提示 |
 
 **未做**

@@ -419,11 +419,18 @@ function buildGraph(input) {
     });
   });
 
+  /* FR-13：部分块数据不可读时该块降级、其余照常，图角报出条数。
+     判定：提问与回答都读不出**且**这一轮已经结束 —— 还在进行中的轮次
+     本来就只可能有提问，不能算"数据不完整"。 */
+  const incomplete = blocks.filter((b) =>
+    b.status !== 'open' && !str(b.prompt) && !str(b.response)).length;
+
   const stats = {
     sessions: scoped.length,
     blocks: blocks.length,
     hiddenSkipped,
-    edges: edges.length
+    edges: edges.length,
+    incomplete
   };
 
   return {
@@ -1452,6 +1459,29 @@ const CSS = `
 .sg-canvas-wrap.sg-linking{cursor:crosshair}
 /* 归档会话：看得到、点不动，悬停说明原因（FR-14） */
 .sg-label.sg-unavailable{opacity:.45;cursor:not-allowed}
+/* 数据读不出来的块：降级显示，但仍可选中/连线/分叉（FR-13） */
+.sg-node.sg-node-thin{border-style:dashed}
+.sg-node.sg-node-thin .sg-ask{color:var(--dsw-alias-label-caption)}
+/* 图角的状态说明（FR-13） */
+.sg-corner{position:absolute;right:10px;bottom:8px;z-index:6;pointer-events:none;
+  padding:3px 9px;border-radius:7px;font-size:11.5px;
+  background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-caption);
+  border:.5px solid var(--dsw-alias-border-l3)}
+/* 空态 / 加载态 / 错误态 */
+.sg-state{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:7;
+  display:flex;flex-direction:column;gap:9px;align-items:flex-start;
+  max-width:400px;padding:18px 20px;border-radius:12px;text-align:left;
+  background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-elevation-panel)}
+.sg-state-t{font-size:13.5px;font-weight:600;color:var(--dsw-alias-label-primary)}
+.sg-state-d{font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary)}
+.sg-state-code{font-size:11.5px;word-break:break-all;padding:6px 8px;border-radius:6px;
+  background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-caption);
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.sg-state-act{align-self:flex-start}
+.sg-skel{background:transparent;box-shadow:none;align-items:center;width:220px}
+.sg-skel-line{height:11px;border-radius:6px;background:var(--dsw-alias-bg-layer-1);
+  animation:sg-pulse 1.4s ease-in-out infinite}
+@keyframes sg-pulse{0%,100%{opacity:.35}50%{opacity:.75}}
 .sg-world{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform}
 .sg-world svg{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}
 .sg-e-branch{fill:none;stroke:var(--dsw-alias-label-dimmed);stroke-width:1.6}
@@ -1743,8 +1773,18 @@ function GraphView(props) {
     return () => ro.disconnect();
   }, []);
 
-  /* 每次数据变化重建图模型 */
-  const sessionsNorm = React.useMemo(() => normalizeSessions(listOf(listSnapshot)), [listSnapshot]);
+  /* 每次数据变化重建图模型。
+     会话规范化本身也可能炸（宿主给的列表快照结构不对），
+     它不能直接抛 —— FR-13 要求异常不得抛出视图之外，否则整页白屏。
+     所以把规范化与建模放进同一个守卫，错误一律走错误态。 */
+  const norm = React.useMemo(() => {
+    try {
+      return { sessions: normalizeSessions(listOf(listSnapshot)), error: null };
+    } catch (e) {
+      return { sessions: [], error: e };
+    }
+  }, [listSnapshot]);
+  const sessionsNorm = norm.sessions;
   const sessionKey = sessionsNorm.map((s) => s.id).join(',');
   const localTurns = React.useMemo(
     () => turnsFromTimeline(graphSnapshot && graphSnapshot.timeline),
@@ -1754,6 +1794,8 @@ function GraphView(props) {
   /* 家族里其他会话的轮次要向 Host 取（本地的装配器时间线只覆盖当前会话）。
      取不到就退化成"只有当前会话有块"——家族骨架仍然完整。 */
   const [remote, setRemote] = React.useState(null);
+  /* 重试计数：改一下就重跑取数 effect（FR-13 的「重试可恢复」） */
+  const [reloadNonce, setReloadNonce] = React.useState(0);
   /* 存档里的家族根 id 与视口，写回时要用 */
   const familyRef = React.useRef('');
   const savedViewportRef = React.useRef(null);
@@ -1799,7 +1841,16 @@ function GraphView(props) {
         setLoaded(true);
       });
     return () => { alive = false; };
-  }, [sessionId, sessionKey]);
+  }, [sessionId, sessionKey, reloadNonce]);
+
+  /* 重试：清掉旧状态并重新取数（FR-13 验收 3「重试可恢复」） */
+  const retry = React.useCallback(() => {
+    setSaveError('');
+    setRemote(null);
+    setLoaded(false);
+    loadedRef.current = false;
+    setReloadNonce((n) => n + 1);
+  }, []);
 
   /* 写回：交互写入按帧合并后节流提交（§5.3 的写入策略） */
   const writableRef = React.useRef(true);
@@ -1861,6 +1912,7 @@ function GraphView(props) {
   }, [remote, localTurns, sessionId]);
 
   const graph = React.useMemo(() => {
+    if (norm.error) return { error: norm.error };
     try {
       return buildGraph({
         sessions: sessionsNorm,
@@ -1872,7 +1924,7 @@ function GraphView(props) {
     } catch (e) {
       return { error: e };
     }
-  }, [sessionsNorm, turnsBySession, sessionId, hidden, alias, links, showHidden]);
+  }, [norm, sessionsNorm, turnsBySession, sessionId, hidden, alias, links, showHidden]);
 
   const laid = React.useMemo(() => {
     if (!graph || graph.error) {
@@ -2452,10 +2504,14 @@ function GraphView(props) {
       }, h('span', null, '空子会话 · 尚未提问'));
     }
     const b = n.block;
+    /* FR-13：部分块数据读不出来时**该块降级**，而不是整张图报错。
+       判定与 stats.incomplete 一致：这一轮已结束，但提问与回答都没有文本。 */
+    const thin = b.status !== 'open' && !digest(b.prompt) && !digest(b.response);
     const cls = 'sg-node'
       + (b.current ? ' sg-current' : '')
       + (selected === n.id ? ' sg-selected' : '')
-      + (b.hidden && showHidden ? ' sg-hidden' : '');
+      + (b.hidden && showHidden ? ' sg-hidden' : '')
+      + (thin ? ' sg-node-thin' : '');
     const badges = [];
     if (b.toolCalls) badges.push(h('span', { key: 't', className: 'sg-badge' }, '⚙ ' + b.toolCalls));
     if (b.deliverables) badges.push(h('span', { key: 'd', className: 'sg-badge' }, '⧉ ' + b.deliverables));
@@ -2476,9 +2532,11 @@ function GraphView(props) {
       h('span', { className: 'sg-sp' }),
       badges),
     h('div', { className: 'sg-ask' + (digest(b.prompt) ? '' : ' sg-empty') },
-      b.alias ? '✎ ' + b.alias : (clip(digest(b.prompt), 110) || '（该轮提问尚未载入）')),
+      b.alias ? '✎ ' + b.alias : (clip(digest(b.prompt), 110)
+        || (thin ? '（这一轮的内容读不出来）' : '（该轮提问尚未载入）'))),
     feats.blockText
-      ? h('div', { className: 'sg-ans' }, clip(digest(b.response, 'first-paragraph'), 220) || '（该轮回答尚未载入）')
+      ? h('div', { className: 'sg-ans' }, clip(digest(b.response, 'first-paragraph'), 220)
+        || (thin ? '元数据仍在，可正常连线与分叉' : '（该轮回答尚未载入）'))
       : null,
     /* 连线把手：拖到另一个块即可建立手动边（FR-9）。悬停或选中时才显形。 */
     h('div', {
@@ -2537,18 +2595,50 @@ function GraphView(props) {
   /* 断裂的边指向已不存在的块：几何上画不出来，但**不能装作没这回事** */
   const brokenCount = edgeList.filter((e) => e.broken).length;
 
-  /* 空态说人话（FR-13）：不暴露状态码，只告诉用户现在能看到什么、可以做什么 */
+  /* 图角的状态说明（FR-13）：数据不完整、断裂连线都要报数 */
+  const cornerNotes = [];
+  if (!graph.error && graph.stats.incomplete > 0) {
+    cornerNotes.push(graph.stats.incomplete + ' 个块数据不完整');
+  }
+  if (brokenCount > 0) cornerNotes.push(brokenCount + ' 条连线指向已不存在的块');
+  const cornerNote = cornerNotes.length
+    ? h('div', { className: 'sg-corner' }, cornerNotes.join(' · '))
+    : null;
+
+  /* 首次装配中：Host 还没回来、本地一个块也没有 → 骨架屏（FR-13）。
+     注意不能拿 laid.nodes 是否为空来判断 —— 会话头也是节点，
+     只要家族里有会话它就不空，骨架屏将永远不会出现。 */
+  /* 注意：graph.stats 只在装配成功时存在，出错时**没有** stats —— 必须先判 error */
+  const emptyFamily = !graph.error && graph.stats.blocks === 0;
+  const assembling = !loaded && emptyFamily;
+
+  /* 空态/加载态/错误态都要说人话：不暴露状态码，只讲现在能看到什么、可以做什么 */
   const body = graph.error
-    ? h('div', { className: 'sg-err' },
-        '图谱没能装配起来。',
-        h('br'),
-        '可以把当前视图切到「对话」再切回来重试；若一直如此，请反馈这条信息：' + graph.error.message)
-    : !laid.nodes.length
-      ? h('div', { className: 'sg-emptybox' },
-          '这个家族里还没有可显示的轮次。',
-          h('br'), h('br'),
-          '发出第一条消息之后，图谱里就会出现第一个块。')
-      : null;
+    ? h('div', { className: 'sg-state sg-state-err' },
+        h('div', { className: 'sg-state-t' }, '图谱没能装配起来'),
+        h('div', { className: 'sg-state-d' },
+          '图谱以外的功能不受影响。若反复失败，请把下面这行一并反馈：'),
+        h('div', { className: 'sg-state-code' },
+          String((graph.error && graph.error.message) || graph.error)),
+        h('button', { className: 'sg-btn sg-state-act', onClick: retry }, '↻ 重试'))
+    : assembling
+      ? h('div', { className: 'sg-state sg-skel' },
+          h('div', { className: 'sg-skel-line', style: { width: '46%' } }),
+          h('div', { className: 'sg-skel-line', style: { width: '72%' } }),
+          h('div', { className: 'sg-skel-line', style: { width: '58%' } }),
+          h('div', { className: 'sg-state-d' }, '正在装配图谱…'))
+      : emptyFamily
+        ? h('div', { className: 'sg-state' },
+            h('div', { className: 'sg-state-t' }, '这个家族里还没有可显示的轮次'),
+            h('div', { className: 'sg-state-d' },
+              '发出第一条消息之后，图谱里就会出现第一个块。'),
+            typeof props.openView === 'function'
+              ? h('button', {
+                className: 'sg-btn sg-state-act',
+                onClick: () => props.openView('transcript-view')
+              }, '去对话视图开始提问')
+              : null)
+        : null;
 
   /* 刚建好的连线：就地弹出标签输入框（FR-9）。
      Enter 或失焦确认，Esc 取消；留空即无标签。 */
@@ -2805,6 +2895,7 @@ function GraphView(props) {
       contentHint,
       saveHint,
       scaleHint,
+      cornerNote,
       labelInput,
       body),
     h('aside', { className: 'sg-side' }, detail),

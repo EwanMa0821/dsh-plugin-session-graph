@@ -248,7 +248,7 @@ function fakeCtx() {
     },
     uiConversation: {
       views: { register(d) { viewRegistry.definition = d; } },
-      binding() { return { target: () => source({ timeline: TIMELINE }) }; }
+      binding() { return { target: () => source({ timeline: ctx.timeline || TIMELINE }) }; }
     },
     sessions: {
       list: source({ byId: Object.fromEntries(FAMILY.map((s) => [s.id, { ...s, sessionId: s.id }])) }),
@@ -591,12 +591,13 @@ test('块上的提问行不会退化成轮次号', () => {
 /* ----------------------------------------------------------- 持久化 */
 
 /** 挂载一次并等存档落地；副作用会在下一轮渲染才落到树上，所以要多渲染一轮 */
-async function mountLoaded() {
+async function mountLoaded(p) {
+  const use = p || props;
   resetComponent();
-  render(ctx.slots.Component, props);
+  render(ctx.slots.Component, use);
   await tick();
-  render(ctx.slots.Component, props);
-  return render(ctx.slots.Component, props);
+  render(ctx.slots.Component, use);
+  return render(ctx.slots.Component, use);
 }
 
 test('存档里的隐藏与别名在加载时就生效', async () => {
@@ -726,11 +727,8 @@ test('从把手拖到另一个块即建立连线，并写回宿主', async () =>
       && c.props['data-sg-link-handle'] === 'root:1'), '块上有连线把手');
 
     const badge = elements(tree).find((n)=>n.props&&n.props.className==='sg-ro');
-    console.log('PROBE 徽章', badge ? String(badge.props.children) : '（无）');
-    console.log('PROBE 挂载后 blocks', elements(tree).filter((n)=>n.props&&n.props['data-sg-node']).length);
     press(tree, { handle: 'root:1' });
     tree = render(ctx.slots.Component, props);
-    console.log('PROBE 连线态', canvasOf(tree).props.className);
     assert.ok(canvasOf(tree).props.className.includes('sg-linking'), '进入连线态');
 
     fire('mousemove', { clientX: 320, clientY: 240, preventDefault() {} });
@@ -1508,5 +1506,150 @@ test('切换会话失败时提示，且不改变当前会话', async () => {
   } finally {
     ctx.uiWorkspace = saved;
     serverReply = { ...serverReply, state: null };
+  }
+});
+
+/* ---------------------------- 空态 / 加载态 / 错误态（FR-13） */
+
+const turnAt = (n, prompt, response, status) => ({
+  turn: n, startSeq: n * 10, endSeq: n * 10 + 8,
+  prompt, response, status: status || 'done', toolCalls: 0, deliverables: 0
+});
+const NO_TIMELINE = { turnOrder: [], turns: new Map() };
+
+const statePane = (tree) => elements(tree).find((n) => typeof n.props.className === 'string'
+  && n.props.className.includes('sg-state'));
+
+test('首次装配中显示骨架屏，不是空白', async () => {
+  serverReply = { ...serverReply, state: blankState(), turns: { root: [], ancor: [], invest: [] } };
+  ctx.timeline = NO_TIMELINE;
+  try {
+    const p = propsFor('root');
+    resetComponent();
+    const tree = render(ctx.slots.Component, p);      /* 不等取数回来 */
+    const pane = statePane(tree);
+    assert.ok(pane, '有加载态');
+    assert.ok(pane.props.className.includes('sg-skel'), '是骨架屏');
+    assert.ok(elements(tree).some((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-skel-line')), '有占位线条');
+  } finally {
+    serverReply = { ...serverReply, state: null, turns: REMOTE_TURNS };
+    ctx.timeline = TIMELINE;
+  }
+});
+
+test('空家族显示空态，并提供「去对话视图开始提问」', async () => {
+  serverReply = { ...serverReply, state: blankState(), turns: { root: [], ancor: [], invest: [] } };
+  ctx.timeline = NO_TIMELINE;
+  viewOpens.length = 0;
+  try {
+    const tree = await mountLoaded(propsFor('root'));
+    const pane = statePane(tree);
+    assert.ok(pane, '有空态');
+    assert.match(textIn(pane), /还没有可显示的轮次/);
+    const btn = elements(pane).find((n) => n.props && n.props.className.includes('sg-btn')
+      && String(n.props.children).includes('去对话视图开始提问'));
+    assert.ok(btn, '给了下一步入口，而不是只说"没有数据"');
+    btn.props.onClick();
+    assert.deepEqual(viewOpens.map((v) => v.view), ['transcript-view']);
+  } finally {
+    serverReply = { ...serverReply, state: null, turns: REMOTE_TURNS };
+    ctx.timeline = TIMELINE;
+  }
+});
+
+test('装配失败时视图区域显示错误态，可重试且其余功能不受影响', async () => {
+  /* 核心层写得很防御，喂坏数据并不会抛；要触发「装配整体失败」这条兜底路径，
+     得让它在建模途中真的炸掉 —— 用一个读属性就抛的 Proxy 当会话条目。 */
+  const bomb = new Proxy({}, {
+    get() { throw new Error('会话列表读取失败'); },
+    ownKeys() { throw new Error('会话列表读取失败'); }
+  });
+  const savedList = ctx.sessions.list;
+  ctx.sessions.list = source({ byId: { root: bomb } });
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+
+    const pane = statePane(tree);
+    assert.ok(pane, '有错误态');
+    assert.ok(pane.props.className.includes('sg-state-err'));
+    assert.match(textIn(pane), /图谱没能装配起来/);
+    assert.match(textIn(pane), /会话列表读取失败/, '把原因原样带出来');
+    assert.ok(elements(tree).some((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-side')), '右栏还在 —— 没有整页白屏');
+    assert.ok(elements(tree).some((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-tools')), '工具条还在');
+
+    /* 重试：换回好的数据，点重试要真的重新取数并恢复 */
+    ctx.sessions.list = savedList;
+    const callsBefore = fetchCalls.length;
+    elements(pane).find((n) => n.props && n.props.className.includes('sg-btn')
+      && String(n.props.children).includes('重试')).props.onClick();
+    await tick();
+    tree = render(ctx.slots.Component, props);
+    assert.ok(fetchCalls.length > callsBefore, '重试真的重新取数了');
+    /* 会话列表换成了新对象，useSource 要重新订阅并拉一次快照 —— 再渲染一次才看得到 */
+    tree = render(ctx.slots.Component, props);
+    assert.equal(statePane(tree), undefined, '恢复后不再显示错误态');
+    assert.ok(elements(tree).some((n) => n.props && n.props['data-sg-node']), '块回来了');
+  } finally {
+    ctx.sessions.list = savedList;
+    serverReply = { ...serverReply, state: null, ok: true, status: 200 };
+  }
+});
+
+test('部分块数据不可读：该块降级、其余正常，图角报数', async () => {
+  ctx.timeline = NO_TIMELINE;
+  serverReply = {
+    ...serverReply,
+    state: blankState(),
+    turns: {
+      root: [
+        turnAt(1, '正常的提问', '正常的回答'),
+        turnAt(2, '', ''),                      /* 读不出来 */
+        turnAt(3, '又一个正常提问', '回答')
+      ],
+      ancor: [],
+      invest: []
+    }
+  };
+  try {
+    const tree = await mountLoaded(propsFor('root'));
+    const thin = elements(tree).filter((n) => typeof (n.props && n.props.className) === 'string'
+      && n.props.className.includes('sg-node-thin'));
+    assert.equal(thin.length, 1, '只有读不出来的那一块降级');
+    assert.equal(thin[0].props['data-sg-node'], 'root:2');
+    assert.match(textIn(thin[0]), /这一轮的内容读不出来/);
+
+    const ok2 = elements(tree).find((n) => n.props && n.props['data-sg-node'] === 'root:1');
+    assert.match(textIn(ok2), /正常的提问/, '其余块照常');
+    assert.equal(elements(tree).some((n) => n.props && n.props['data-sg-node'] === 'root:3'), true);
+
+    const corner = elements(tree).find((n) => n.props && n.props.className === 'sg-corner');
+    assert.ok(corner, '图角有说明');
+    assert.match(String(corner.props.children), /1 个块数据不完整/);
+  } finally {
+    serverReply = { ...serverReply, state: null, turns: REMOTE_TURNS };
+  }
+});
+
+test('还在进行中的轮次不算"数据不完整"', async () => {
+  serverReply = {
+    ...serverReply,
+    state: blankState(),
+    turns: {
+      root: [turnAt(1, '已经答完', '回答'), { ...turnAt(2, '刚发出还没答', ''), status: 'open' }],
+      ancor: [], invest: []
+    }
+  };
+  try {
+    const tree = await mountLoaded();
+    assert.equal(elements(tree).filter((n) => typeof (n.props && n.props.className) === 'string'
+      && n.props.className.includes('sg-node-thin')).length, 0, '进行中的轮次不算不完整');
+  } finally {
+    serverReply = { ...serverReply, state: null, turns: REMOTE_TURNS };
   }
 });

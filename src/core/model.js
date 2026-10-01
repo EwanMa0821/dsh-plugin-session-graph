@@ -412,11 +412,18 @@ export function buildGraph(input) {
     });
   });
 
+  /* FR-13：部分块数据不可读时该块降级、其余照常，图角报出条数。
+     判定：提问与回答都读不出**且**这一轮已经结束 —— 还在进行中的轮次
+     本来就只可能有提问，不能算"数据不完整"。 */
+  const incomplete = blocks.filter((b) =>
+    b.status !== 'open' && !str(b.prompt) && !str(b.response)).length;
+
   const stats = {
     sessions: scoped.length,
     blocks: blocks.length,
     hiddenSkipped,
-    edges: edges.length
+    edges: edges.length,
+    incomplete
   };
 
   return {

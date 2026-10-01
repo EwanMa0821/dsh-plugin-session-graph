@@ -835,6 +835,38 @@ test('bounds 把被拖远的块也算进去，适应视图才不会漏掉它', (
   assert.ok(bounds(saved.nodes).maxX > bounds(auto.nodes).maxX + 1000);
 });
 
+/* ------------------------------------------- 数据不完整（FR-13） */
+
+test('提问与回答都读不出来且已结束 → 计入 incomplete', () => {
+  const g = buildGraph({
+    sessions: normalizeSessions([{ id: 'root', title: '根' }]),
+    turnsBySession: {
+      root: [
+        turn(1, '正常提问', '正常回答'),
+        turn(2, '', ''),                                  /* 读不出来 */
+        turn(3, '有提问没回答', '')
+      ]
+    },
+    currentId: 'root'
+  });
+  assert.equal(g.stats.incomplete, 1, '只有第二块算不完整');
+  assert.equal(g.stats.blocks, 3, '不完整的块照样进图，不是丢掉');
+});
+
+test('还在进行中的轮次不算 incomplete', () => {
+  const g = buildGraph({
+    sessions: normalizeSessions([{ id: 'root', title: '根' }]),
+    turnsBySession: {
+      root: [
+        { ...turn(1, '刚发出还没答', ''), status: 'open' },
+        { ...turn(2, '', ''), status: 'failed' }
+      ]
+    },
+    currentId: 'root'
+  });
+  assert.equal(g.stats.incomplete, 1, '进行中的不算，失败且无内容的算');
+});
+
 /* ------------------------------------------------- 规模降级（NFR-1） */
 
 test('tierOf 按块数分档，边界不含糊', () => {
