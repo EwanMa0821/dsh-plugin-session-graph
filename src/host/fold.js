@@ -136,6 +136,14 @@ export function foldTurns(events) {
       return;
     }
     if (type === 'tool/call') { cur.toolCalls += 1; return; }
+    /* 交付物：宿主的已知事件类型表里就有 `deliverables/presented`
+       （`@deepseek-ai/dsh-session` 的 KNOWN_SESSION_EVENT_TYPES），
+       载荷形状照 `@deepseek-ai/dsh-client-ui-deliverables` 的 isPresentedData 是
+       `{ turn, callId, files }` —— **没有**标量计数字段，所以和 tool/call 一样
+       按"一条事件算一次交付"累加。以前这里只在轮次初始化时写过 0、从不累加，
+       界面上的 ⧉ 徽标与「N 个交付物」因此恒为空。
+       不去猜 files.length 之类的字段：猜错就是重新变回恒为 0。 */
+    if (type === 'deliverables/presented') { cur.deliverables += 1; return; }
     if (type === 'turn/end') { flush(seq); }
   });
 

@@ -226,10 +226,43 @@ function normalizeSessions(raw) {
 }
 
 /**
+ * 找出所有「彼此为父」的环成员。
+ *
+ * 从每个会话沿父链上溯，撞回走过的节点就说明这里有环，把环上那一段收下。
+ * 环里的父子关系是自相矛盾的（谁都到不了顶），既不能当普通后代丢在一边，
+ * 也不能随便挑一个当根 —— 挑中的那个会变成"上位"，另一个降成子会话，
+ * 而它们本来就是互指的。挂在环下面的后代不算环成员：那些能正常从环展开。
+ */
+function ringMembersOf(sessions, byId) {
+  const members = new Set();
+  sessions.forEach((s) => {
+    const path = [];
+    const at = new Map();
+    let cur = s.id;
+    while (cur && byId.has(cur)) {
+      if (at.has(cur)) {
+        for (let i = at.get(cur); i < path.length; i += 1) members.add(path[i]);
+        break;
+      }
+      if (members.has(cur)) break;      /* 再往上还是同一个环，不必重走 */
+      at.set(cur, path.length);
+      path.push(cur);
+      const parent = byId.get(cur).parentId;
+      cur = parent && byId.has(parent) ? parent : null;
+    }
+  });
+  return members;
+}
+
+/**
  * 家族范围（FR-3）。
  *
  * 从 currentId 沿 parentId 上溯到无法继续的祖先，再向下展开全部后代。
  * 孤儿（父不在列表）降级为根；血缘成环时把环成员作为根渲染——**绝不丢节点、绝不无限递归**。
+ *
+ * 这里返回的 order 就是 buildGraph 的唯一范围，所以「提示里说已作为根显示、
+ * 实际上却没进 order」等于把这些会话从图、统计、导出里一起抹掉：
+ * 提示必须与范围一致，说显示就真的进 order。
  *
  * @returns {{ rootId: string|null, order: string[], notes: string[], roots: string[] }}
  */
@@ -239,7 +272,7 @@ function familyOf(sessions, currentId) {
     return { rootId: null, order: [], notes: ['当前会话不在会话列表中'], roots: [] };
   }
 
-  /* 上溯：只沿真实存在于列表里的父链走，遇到环就停 */
+  /* 上溯：只沿真实存在于列表里的父链走，撞回走过的节点就是成环，停 */
   const chain = [];
   const seen = new Set();
   let cursor = currentId;
@@ -252,7 +285,21 @@ function familyOf(sessions, currentId) {
   }
   const rootId = chain[chain.length - 1];
 
-  /* 下拓：从根深度优先展开后代，环安全 */
+  /* 根候选 = 正统血缘根 + 孤儿 + 环成员。顺序固定（血缘根在最前），
+     家族范围才不会随遍历顺序抖动。 */
+  const rootIds = [];
+  const addRoot = (id) => { if (id && !rootIds.includes(id)) rootIds.push(id); };
+  addRoot(rootId);
+  /* 孤儿：父会话不在列表里，血缘断了，但它自己就是这一支的根。
+     早先只给提示、不纳入 order —— 提示说"已作为根显示"，其实什么都没显示。 */
+  sessions.forEach((s) => { if (s.parentId && !byId.has(s.parentId)) addRoot(s.id); });
+  /* 成环：环成员谁也到不了顶，全部当根。
+     早先的 `chain.length > byId.size` 判定永远不会触发（chain 里去重过），
+     于是这类会话从图、统计、导出里一起消失且毫无提示。 */
+  const ringers = ringMembersOf(sessions, byId);
+  ringers.forEach(addRoot);
+
+  /* 下拓：从每个根深度优先展开后代，visited 兜住环，绝不重复展开 */
   const order = [];
   const visited = new Set();
   const walk = (id) => {
@@ -265,18 +312,18 @@ function familyOf(sessions, currentId) {
       .sort()
       .forEach(walk);
   };
-  walk(rootId);
+  rootIds.forEach(walk);
 
-  /* 孤儿降级为根 */
   const notes = [];
   sessions.forEach((s) => {
     if (s.parentId && !byId.has(s.parentId)) notes.push(`会话「${s.title}」的父会话已不可见，已作为根显示`);
   });
-  /* 成环检测：上溯长度异常时给出告警 */
-  if (chain.length > byId.size) notes.push('血缘存在环，已按根处理');
+  if (ringers.size) {
+    const names = sessions.filter((s) => ringers.has(s.id)).map((s) => `「${s.title}」`);
+    notes.push(`血缘存在环（${names.join('、')}），环上会话已作为根显示`);
+  }
 
-  const roots = [rootId];
-  return { rootId, order, notes, roots };
+  return { rootId, order, notes, roots: rootIds };
 }
 
 /**
@@ -666,10 +713,13 @@ function fitView(nodes, viewportWidth, viewportHeight, padding = 48) {
  * 键盘在相邻块之间移动选中（FR-5 / NFR-5）。
  * 只在按键方向的 ±45° 锥内取候选，命中后再按「同轴优先」打分——
  * 否则在列末按方向键会跳到邻列去，观感上是乱飞。
+ *
+ * **只在块之间走**：需求写的就是「在相邻块之间移动选中」，会话头不是块 ——
+ * 选中它右栏没有任何块级信息可给，只会让详情面板空掉。
  * @returns {string|null} 下一个节点 id；无处可去时返回 null
  */
 function moveSelection(nodes, selectedId, key) {
-  const walkable = nodes.filter((n) => n.kind === 'block' || n.kind === 'header');
+  const walkable = nodes.filter((n) => n.kind === 'block');
   if (!walkable.length) return null;
   const cur = walkable.find((n) => n.id === selectedId) || walkable[0];
   const dir = { ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] }[key];
@@ -711,7 +761,17 @@ function moveSelection(nodes, selectedId, key) {
 
 const FORMATS = ['mm', 'md'];
 
+/**
+ * XML 1.0 的 Char 不允许的字符：C0 控制字符（\t \n \r 例外）与 U+FFFE/U+FFFF。
+ *
+ * 真实会话正文里带着 ANSI 转义（ESC = U+001B）与 NUL，只转义 & < > " ' 是拦不住它们的 ——
+ * 结果是**整个 .mm 文件都不是合法 XML**（不是少一行，是解析器直接罢工）。
+ * 所以这里直接丢掉，而不是换成实体：这些字符在思维导图里也没有任何可显示的含义。
+ */
+const XML_ILLEGAL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]/g;
+
 const escXml = (v) => String(v === undefined || v === null ? '' : v)
+  .replace(XML_ILLEGAL, '')
   .replace(/&/g, '&amp;')
   .replace(/</g, '&lt;')
   .replace(/>/g, '&gt;')
@@ -734,8 +794,14 @@ function inlineHtml(text) {
     .replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, '<a href="$2">$1</a>');
 }
 
-/** 表格分隔行（`|---|---|`）在思维导图里只是噪声，丢掉 */
-const isTableRule = (line) => /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line) && line.includes('-');
+/**
+ * 表格分隔行（`|---|---|`）在思维导图里只是噪声，丢掉。
+ *
+ * 必须**同时**含 `|` 才算分隔行：早先只按"字符全在 [\s:|-] 里且至少一个 -"判断，
+ * 于是 `---`、`--` 这类 Markdown 水平线也被当成表格规则吃掉 —— 那是一行真内容。
+ */
+const isTableRule = (line) =>
+  line.includes('|') && /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line);
 
 /**
  * 把一段 Markdown 正文逐行转成 `<p>`，首行带标签（如「问」）。返回**数组**，
@@ -782,10 +848,25 @@ function stamp(at) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/** 文件名安全化：路径非法字符替换、长度截断、空标题回落 */
+/**
+ * 去掉孤立代理码元。
+ *
+ * 截断救不了输入本身就畸形的标题（正文被截过、上游拼接出错等），
+ * 而孤立代理会让 encodeURIComponent 抛 URIError —— 下载链接根本拼不出来。
+ */
+const stripLoneSurrogates = (s) => s
+  .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
+  .replace(/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '$1');
+
+/**
+ * 文件名安全化：路径非法字符替换、长度截断、空标题回落。
+ *
+ * 截断必须按**码点**，不能按 UTF-16 码元：`'x'.repeat(59) + '😀'` 这类标题
+ * 切在 60 个码元上会留下半个代理对（0xD83D），随后 encodeURIComponent 抛 URIError。
+ */
 function safeFilename(title, fallback = 'session-graph') {
   const base = plain(title).replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim();
-  return (base || fallback).slice(0, 60);
+  return stripLoneSurrogates([...(base || fallback)].slice(0, 60).join(''));
 }
 
 /** 导出文件名：`会话图谱-<家族根标题>.mm|.md` */
@@ -835,13 +916,56 @@ function buildTree(graph, options = {}) {
      被引用拉进来的会话不算根 —— 它们挂在源块之下（refsAt），
      否则同一个会话会在导出结果里出现两遍。 */
   const pulled = new Set(graph.referenced || []);
-  const roots = graph.order
+  const baseRoots = graph.order
     .map((id) => bySession.get(id))
     .filter((s) => s && !pulled.has(s.id) && (!s.parentId || !bySession.has(s.parentId)));
 
+  const childrenOf = new Map();
+  graph.sessions.forEach((s) => {
+    if (!s.parentId) return;
+    if (!childrenOf.has(s.parentId)) childrenOf.set(s.parentId, []);
+    childrenOf.get(s.parentId).push(s.id);
+  });
+
+  /* 哪些会话真的会被画出来？从根往下走一遍：子会话全部会挂上，而**只有可见块的
+     引用连线才拉得动会话** —— 源块被隐藏时 buildGraph 根本不生成那条引用边（FR-11）。
+     早先没有这一步，只把"源块 id 命中"当唯一出口：源块一被隐藏，被引用的会话
+     既不是根、也没有挂载点，于是一整个会话从 .mm/.md 里消失，连一句提示都没有。 */
+  const live = new Set();
+  const mark = (seed) => {
+    const stack = seed.map((s) => s.id);
+    while (stack.length) {
+      const sid = stack.pop();
+      if (!sid || live.has(sid) || !bySession.has(sid)) continue;
+      live.add(sid);
+      (childrenOf.get(sid) || []).forEach((id) => stack.push(id));
+      blocksOf(sid).forEach((b) => refsAt(b.id).forEach((id) => stack.push(id)));
+    }
+  };
+  mark(baseRoots);
+
+  /* order 里的会话必须**恰好出现一次**：没被任何节点接住的（引用源块被隐藏、
+     血缘成环谁也不是根）补成根，绝不静默丢节点。 */
+  const extraRoots = graph.order
+    .map((id) => bySession.get(id))
+    .filter((s) => s && !live.has(s.id));
+  mark(extraRoots);
+  const roots = [...baseRoots, ...extraRoots];
+
+  /* 同一个会话只能出现在一处：补出来的根与树内挂载可能指向同一个会话
+     （成环、同一条引用被多块引用），渲染期用这个集合兜住"恰好一次"。 */
+  const rendered = new Set();
+  const enter = (sid) => {
+    if (rendered.has(sid)) return false;
+    rendered.add(sid);
+    return true;
+  };
+
   const skipped = [];
   const keptLinks = [];
-  const visible = new Set(graph.blocks.map((b) => b.id));
+  /* 只有真的会被输出的块才算"可见"。按 graph.blocks 判断会造出指向不存在节点的
+     `<arrowlink DESTINATION>` —— 悬空目标在思维导图里是硬错误，不是少画一条线。 */
+  const visible = new Set(graph.blocks.filter((b) => live.has(b.sessionId)).map((b) => b.id));
   links.forEach((l) => {
     if (l.kind === 'reference') return;                       /* 引用关系已由树结构表达 */
     if (visible.has(l.from) && visible.has(l.to)) keptLinks.push(l);
@@ -854,7 +978,11 @@ function buildTree(graph, options = {}) {
     linkFrom.get(l.from).push(l);
   });
 
-  return { roots, blocksOf, childrenAt, leftoverChildren, refsAt, keptLinks, linkFrom, skipped };
+  return {
+    roots, blocksOf, childrenAt, leftoverChildren, refsAt, keptLinks, linkFrom, skipped, enter,
+    /* 被引用拉进来、却因源块不可见而只能当根的会话：导出里要给出诚实提示 */
+    promotedRoots: extraRoots.filter((s) => pulled.has(s.id))
+  };
 }
 
 /* ------------------------------------------------------------------ .mm */
@@ -918,6 +1046,8 @@ function toFreeMind(graph, options = {}) {
 
   function sessionNode(s, depth, mode) {
     if (!s) return;
+    /* 同一个会话只画一次：补出来的根与树内挂载可能指向同一个会话（成环、重复引用） */
+    if (!tree.enter(s.id)) return;
     const ref = mode === 'ref';
     const label = ref && /^引用[:：]/.test(s.title) ? s.title : (ref ? `引用：${s.title}` : s.title);
     out.push(`${pad(depth)}<node TEXT="${escXml(label)}" ID="${idOf(`S:${s.id}`)}">`);
@@ -948,6 +1078,10 @@ function toFreeMind(graph, options = {}) {
     '分叉出来的会话挂在它的分叉源块之下；手动连线导出为箭头链接。'
   ];
   if (graph.stats.hiddenSkipped) note.push(`有 ${graph.stats.hiddenSkipped} 个块因被隐藏而未导出。`);
+  /* 引用源块被隐藏时，被引用的会话只能当根 —— 这件事必须说出来，不能悄悄改变结构 */
+  if (tree.promotedRoots.length) {
+    note.push(`有 ${tree.promotedRoots.length} 个被引用的会话因源块不可见，已作为根导出。`);
+  }
   tree.keptLinks.forEach((l) => note.push(`连线：${l.from} → ${l.to}${l.label ? `（${l.label}）` : ''}`));
   tree.skipped.forEach((l) => note.push(`未导出的连线：${l.from} → ${l.to}${l.label ? `（${l.label}）` : ''}`));
   rich('NOTE', 1, note.map((n) => `<p>${escXml(n)}</p>`));
@@ -976,6 +1110,10 @@ function toMarkdown(graph, options = {}) {
   out.push(`> 导出时间 ${options.stamp || stamp()} · 会话 ${graph.stats.sessions} 个 · 块 ${graph.stats.blocks} 个`);
   out.push('>');
   out.push('> 每个块内用 **问** / **答** 两段区分用户提问与助手回答，正文按其原有 Markdown 结构缩进呈现。', '');
+  /* 引用源块被隐藏时，被引用的会话只能当根 —— 这件事必须说出来，不能悄悄改变结构 */
+  if (tree.promotedRoots.length) {
+    out.push(`> 有 ${tree.promotedRoots.length} 个被引用的会话因源块不可见，已作为根导出。`, '');
+  }
 
   function blockItem(block, depth) {
     const alias = block.alias ? `（${block.alias}）` : '';
@@ -994,6 +1132,8 @@ function toMarkdown(graph, options = {}) {
 
   function sessionItem(s, depth, mode) {
     if (!s) return;
+    /* 同一个会话只列一次：补出来的根与树内挂载可能指向同一个会话（成环、重复引用） */
+    if (!tree.enter(s.id)) return;
     const mark = mode === 'ref' ? '🔗 引用' : '⑂ 分叉';
     const label = mode === 'ref' ? s.title.replace(/^引用[:：]\s*/, '') : s.title;
     out.push(`${ind(depth)}- **${mark} → ${label}**`);
@@ -1004,6 +1144,8 @@ function toMarkdown(graph, options = {}) {
   }
 
   tree.roots.forEach((s) => {
+    /* 补根与树内挂载可能撞到同一个会话：先到先画，后到的跳过 */
+    if (!tree.enter(s.id)) return;
     out.push(`## ${s.title}`, '');
     tree.blocksOf(s.id).forEach((b) => blockItem(b, 0));
     tree.leftoverChildren(s.id).forEach((c) => sessionItem(c, 0, 'fork'));
@@ -1216,11 +1358,18 @@ function mergePatch(state, patch, now = 0) {
   if ('links' in patch) {
     const incoming = (Array.isArray(patch.links) ? patch.links : [])
       .slice(0, LIMITS.links).map((l) => sxSanitizeLink(l, now)).filter(Boolean);
-    /* 按 id 覆盖式合并：同一 id 视为更新，其它保留 —— 这样客户端可以只发变化的那几条 */
+    /* 按 id 覆盖式合并：同一 id 视为更新，其它保留 —— 这样客户端可以只发变化的那几条。
+       注意 label **以 patch 为准（缺键 = 清空）**：客户端表达"这条连线没有标签"就是
+       把 label 键删掉（见 src/client/app.js 的 labelLink: `const { label: _drop, ...rest } = l`），
+       而 `{ ...prev, ...l }` 会把"缺键"读成"保留旧值"，于是清空标签永远落不了盘 ——
+       界面上删掉、刷新又回来。createdAt 仍保留首次写入的时间。 */
     const byId = new Map(base.links.map((l) => [l.id, l]));
     incoming.forEach((l) => {
       const prev = byId.get(l.id);
-      byId.set(l.id, prev ? { ...prev, ...l, createdAt: prev.createdAt, updatedAt: now } : l);
+      if (!prev) { byId.set(l.id, l); return; }
+      const merged = { ...prev, ...l, createdAt: prev.createdAt, updatedAt: now };
+      if (!('label' in l)) delete merged.label;
+      byId.set(l.id, merged);
     });
     next.links = [...byId.values()].slice(0, LIMITS.links);
   }
@@ -1747,6 +1896,8 @@ function flatten(locales) {
 
 /* 视图切走会卸载组件；选中块放在模块级 Map 里，重挂载时恢复（验收 13） */
 const lastSelection = new Map();
+/* 折叠状态同理（验收：离开再回来保留折叠状态） */
+const lastCollapsed = new Map();
 
 const NS = 'dsh-plugin-session-graph';
 const TARGET = 'session-graph';
@@ -1771,6 +1922,39 @@ function markdownLabels(t) {
     },
     footnotes: t('md.footnotes')
   };
+}
+
+/** 宿主的本地化解析器；服务缺席时返回 null，由 makeT 退到本地字典 */
+function localeResolver(ctx) {
+  const svc = ctx && ctx.locale;
+  return svc && typeof svc.resolveText === 'function' ? (text) => svc.resolveText(text) : null;
+}
+
+/** 当前语言。槽位 label 由宿主在模块作用域调用，拿不到组件订阅的快照，所以现读一次 */
+function activeLocaleOf(ctx) {
+  try {
+    const svc = ctx && ctx.locale;
+    const snap = svc && typeof svc.getSnapshot === 'function' ? svc.getSnapshot() : null;
+    if (snap && typeof snap.active === 'string' && snap.active) return snap.active;
+  } catch { /* 取不到就用默认语言 */ }
+  return 'zh';
+}
+
+/**
+ * 视图标签。**必须是模块作用域可用的函数**。
+ *
+ * 宿主取标签时直接调用这个 thunk：`viewTabs()` → `resolveSlotLabel(label)` → `label()`，
+ * 而它对函数标签**没有任何兜底**（`typeof label === "function" ? label() : label`）。
+ * 调用时机也跟组件无关：注册槽位时、**切换会话时**（`activateView` 里又取一次 viewTabs）、
+ * 换语言时都会跑。
+ *
+ * 早先这里写成 `() => t('view.title')`，而 `t` 只活在 GraphView 组件作用域里 ——
+ * 于是宿主一取标签就抛 `ReferenceError: t is not defined`，`activateView` 直接失败：
+ * 会话切不动，输入框也跟着废掉。一个标签把整个对话界面带崩，就是这么来的。
+ * 所以这里**按当前语言现取**：优先走宿主解析器，缺服务时用本地字典（语义与组件内一致）。
+ */
+function viewLabel(ctx) {
+  return makeT(activeLocaleOf(ctx), localeResolver(ctx))('view.title');
 }
 
 /** 正文渲染：优先用宿主的渲染器，缺失时退回纯文本 */
@@ -2072,13 +2256,10 @@ function GraphView(props) {
      服务不可用时用本地字典，语义与宿主 resolveText 一致（缺键回退英文）。 */
   const localeSnap = useSource(ctx && ctx.locale);
   const activeLocale = (localeSnap && localeSnap.active) || 'zh';
-  const t = React.useMemo(() => {
-    const svc = ctx && ctx.locale;
-    const resolver = svc && typeof svc.resolveText === 'function'
-      ? (text) => svc.resolveText(text)
-      : null;
-    return makeT(activeLocale, resolver);
-  }, [ctx, activeLocale]);
+  const t = React.useMemo(
+    () => makeT(activeLocale, localeResolver(ctx)),
+    [ctx, activeLocale]
+  );
   /** 数字按当前语言排版（NFR-3 第三条） */
   const fmtNum = React.useCallback(
     (n) => formatNumber(n, activeLocale),
@@ -2101,15 +2282,26 @@ function GraphView(props) {
   /* 正在拖动中的块：{ id, x, y }，只在本地生效，松手才落盘 */
   const [draggingBlock, setDraggingBlock] = React.useState(null);
   /* 骨架档下用户显式展开的会话（NFR-1：其余按需展开） */  const [expandedSessions, setExpandedSessions] = React.useState([]);
+  /* 用户显式折叠的会话（FR-11）。这是**自有数据**，要落盘（§5.2 的 collapsedSessions），
+     否则切走再回来折叠状态就没了（验收：离开再回来保留折叠状态）。 */
+  const [collapsedSessions, setCollapsedSessions] = React.useState(
+    () => (sessionId && lastCollapsed.get(sessionId)) || []
+  );
+  /* 折叠状态也要活过组件重挂载（切视图会卸载），与选中块同一处理 */
+  React.useEffect(() => {
+    if (sessionId) lastCollapsed.set(sessionId, collapsedSessions);
+  }, [sessionId, collapsedSessions]);
+  /* 正在编辑的连线标签：{ id, value }。**编辑期间不落盘** ——
+     原先每敲一个字符就 remember() + persist() 一次，撤销变成"退回一个字符"，
+     而且 50 步历史会被一次输入冲光。改名输入框早就是这样先攒后提交的。 */
+  const [labelDraft, setLabelDraft] = React.useState(null);
   const isExpanded = React.useCallback(
     (sid) => expandedSessions.indexOf(sid) >= 0,
     [expandedSessions]
   );
-  const toggleExpanded = React.useCallback((sid) => {
-    setExpandedSessions((list) => (list.indexOf(sid) >= 0
-      ? list.filter((x) => x !== sid)
-      : [...list, sid]));
-  }, []);
+  /* 平移画布之后浏览器仍会补一个 click（mouseup 之后必到），落在会话头上就会顺带切会话。
+     用这个 ref 把"拖出来的那一次 click"吃掉：按下时清、拖动了才置位。 */
+  const suppressClickRef = React.useRef(false);
   /* 上一次布局耗时，供慢布局提示用 */
   const lastLayoutMsRef = React.useRef(0);
   /* 跨会话定位的待办：切完会话后还要切视图（FR-14） */
@@ -2148,6 +2340,20 @@ function GraphView(props) {
     return () => ro.disconnect();
   }, []);
 
+  /* React 把 onWheel 注册成**被动**监听（facebook/react#19654），
+     所以 onWheel 里那句 preventDefault 其实是空操作：滚轮会一边缩放、
+     一边把外层容器滚走。这里补一个非被动的原生监听，只负责掐掉默认滚动；
+     缩放逻辑仍由 React 的 onWheel 做，两处不重复执行缩放。 */
+  React.useEffect(() => {
+    const el = hostRef.current;
+    if (!el || typeof el.addEventListener !== 'function') return undefined;
+    const stopScroll = (ev) => { if (typeof ev.preventDefault === 'function') ev.preventDefault(); };
+    el.addEventListener('wheel', stopScroll, { passive: false });
+    return () => {
+      if (typeof el.removeEventListener === 'function') el.removeEventListener('wheel', stopScroll);
+    };
+  }, []);
+
   /* 每次数据变化重建图模型。
      会话规范化本身也可能炸（宿主给的列表快照结构不对），
      它不能直接抛 —— FR-13 要求异常不得抛出视图之外，否则整页白屏。
@@ -2161,6 +2367,19 @@ function GraphView(props) {
   }, [listSnapshot]);
   const sessionsNorm = norm.sessions;
   const sessionKey = sessionsNorm.map((s) => s.id).join(',');
+  /* `sessions=` 只报**家族内**的会话。
+     它的用途是把 Host 活跃列表里没有的家族成员补进来（例如已归档的父会话），
+     而不是"请把整个目录都读一遍" —— 报全量会让 Host 侧"按家族收敛取数"的优化失效，
+     点一个骨架块又变成重读整库（实测 40 会话 × 50 轮时会回传 1.8 MB）。 */
+  const familyKey = React.useMemo(() => {
+    if (!sessionId) return '';
+    try {
+      const order = familyOf(sessionsNorm, sessionId).order;
+      return order.length ? order.join(',') : sessionKey;
+    } catch {
+      return sessionKey;                     /* 家族算不出来时退回全量，宁可慢不要漏 */
+    }
+  }, [sessionsNorm, sessionId, sessionKey]);
   const localTurns = React.useMemo(
     () => turnsFromTimeline(graphSnapshot && graphSnapshot.timeline),
     [graphSnapshot]
@@ -2180,14 +2399,25 @@ function GraphView(props) {
   const savedViewportRef = React.useRef(null);
   /* 存档读回来之前禁止写：否则首帧的空状态会把已存的隐藏/别名冲掉 */
   const loadedRef = React.useRef(false);
+  /* 还没落盘的键（攒在防抖里或请求在飞）。取数 effect 要用它，所以声明在 effect **之前**：
+     它既在 effect 体里被调用，也在依赖数组里被求值，放后面会踩 TDZ。 */
+  const pendingKeysRef = React.useRef(null);
+  /** 取数回来时：还没落盘的键不能被存档覆盖（否则改动会"自己变回去"） */
+  const freshFromServer = React.useCallback(
+    (key) => !(pendingKeysRef.current && pendingKeysRef.current.has(key)),
+    []
+  );
 
   React.useEffect(() => {
-    if (!sessionId) return undefined;
+    /* 没有可用的会话 id：不要停在"首次装配中"的骨架屏上等一辈子。
+       原先这里直接 return，`loaded` 永远是 false，而空家族的骨架屏判定
+       `!loaded && blocks === 0` 恒成立 —— 界面就一直转，什么都不会发生。 */
+    if (!sessionId) { loadedRef.current = true; setLoaded(true); return undefined; }
     let alive = true;
     const url = '/api/session.graph-export'
       + '?format=json'
       + '&sessionId=' + encodeURIComponent(sessionId)
-      + (sessionKey ? '&sessions=' + encodeURIComponent(sessionKey) : '')
+      + (familyKey ? '&sessions=' + encodeURIComponent(familyKey) : '')
         + (fullIds.length ? '&full=' + encodeURIComponent(fullIds.slice(-400).join(',')) : '');
     const carrier = typeof fetch === 'function' ? fetch : null;
     if (!carrier) { setRouteOk(false); setLoaded(true); return undefined; }
@@ -2206,12 +2436,17 @@ function GraphView(props) {
           .filter((b) => b && b.skeleton)
           .map((b) => b.id)));
         if (typeof data.rootId === 'string') familyRef.current = data.rootId;
-        /* 存档是基线，界面上的改动在此之上叠加 */
+        /* 存档是基线，界面上的改动在此之上叠加。
+           但**还没落盘的键**（攒在防抖里或请求在飞）不能被存档覆盖 ——
+           否则"点了隐藏 → 顺手点个骨架块触发取数"就会把改动还原回去。 */
         const saved = data.state || null;
-        setHidden(saved && saved.hidden ? saved.hidden : {});
-        setAlias(saved && saved.alias ? saved.alias : {});
-        setLinks(saved && saved.links ? saved.links : []);
-        setPositions(saved && saved.positions ? saved.positions : {});
+        if (freshFromServer('hiddenBlocks')) setHidden(saved && saved.hidden ? saved.hidden : {});
+        if (freshFromServer('alias')) setAlias(saved && saved.alias ? saved.alias : {});
+        if (freshFromServer('links')) setLinks(saved && saved.links ? saved.links : []);
+        if (freshFromServer('positions')) setPositions(saved && saved.positions ? saved.positions : {});
+        if (freshFromServer('collapsedSessions')) {
+          setCollapsedSessions((saved && Array.isArray(saved.collapsedSessions)) ? saved.collapsedSessions : []);
+        }
         setWritable(data.writable !== false);
         setIncompatible(!!data.incompatible);
         savedViewportRef.current = (saved && saved.viewport) || null;
@@ -2225,7 +2460,7 @@ function GraphView(props) {
         setLoaded(true);
       });
     return () => { alive = false; };
-  }, [sessionId, sessionKey, reloadNonce, fullIds]);
+  }, [sessionId, familyKey, reloadNonce, fullIds, freshFromServer]);
 
   /* 重试：清掉旧状态并重新取数（FR-13 验收 3「重试可恢复」） */
   const retry = React.useCallback(() => {
@@ -2241,39 +2476,80 @@ function GraphView(props) {
     setFullIds((list) => (list.indexOf(id) >= 0 ? list : [...list, id]));
   }, []);
 
-  /* 写回：交互写入按帧合并后节流提交（§5.3 的写入策略） */
+  /* 写回：交互写入按帧合并后节流提交（§5.3 的写入策略）。
+     四条硬约束，前三条都是踩过的坑：
+
+     1. **同一时刻只能有一个 POST 在飞。** Host 侧是"读-改-写"，两个请求并发时
+        后一个会拿着旧状态覆盖前一个 —— 实测会整片丢掉 hiddenBlocks。
+     2. **removeLinkIds 要取并集。** 原先用对象展开合并，后一次删除会把前一次的 id
+        覆盖掉；而 links 在 Host 侧是按 id 合并的，被覆盖掉的那条连线于是在存档里"复活"。
+     3. **记下哪些键还没落盘。** 取数是异步的，回来时若无条件用存档覆盖内存状态，
+        刚做的改动会在一次取数后自己变回去。
+     4. 报错文案要跟着语言走：原先 `t` 被 useCallback([]) 关在初次渲染的闭包里，
+        换语言后写失败提示仍是旧语言。 */
   const writableRef = React.useRef(true);
   writableRef.current = writable;
+  const tRef = React.useRef(t);
+  tRef.current = t;
   const pendingRef = React.useRef(null);
   const timerRef = React.useRef(null);
+  const inFlightRef = React.useRef(false);
+
+  /** 合并两次增量：键覆盖，removeLinkIds 取并集 */
+  const mergePayload = (prev, payload) => {
+    const out = { ...(prev || {}), ...payload };
+    if (prev && Array.isArray(prev.removeLinkIds) && Array.isArray(payload.removeLinkIds)) {
+      out.removeLinkIds = [...new Set([...prev.removeLinkIds, ...payload.removeLinkIds])];
+    }
+    return out;
+  };
+
+  /** 发一批增量（串行：有请求在飞就先不发，等它落地再发） */
+  const sendPending = React.useCallback(() => {
+    if (inFlightRef.current) return;
+    const body = pendingRef.current;
+    pendingRef.current = null;
+    if (!body || !familyRef.current || typeof fetch !== 'function') return;
+    inFlightRef.current = true;
+    /* 这一批涉及的键：**请求落地前一直算"脏"**，期间取数回来不能拿存档覆盖它们。
+       只清这一批 —— 飞行期间新攒的键要留着。 */
+    const sentKeys = pendingKeysRef.current ? [...pendingKeysRef.current] : [];
+    const settle = () => {
+      inFlightRef.current = false;
+      if (pendingKeysRef.current) sentKeys.forEach((k) => pendingKeysRef.current.delete(k));
+      /* 飞行期间又攒了增量：接着发，仍然串行 */
+      if (pendingRef.current && !timerRef.current) sendPending();
+    };
+    fetch('/api/session.graph-export', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ familyRootId: familyRef.current, patch: body })
+    }).then((r) => {
+      if (r && r.ok) { setSaveError(''); return; }
+      /* 提交失败：保留内存状态并标记未保存，而不是回滚用户刚做的操作 */
+      setSaveError(r && r.status === 409
+        ? tRef.current('ro.writeFailedIncompatible')
+        : tRef.current('ro.writeFailed'));
+      if (r && r.status === 409) setIncompatible(true);
+    }).catch(() => setSaveError(tRef.current('ro.writeFailed'))).finally(settle);
+  }, []);
+
   const persist = React.useCallback((patch) => {
     if (!loadedRef.current || !writableRef.current) return;
     const payload = clientPatchToState(patch);
     if (!Object.keys(payload).length) return;
-    pendingRef.current = { ...(pendingRef.current || {}), ...payload };
+    pendingRef.current = mergePayload(pendingRef.current, payload);
+    const keys = pendingKeysRef.current || (pendingKeysRef.current = new Set());
+    Object.keys(payload).forEach((k) => keys.add(k));
     if (timerRef.current) return;
-    timerRef.current = setTimeout(() => {
-      timerRef.current = null;
-      const body = pendingRef.current;
-      pendingRef.current = null;
-      if (!body || !familyRef.current || typeof fetch !== 'function') return;
-      fetch('/api/session.graph-export', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ familyRootId: familyRef.current, patch: body })
-      }).then((r) => {
-        if (r && r.ok) { setSaveError(''); return; }
-        /* 提交失败：保留内存状态并标记未保存，而不是回滚用户刚做的操作 */
-        setSaveError(r && r.status === 409 ? t('ro.writeFailedIncompatible') : t('ro.writeFailed'));
-        if (r && r.status === 409) setIncompatible(true);
-      }).catch(() => setSaveError(t('ro.writeFailed')));
-    }, 400);
-  }, []);
+    timerRef.current = setTimeout(() => { timerRef.current = null; sendPending(); }, 400);
+  }, [sendPending]);
 
   const clearPending = React.useCallback(() => {
     if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
     pendingRef.current = null;
+    pendingKeysRef.current = null;
   }, []);
   React.useEffect(() => () => clearPending(), [clearPending]);
 
@@ -2334,10 +2610,31 @@ function GraphView(props) {
   /* 规模降级（NFR-1）：按块数选档，越大的档省得越多 */
   const tier = graph && !graph.error ? tierOf(graph.stats.blocks) : 'full';
   const feats = tierFeatures(tier);
-  /* 骨架档下哪些会话的块要画；null 表示不限 */
-  const blockSessions = graph && !graph.error
+  /* 档位允许画块的会话；null 表示不限 */
+  const tierSessions = graph && !graph.error
     ? sessionsWithBlocks(graph.sessions, tier, sessionId, expandedSessions)
     : null;
+  /* 会话折叠（FR-5 / FR-11）：折叠非当前会话的块，只留会话头与指向它的派生边。
+     两个来源 —— 工具条的「折叠其他会话」是临时密度开关（像「显示已隐藏」一样不入存档），
+     会话头上的 ▾ 是用户对单个会话的显式折叠（入存档，切走再回来还在）。
+     当前会话永不折叠：正在跟的那条线不该被藏起来。 */
+  const collapseAllOthers = collapseOthers || collapsedSessions.length > 0;
+  const blockSessions = (() => {
+    if (!graph || graph.error) return null;
+    if (!tierSessions && !collapseAllOthers) return null;
+    const out = new Set(tierSessions || graph.sessions.map((s) => s.id));
+    if (collapseOthers) {
+      for (const s of graph.sessions) {
+        if (s.id !== sessionId && !isExpanded(s.id)) out.delete(s.id);
+      }
+    }
+    for (const id of collapsedSessions) {
+      if (id !== sessionId) out.delete(id);
+    }
+    out.add(sessionId);
+    return out;
+  })();
+
   /* 布局慢过预算就提示（NFR-1 的第三条阈值） */
   const [slowLayout, setSlowLayout] = React.useState(false);
   React.useEffect(() => {
@@ -2409,30 +2706,32 @@ function GraphView(props) {
 
   /* ------------------------------------------------------------ 撤销 */
 
-  /* 快照式撤销：这三份自有数据就是全部可变状态，量也小，
+  /* 快照式撤销：这几份自有数据就是全部可变状态，量也小，
      与其为每种操作写一个逆操作，不如存一份快照。上限 50 步。 */
   const historyRef = React.useRef([]);
   const [canUndo, setCanUndo] = React.useState(false);
 
   /** 在任何变更**之前**调用 */
   const remember = React.useCallback(() => {
-    historyRef.current.push({ hidden, alias, links, positions });
+    historyRef.current.push({ hidden, alias, links, positions, collapsedSessions });
     if (historyRef.current.length > 50) historyRef.current.shift();
     setCanUndo(true);
-  }, [hidden, alias, links, positions]);
+  }, [hidden, alias, links, positions, collapsedSessions]);
 
   /** 把界面与存档一起恢复到某个快照；多出来的连线要显式删掉 */
   const applySnapshot = React.useCallback((snap) => {
     const keep = new Set(snap.links.map((l) => l.id));
     const removeLinkIds = links.filter((l) => !keep.has(l.id)).map((l) => l.id);
     const nextPositions = snap.positions || {};
+    const nextCollapsed = Array.isArray(snap.collapsedSessions) ? snap.collapsedSessions : [];
     setHidden(snap.hidden);
     setAlias(snap.alias);
     setLinks(snap.links);
     setPositions(nextPositions);
+    setCollapsedSessions(nextCollapsed);
     persist({
       hidden: snap.hidden, alias: snap.alias, links: snap.links,
-      positions: nextPositions, removeLinkIds
+      positions: nextPositions, collapsedSessions: nextCollapsed, removeLinkIds
     });
   }, [links, persist]);
 
@@ -2442,6 +2741,30 @@ function GraphView(props) {
     if (!snap) { say(t('toolbar.nothingToUndo')); return; }
     applySnapshot(snap);
   }, [applySnapshot, say]);
+
+  /* ---- 会话折叠（FR-5 / FR-11）----
+     放在撤销之后：它要用到 remember（TDZ，声明顺序不能反）。 */
+
+  /** 这个会话的块现在是否被折叠了 */
+  const isCollapsed = React.useCallback((sid) => {
+    if (!sid || sid === sessionId) return false;
+    return !!blockSessions && !blockSessions.has(sid);
+  }, [blockSessions, sessionId]);
+
+  /** 会话头 ▸/▾：展开 = 从折叠集合里拿掉并记进"显式展开"；折叠 = 反过来 */
+  const toggleSession = React.useCallback((sid) => {
+    if (!sid || sid === sessionId) return;
+    const nowCollapsed = !!blockSessions && !blockSessions.has(sid);
+    const nextCollapsed = nowCollapsed
+      ? collapsedSessions.filter((x) => x !== sid)
+      : (collapsedSessions.indexOf(sid) >= 0 ? collapsedSessions : [...collapsedSessions, sid]);
+    remember();
+    setExpandedSessions((list) => (nowCollapsed
+      ? (list.indexOf(sid) >= 0 ? list : [...list, sid])
+      : list.filter((x) => x !== sid)));
+    setCollapsedSessions(nextCollapsed);
+    persist({ collapsedSessions: nextCollapsed });
+  }, [blockSessions, collapsedSessions, persist, remember, sessionId]);
 
   /** 建立一条手动连线（FR-9），随后弹出标签输入框 */
   const createLink = React.useCallback((from, to, at) => {
@@ -2459,6 +2782,9 @@ function GraphView(props) {
   /** 写入某条连线的标签；空字符串即清除标签 */
   const labelLink = React.useCallback((id, value) => {
     const text = String(value === undefined || value === null ? '' : value).trim().slice(0, 120);
+    const target = links.find((l) => l.id === id);
+    /* 没改就不写：点进输入框又点走不该占一格撤销、也不该发一次 POST */
+    if (target && String(target.label || '').trim() === text) return;
     const next = links.map((l) => {
       if (l.id !== id) return l;
       if (text === '') { const { label: _drop, ...rest } = l; return rest; }
@@ -2472,6 +2798,7 @@ function GraphView(props) {
   /** 重命名（FR-11）：写入别名；留空即恢复自动标题 */
   const renameBlock = React.useCallback((id, value) => {
     const text = String(value === undefined || value === null ? '' : value).trim().slice(0, 120);
+    if (String(alias[id] || '').trim() === text) { setRenaming(null); return; }
     const next = { ...alias };
     if (text === '') delete next[id];
     else next[id] = text;
@@ -2603,6 +2930,8 @@ function GraphView(props) {
       loadTurn(hit);
     }
     const node = hit ? nodeMap.get(hit) : null;
+    /* 新手势开始：上一次留下的"吃掉这次 click"标记要清掉 */
+    suppressClickRef.current = false;
     /* 拖块 = 移动块，拖空白 = 平移（FR-5）。块上起手不再平移 ——
        那会让"想挪块"变成"整张图跑掉"。 */
     drag.current = node && node.kind === 'block'
@@ -2680,6 +3009,9 @@ function GraphView(props) {
         return;
       }
 
+      /* 拖出来的平移不要顺带当成"点了一下会话头"：mouseup 之后浏览器必补一个 click */
+      if (d && d.kind === 'pan' && d.moved) suppressClickRef.current = true;
+
       /* 空白处单击（且没拖动）才清选中；点在块上时选中已在按下时给过了 */
       if (d && !d.moved && !d.id) setSelected(null);
     };
@@ -2720,26 +3052,29 @@ function GraphView(props) {
 
   /* ---- 动作 ---- */
   const doFork = React.useCallback((sid, turn) => {
+    if (!graph || graph.error) return;
     const block = graph.blocks.find((b) => b.sessionId === sid && b.turn === turn);
     if (block && block.status === 'open') { say(t('fork.openTurn')); return; }
     const atSeq = block ? block.endSeq : null;
     if (atSeq === null || atSeq === undefined) { say(t('fork.noBoundary')); return; }
+    const titles = graph.sessions.map((s) => s.title);
+    const src = graph.sessions.find((s) => s.id === sid);
+    const childTitle = src ? uniqueTitle(src.title, titles) : undefined;
+    const done = () => say(t('fork.done', { turn }) + (childTitle ? ' → ' + childTitle : ''));
+    const failed = (err) => {
+      const code = err && err.rpcError ? err.rpcError.code : '';
+      if (code === 'session/fork-unavailable') say(t('fork.noneAvailable'));
+      else if (code === 'session/not-found') say(t('fork.sourceUnavailable'));
+      else say(t('fork.failed', { msg: err && err.message ? err.message : String(err) }));
+    };
     try {
-      const titles = graph.sessions.map((s) => s.title);
-      const src = graph.sessions.find((s) => s.id === sid);
-      const childTitle = src ? uniqueTitle(src.title, titles) : undefined;
       const p = ctx.sessions.fork({ sessionId: sid, atSeq, increaseTitle: true, onCreated: () => undefined });
-      if (p && typeof p.catch === 'function') {
-        p.catch((err) => {
-          const code = err && err.rpcError ? err.rpcError.code : '';
-          if (code === 'session/fork-unavailable') say(t('fork.noneAvailable'));
-          else if (code === 'session/not-found') say(t('fork.sourceUnavailable'));
-          else say(t('fork.failed', { msg: err && err.message ? err.message : String(err) }));
-        });
-      }
-      say(t('fork.done', { turn }) + (childTitle ? ' → ' + childTitle : ''));
+      /* 失败时**不能先报成功**：原先无论结果如何都立刻弹"已分叉"，
+         分叉被拒绝时用户会同时看到成功与失败两条互相矛盾的提示。 */
+      if (p && typeof p.then === 'function') p.then(done, failed);
+      else done();
     } catch (e) {
-      say(t('fork.failed', { msg: e && e.message ? e.message : String(e) }));
+      failed(e);
     }
   }, [ctx, graph, say]);
 
@@ -2794,27 +3129,32 @@ function GraphView(props) {
     say(p.note);
   }, [sessionId, props, say]);
 
-  /* 导出：生成内容 → 不挂到 body 的 anchor 触发下载 */
+  /* 导出：生成内容 → 不挂到 body 的 anchor 触发下载。
+     顺带把"因隐藏而跳过的块数"带出来：对话框原来读的是画布那张图的 stats，
+     而画布可能开着「显示已隐藏」，于是提示条会说"一个都没跳过"，与真正导出的文件不符。 */
   const exportText = React.useCallback((fmt, includeHidden) => {
     const g = buildGraph({
       sessions: sessionsNorm, turnsBySession, currentId: sessionId,
       hidden, alias, links, includeHidden
     });
-    return render(g, fmt, { links, stamp: stamp(new Date()) });
+    const out = render(g, fmt, { links, stamp: stamp(new Date()) });
+    return { ...out, hiddenSkipped: g.stats.hiddenSkipped };
   }, [sessionsNorm, turnsBySession, sessionId, hidden, alias, links]);
 
   /* 导出（FR-15）：优先走 Host 路由——先 HEAD 预检，通过后交给浏览器下载管理器；
-     路由不可用时回落到本地生成 + Blob，保证功能不因为接线问题而消失。 */
+     路由不可用时回落到本地生成 + Blob，保证功能不因为接线问题而消失。
+     **连线要一起发**：Host 侧只认存档，而连线可能还在 400ms 防抖里没落盘，
+     只读模式下更是永远落不了盘 —— 那时导出的文件会一条连线都没有，与预览不符。 */
   const routeUrl = React.useCallback((fmt, includeHidden) => {
-    const ids = sessionsNorm.map((s) => s.id).join(',');
     return '/api/session.graph-export'
       + '?format=' + fmt
       + '&sessionId=' + encodeURIComponent(sessionId)
-      + (ids ? '&sessions=' + encodeURIComponent(ids) : '')
+      + (familyKey ? '&sessions=' + encodeURIComponent(familyKey) : '')
       + (includeHidden ? '&includeHidden=true' : '')
       + (Object.keys(hidden).length ? '&hidden=' + encodeURIComponent(JSON.stringify(hidden)) : '')
-      + (Object.keys(alias).length ? '&alias=' + encodeURIComponent(JSON.stringify(alias)) : '');
-  }, [sessionsNorm, sessionId, hidden, alias]);
+      + (Object.keys(alias).length ? '&alias=' + encodeURIComponent(JSON.stringify(alias)) : '')
+      + (links.length ? '&links=' + encodeURIComponent(JSON.stringify(links)) : '');
+  }, [familyKey, sessionId, hidden, alias, links]);
 
   const saveUrl = React.useCallback((url, filename) => {
     /* 与产品既有会话日志导出同一手法：anchor 不挂到 document.body，直接 click() */
@@ -2871,6 +3211,8 @@ function GraphView(props) {
   const cell = nodes.map((n) => {
     if (n.kind === 'header') {
       const gone = archivedIds.has(n.sessionId);
+      const collapsible = (feats.skeletonOnly || collapseOthers || collapsedSessions.length > 0)
+        && n.sessionId !== sessionId && !!n.turnCount;
       return h('div', {
         key: n.id,
         className: 'sg-label' + (n.sessionId === sessionId ? ' sg-current' : '')
@@ -2878,18 +3220,23 @@ function GraphView(props) {
         style: { left: n.x, top: n.y, minWidth: n.w, height: n.h },
         title: gone ? t('head.archived') : t('head.switchTip'),
         'aria-disabled': gone ? 'true' : undefined,
-        onClick: gone ? undefined : () => openSession(n.sessionId)
+        /* 拖会话头是平移画布（所有非块节点都走平移），松手时浏览器还会补一个 click。
+           不平移过的才当"切换会话"，否则一拖就跳走 —— 块上早就这么防了，会话头漏了。 */
+        onClick: gone ? undefined : () => {
+          if (suppressClickRef.current) { suppressClickRef.current = false; return; }
+          openSession(n.sessionId);
+        }
       },
       h('span', { className: 'sg-sdot' }),
       h('span', { className: 'sg-st' }, n.title),
       h('span', { className: 'sg-sm' }, t('head.turnCount', { n: fmtNum(n.turnCount) })),
-      /* 骨架档下非当前会话只出头；这里给一个就地展开的入口（NFR-1「按需展开」） */
-      (feats.skeletonOnly && n.sessionId !== sessionId && n.turnCount)
+      /* 被折叠（骨架档或用户折叠）的会话：头上给一个就地展开的入口（NFR-1 / FR-11） */
+      collapsible
         ? h('span', {
           className: 'sg-expand',
-          title: isExpanded(n.sessionId) ? t('head.collapse') : t('head.expand'),
-          onClick: (ev) => { ev.stopPropagation(); toggleExpanded(n.sessionId); }
-        }, isExpanded(n.sessionId) ? '▾' : '▸')
+          title: isCollapsed(n.sessionId) ? t('head.expand') : t('head.collapse'),
+          onClick: (ev) => { ev.stopPropagation(); toggleSession(n.sessionId); }
+        }, isCollapsed(n.sessionId) ? '▸' : '▾')
         : null);
     }
     if (n.kind === 'empty') {
@@ -2920,7 +3267,7 @@ function GraphView(props) {
       'data-sg-node': n.id,
       tabIndex: 0,
       role: 'button',
-      'aria-label': t('block.ariaLabel', { turn: b.turn, prompt: b.prompt }),
+      'aria-label': t('block.ariaLabel', { turn: b.turn, prompt: clip(digest(b.prompt), 120) }),
       style: { left: n.x, top: n.y, width: n.w, minHeight: n.h },
       onDoubleClick: (e) => { e.stopPropagation(); doFork(b.sessionId, b.turn); },
       onKeyDown: (e) => { if (e.key === 'Enter') { e.stopPropagation(); setSelected(n.id); } }
@@ -2945,8 +3292,17 @@ function GraphView(props) {
     }));
   });
 
-  /* 三种边不只靠颜色区分（§5.2）：线型不同，箭头也分实心与空心 */
-  const edgeList = graph.error ? [] : graph.edges;
+  /* 三种边不只靠颜色区分（§5.2）：线型不同，箭头也分实心与空心。
+     终点若没被画出来（骨架档或会话被折叠），按需求 FR-11 退到**它所属会话的会话头**；
+     两端都画不出来就不画这条边 —— 否则会出现"从空白处拉到空白处"的线。
+     边的起点本来就有会话头兜底（见 graph.js 的 edgePath）。 */
+  const edgeList = (graph.error ? [] : graph.edges).map((e) => {
+    if (nodeMap.has(e.to)) return e;
+    if (e.kind === 'branch' && e.sessionId && nodeMap.has(`header:${e.sessionId}`)) {
+      return { ...e, to: `header:${e.sessionId}` };
+    }
+    return e;
+  });
   const edges = edgeList.map((e) => {
     const d = edgePath(e, nodeMap);
     if (!d) return null;
@@ -3087,9 +3443,14 @@ function GraphView(props) {
       ].filter(Boolean).join('；'))
     : null;
 
+  /* 选中项可能不是块（方向键会走到会话头、块也可能因折叠/骨架而没画出来）。
+     那时若直接返回 null，右栏会**整片空白** —— 看着像界面坏了。
+     统一退回空态说明，右侧永远有内容。 */
+  const selectedNode = selected ? nodeMap.get(selected) : null;
+  const selectedIsBlock = !!(selectedNode && selectedNode.kind === 'block');
   const detail = selectedEdge
     ? buildEdgeDetail()
-    : (selected && nodeMap.has(selected) ? buildDetail() : h('div', { className: 'sg-emptybox' },
+    : (selectedIsBlock ? buildDetail() : h('div', { className: 'sg-emptybox' },
       t('side.empty', {
         sessions: fmtNum(graph.error ? 0 : graph.stats.sessions),
         blocks: fmtNum(graph.error ? 0 : graph.stats.blocks)
@@ -3132,8 +3493,22 @@ function GraphView(props) {
             className: 'sg-linkdraft-in sg-wide',
             maxLength: 120,
             placeholder: t('link.noLabel'),
-            value: e.label || '',
-            onChange: (ev) => labelLink(e.id, ev.target.value)
+            /* 编辑期间只改草稿，回车/失焦才落盘：每敲一个字都写一次的话，
+               撤销会变成"退回一个字符"，50 步历史也会被一次输入冲光。 */
+            value: labelDraft && labelDraft.id === e.id ? labelDraft.value : (e.label || ''),
+            onChange: (ev) => {
+              const v = ev.target.value;
+              setLabelDraft({ id: e.id, value: v });
+            },
+            onKeyDown: (ev) => {
+              ev.stopPropagation();
+              if (ev.key === 'Enter') { labelLink(e.id, labelDraft ? labelDraft.value : e.label || ''); setLabelDraft(null); }
+              else if (ev.key === 'Escape') setLabelDraft(null);
+            },
+            onBlur: () => {
+              labelLink(e.id, labelDraft && labelDraft.id === e.id ? labelDraft.value : (e.label || ''));
+              setLabelDraft(null);
+            }
           }),
           h('div', { className: 'sg-tx' }, t('link.labelHelp'))))
     ];
@@ -3318,14 +3693,18 @@ function GraphView(props) {
     let preview = '';
     let filename = '';
     let errorText = '';
+    /* 跳过数必须来自**这次导出**那张图，而不是画布那张 ——
+       画布可能开着「显示已隐藏」，那样提示条会说"没有跳过任何块"，
+       可下载下来的文件里其实少了一批。 */
+    let skipped = 0;
     try {
       const out = exportText(exportFmt, exportHidden);
       preview = out.content;
       filename = out.filename;
+      skipped = out.hiddenSkipped || 0;
     } catch (e) {
       errorText = e && e.message ? e.message : String(e);
     }
-    const skipped = (graph.error ? 0 : graph.stats.hiddenSkipped);
     return h('div', { className: 'sg-mask', onClick: (e) => { if (e.target === e.currentTarget) setExportOpen(false); } },
       h('div', { className: 'sg-dlg' },
         h('div', { className: 'sg-dlg-hd' },
@@ -3410,7 +3789,8 @@ function apply(ctx) {
     name: 'conversation.view',
     id: TARGET,
     order: VIEW_ORDER,
-    label: () => t('view.title'),
+    /* 宿主会在模块作用域直接调用它（切会话时也会），绝不能依赖组件内的 t —— 见 viewLabel */
+    label: () => viewLabel(ctx),
     inject: (sessionId) => {
       let target = null;
       try {

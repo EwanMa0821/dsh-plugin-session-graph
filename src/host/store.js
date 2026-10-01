@@ -90,6 +90,20 @@ export const DOMAIN_SPEC = {
 export function createStore(domain, now = () => Date.now()) {
   const table = () => domain.table(TABLE_NAME);
 
+  /* 每个家族一条写入链。
+     write 是"读-改-写"：先读当前记录，合并补丁，再写回。两个请求并发时
+     后一个会拿着**读到的旧状态**覆盖前一个 —— 实测两次 POST 同时到达时，
+     先写的 hiddenBlocks 被整片抹掉（只剩后写的 alias）。
+     客户端的串行化只能管住自己那一份，Host 侧必须自己排队。 */
+  const chains = new Map();
+  const enqueue = (key, job) => {
+    const prev = chains.get(key) || Promise.resolve();
+    const run = prev.then(job, job);
+    /* 链上只保留"已结算"的位置：前一个失败不影响后一个继续排队 */
+    chains.set(key, run.then(() => {}, () => {}));
+    return run;
+  };
+
   return {
     /** 该族是否可写（记录版本不认识时为 false） */
     async read(familyId) {
@@ -111,16 +125,18 @@ export function createStore(domain, now = () => Date.now()) {
     async write(familyId, patch) {
       const key = String(familyId || '');
       if (key === '') throw new Error('缺少家族根会话 id');
-      const current = await this.read(key);
-      if (current.incompatible) {
-        throw Object.assign(new Error('这条记录由更新的版本写入，本版本不会覆盖它'), {
-          code: 'incompatible-version'
-        });
-      }
-      const before = current.state || emptyState(now());
-      const next = mergePatch(before, patch, now());
-      await table().put(key, next);
-      return next;
+      return enqueue(key, async () => {
+        const current = await this.read(key);
+        if (current.incompatible) {
+          throw Object.assign(new Error('这条记录由更新的版本写入，本版本不会覆盖它'), {
+            code: 'incompatible-version'
+          });
+        }
+        const before = current.state || emptyState(now());
+        const next = mergePatch(before, patch, now());
+        await table().put(key, next);
+        return next;
+      });
     },
 
     async remove(familyId) {

@@ -141,9 +141,37 @@ test('familyOf 把孤儿降级为根并给出提示，绝不丢节点', () => {
     { id: 'b', title: 'B', parentId: 'missing', forkAtTurn: 1 }
   ]);
   const f = familyOf(sessions, 'a');
-  assert.deepEqual(f.order, ['a']);
+  /* 这条断言原先写的是 ['a']：提示说"父会话已不可见，已作为根显示"，
+     而 order 里根本没有 b。order 是 buildGraph 的唯一范围，不进 order
+     就是"有数据、没节点"，提示与事实相反。 */
+  assert.deepEqual(f.order, ['a', 'b'], '血缘根在最前，孤儿随后');
+  assert.deepEqual(f.roots, ['a', 'b'], '孤儿真的被当成根');
   const g = buildGraph({ sessions, turnsBySession: {}, currentId: 'a' });
   assert.ok(g.notes.some((n) => n.includes('父会话已不可见')), '给出孤儿提示');
+  assert.ok(g.order.includes('b'), '提示说显示，范围里就得真的有它');
+});
+
+test('familyOf 把成环的会话也当根纳入范围，并给出诚实提示', () => {
+  const sessions = normalizeSessions([
+    { id: 'root', title: '根' },
+    { id: 'kid', title: '子', parentId: 'root' },
+    { id: 'c1', title: '环一', parentId: 'c2' },
+    { id: 'c2', title: '环二', parentId: 'c1' }
+  ]);
+  const f = familyOf(sessions, 'kid');
+  /* 环成员谁也到不了顶、也不是任何人的后代：早先它们同样会被整个丢掉，
+     而 `chain.length > byId.size` 的成环判定永远不会触发（chain 里去重过）。 */
+  assert.ok(f.order.includes('c1') && f.order.includes('c2'), '环成员进 order');
+  assert.ok(f.roots.includes('c1') && f.roots.includes('c2'), '环成员是根');
+  assert.equal(f.order.length, sessions.length, '每个会话恰好展开一次，不重复也不无限递归');
+  assert.ok(f.notes.length > 0, '成环必须给提示，不能一声不吭');
+
+  const g = buildGraph({
+    sessions,
+    turnsBySession: { c1: [turn(1, '环一提问', '环一回答')] },
+    currentId: 'kid'
+  });
+  assert.ok(g.blocks.some((b) => b.sessionId === 'c1'), '环成员的块进图，不是从统计里消失');
 });
 
 test('familyOf 对血缘成环不无限递归、不丢节点', () => {
@@ -621,6 +649,45 @@ test('.mm 特殊字符被正确转义，且不泄漏原始标签', () => {
   assert.equal(/[&<>]/.test(stripped), false);
 });
 
+test('.mm 剥掉 XML 非法控制字符，但保留制表与换行', () => {
+  /* 真实正文里有 ANSI 转义（ESC = U+001B）与 NUL：只转义 & < > " ' 的话，
+     整个 .mm 都不是合法 XML（解析器直接罢工，不是少一行）。 */
+  const g = buildGraph({
+    sessions: normalizeSessions([{ id: 'root', title: '根' }]),
+    turnsBySession: {
+      root: [turn(1, 'ANSI \u001b[31m红色\u001b[0m 与 \u0000NUL', '答：\u0007a\tb\n第二行\u001f\uFFFE\uFFFF')]
+    },
+    currentId: 'root'
+  });
+  const { content } = toFreeMind(g);
+  assert.equal(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]/.test(content), false,
+    'XML 1.0 的 Char 不允许这些字符（C0 控制字符与 U+FFFE/U+FFFF）');
+  assert.equal(content.includes('\u001b'), false, 'ANSI 转义被丢掉');
+  assert.ok(content.includes('\t'), '制表符是合法字符，必须保留');
+  assert.ok(content.includes('\n'), '换行是合法字符，必须保留');
+  assert.equal(nodeOpen(content), nodeClose(content));
+});
+
+test('.mm 不再把 Markdown 水平线当表格分隔行吃掉', () => {
+  const answer = [
+    '第一段。', '',
+    '---', '',
+    '| 层 | 依赖 |', '| --- | --- |', '| L1 | 视图位 |'
+  ].join('\n');
+  const g = buildGraph({
+    sessions: normalizeSessions([{ id: 'root', title: '根' }]),
+    turnsBySession: { root: [turn(1, '问', answer)] },
+    currentId: 'root'
+  });
+  const { content } = toFreeMind(g);
+  const node = /<richcontent TYPE="NODE">([\s\S]*?)<\/richcontent>/.exec(content)[1];
+  /* `---` 只含横线、不含 |，是水平线不是表格分隔行 —— 早先被当成噪声整行丢掉 */
+  assert.ok(node.includes('<p>---</p>'), '水平线是一行真内容，必须留成可见段落');
+  assert.ok(!node.includes('| --- | --- |'), '真正的表格分隔行仍然是噪声，丢掉');
+  assert.ok(node.includes('| 层 | 依赖 |'), '表格其余行照常保留');
+  assert.ok(toMarkdown(g).content.includes('    ---'), '.md 里同样还是原样一行');
+});
+
 test('.mm 分叉源未知的子会话不会从导出结果里消失', () => {
   /* forkAtTurn 为 null：上游没能推出分叉轮次（冷会话、继承计数缺失等） */
   const sessions = normalizeSessions([
@@ -761,6 +828,35 @@ test('safeFilename 先剥标记语言、再清理路径非法字符，并限长'
   assert.equal(safeFilename('报告 2026/10'), '报告 2026_10');
   assert.equal(safeFilename('   '), 'session-graph');
   assert.equal(safeFilename('x'.repeat(100)).length, 60);
+});
+
+test('safeFilename 按码点截断，任何标题都不会让 encodeURIComponent 抛错', () => {
+  const titles = [
+    'x'.repeat(58) + '😀报告',
+    'x'.repeat(59) + '😀报告',        /* 按 UTF-16 码元切会正好切出半个代理对 */
+    'x'.repeat(60) + '😀报告',
+    'x'.repeat(61) + '😀报告',
+    '😀'.repeat(40),
+    'x'.repeat(59) + '\uD83D',        /* 输入本身就畸形：半个高代理 */
+    '标题\uDC00尾巴'                   /* 孤立低代理 */
+  ];
+  titles.forEach((title) => {
+    const g = buildGraph({
+      sessions: normalizeSessions([{ id: 'root', title }]),
+      turnsBySession: {},
+      currentId: 'root'
+    });
+    const name = exportFilename(g, 'mm');
+    assert.doesNotThrow(() => encodeURIComponent(name),
+      `标题 ${JSON.stringify(title)} 的文件名必须能编码成下载链接`);
+
+    const base = safeFilename(title);
+    assert.ok([...base].length <= 60, '长度上限仍然成立：' + base);
+    assert.equal(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(base), false, '不留孤立高代理');
+    assert.equal(/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(base), false, '不留孤立低代理');
+  });
+  /* 正好 60 个码点时原样返回，不因为修这个而改动已有行为 */
+  assert.equal(safeFilename('x'.repeat(59) + '😀'), 'x'.repeat(59) + '😀');
 });
 
 test('exportFilename 用家族根标题', () => {
@@ -1074,6 +1170,82 @@ test('引用拉进来的会话在导出里不当独立根，避免同一个会�
   const { content } = toFreeMind(g, { links: [link] });
   const hits = (content.match(/引用：新会话/g) || []).length;
   assert.equal(hits, 1, '只出现一次（挂在源块之下），实际出现 ' + hits + ' 次');
+});
+
+/* 会话标题在 .mm 里既出现在会话节点的 TEXT 上，也出现在每个块的「元信息」行里
+   （.md 里是块末尾的斜体元信息行），所以"这个会话出现了几次"要数**会话节点**，
+   而不是数标题字符串 —— 后者会把元信息一起数进来。 */
+const mmSessionHits = (content, title) =>
+  (content.match(new RegExp(`<node TEXT="(?:引用：)?${title}"`, 'g')) || []).length;
+const mdSessionHits = (content, title) =>
+  (content.match(new RegExp(
+    `^(?:## ${title}|\\s*- \\*\\*(?:🔗 引用|⑂ 分叉) → (?:引用：)?${title}\\*\\*)$`, 'gm')) || []).length;
+/** 找出指向不存在节点的 arrowlink —— 悬空目标在思维导图里是硬错误 */
+const mmDanglingArrows = (content) => {
+  const ids = new Set([...content.matchAll(/ID="(ID_\d+)"/g)].map((m) => m[1]));
+  return [...content.matchAll(/DESTINATION="(ID_\d+)"/g)]
+    .map((m) => m[1]).filter((d) => !ids.has(d));
+};
+
+test('引用源块被隐藏后，被引用的会话作为根出现恰好一次，且没有悬空箭头', () => {
+  const sessions = normalizeSessions([
+    { id: 'root', title: '根会话' },
+    { id: 'iso', title: '独立会话' }
+  ]);
+  const turns = {
+    root: [turn(1, '根一问', '根一答'), turn(2, '根二问', '根二答')],
+    iso: [turn(1, '引用提问', '引用回答')]
+  };
+  const ref = { id: 'R1', kind: 'reference', from: 'root:2', to: 'header:iso', label: '引用' };
+  const manual = { id: 'L1', kind: 'link', from: 'root:1', to: 'iso:1', label: '手动' };
+  const links = [ref, manual];
+  const mk = (hidden) => buildGraph({ sessions, turnsBySession: turns, currentId: 'root', hidden, links });
+
+  /* 源块被隐藏：那条引用边在建模层就整条消失（FR-11），iso 于是既不是家族根、
+     也没有挂载点 —— 早先它会从 .mm/.md 里整个不见，而且一句提示都没有。 */
+  const off = mk({ 'root:2': true });
+  assert.deepEqual(off.referenced, ['iso'], '它仍然是被引用拉进来的');
+  const mm = toFreeMind(off, { links }).content;
+  const md = toMarkdown(off, { links }).content;
+  assert.equal(mmSessionHits(mm, '独立会话'), 1, '.mm 里恰好一次');
+  assert.equal(mdSessionHits(md, '独立会话'), 1, '.md 里恰好一次');
+  assert.ok(mm.includes('已作为根导出'), '结构被迫变了就得说一声，不能静默');
+  assert.equal((mm.match(/<arrowlink /g) || []).length, 1, '手动连线照常画出来');
+  assert.deepEqual(mmDanglingArrows(mm), [], '不许产出指向不存在节点的 arrowlink');
+
+  /* 反例：什么都不隐藏时它挂在源块之下，同样恰好一次、同样没有悬空箭头 */
+  const on = mk({});
+  const mm2 = toFreeMind(on, { links }).content;
+  const md2 = toMarkdown(on, { links }).content;
+  assert.equal(mmSessionHits(mm2, '独立会话'), 1, '挂在源块之下时也只出现一次');
+  assert.equal(mdSessionHits(md2, '独立会话'), 1);
+  assert.equal(mm2.includes('已作为根导出'), false, '没有补根就不该有这句提示');
+  assert.equal((mm2.match(/<arrowlink /g) || []).length, 1);
+  assert.deepEqual(mmDanglingArrows(mm2), []);
+});
+
+test('.mm / .md 里血缘成环的会话不会被导出丢掉', () => {
+  const sessions = normalizeSessions([
+    { id: 'root', title: '根会话' },
+    { id: 'c1', title: '环一会话', parentId: 'c2' },
+    { id: 'c2', title: '环二会话', parentId: 'c1' }
+  ]);
+  const g = buildGraph({
+    sessions,
+    turnsBySession: {
+      root: [turn(1, '根问', '根答')],
+      c1: [turn(1, '环一问', '环一答')],
+      c2: [turn(1, '环二问', '环二答')]
+    },
+    currentId: 'root'
+  });
+  const mm = toFreeMind(g).content;
+  const md = toMarkdown(g).content;
+  assert.equal(mmSessionHits(mm, '环一会话'), 1, '环成员在 .mm 里恰好一次');
+  assert.equal(mmSessionHits(mm, '环二会话'), 1, '环成员在 .mm 里恰好一次');
+  assert.equal(mdSessionHits(md, '环一会话'), 1, '环成员在 .md 里恰好一次');
+  assert.equal(mdSessionHits(md, '环二会话'), 1, '环成员在 .md 里恰好一次');
+  assert.equal(nodeOpen(mm), nodeClose(mm));
 });
 
 test('血缘内的会话照旧当根', () => {

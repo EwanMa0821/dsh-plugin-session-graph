@@ -183,11 +183,18 @@ export function mergePatch(state, patch, now = 0) {
   if ('links' in patch) {
     const incoming = (Array.isArray(patch.links) ? patch.links : [])
       .slice(0, LIMITS.links).map((l) => sxSanitizeLink(l, now)).filter(Boolean);
-    /* 按 id 覆盖式合并：同一 id 视为更新，其它保留 —— 这样客户端可以只发变化的那几条 */
+    /* 按 id 覆盖式合并：同一 id 视为更新，其它保留 —— 这样客户端可以只发变化的那几条。
+       注意 label **以 patch 为准（缺键 = 清空）**：客户端表达"这条连线没有标签"就是
+       把 label 键删掉（见 src/client/app.js 的 labelLink: `const { label: _drop, ...rest } = l`），
+       而 `{ ...prev, ...l }` 会把"缺键"读成"保留旧值"，于是清空标签永远落不了盘 ——
+       界面上删掉、刷新又回来。createdAt 仍保留首次写入的时间。 */
     const byId = new Map(base.links.map((l) => [l.id, l]));
     incoming.forEach((l) => {
       const prev = byId.get(l.id);
-      byId.set(l.id, prev ? { ...prev, ...l, createdAt: prev.createdAt, updatedAt: now } : l);
+      if (!prev) { byId.set(l.id, l); return; }
+      const merged = { ...prev, ...l, createdAt: prev.createdAt, updatedAt: now };
+      if (!('label' in l)) delete merged.label;
+      byId.set(l.id, merged);
     });
     next.links = [...byId.values()].slice(0, LIMITS.links);
   }

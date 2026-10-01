@@ -119,6 +119,45 @@ test('mergePatch 能按 id 删连线', () => {
   assert.deepEqual(after.links.map((l) => l.id), ['L2']);
 });
 
+test('清空连线标签会真的落盘：patch 里缺 label 键就是清空', () => {
+  const withLabel = mergePatch(emptyState(0), {
+    links: [{ id: 'L1', from: 's1:1', to: 's1:2', kind: 'link', label: '甲' }]
+  }, 10);
+  assert.equal(withLabel.links[0].label, '甲');
+
+  /* 客户端表达"这条连线没有标签"就是**把 label 键删掉**
+     （src/client/app.js 的 labelLink：`const { label: _drop, ...rest } = l`）。
+     `{ ...prev, ...l }` 会把"缺键"读成"保留旧值"，于是清空永远落不了盘 —— 删了又回来。 */
+  const cleared = mergePatch(withLabel, {
+    links: [{ id: 'L1', from: 's1:1', to: 's1:2', kind: 'link' }]
+  }, 20);
+  assert.equal(cleared.links.length, 1, '同 id 是更新，不是新增');
+  assert.equal(cleared.links[0].label, undefined, '缺 label 键 = 清空');
+  assert.equal('label' in cleared.links[0], false, '不是留一个 undefined 占位');
+  assert.equal(cleared.links[0].createdAt, 10, '创建时间保留');
+  assert.equal(cleared.links[0].updatedAt, 20, '更新时间刷新');
+
+  /* 重新写回标签，以及"只发另一条连线"，彼此都不串味 */
+  const relabeled = mergePatch(cleared, {
+    links: [
+      { id: 'L1', from: 's1:1', to: 's1:2', label: '乙' },
+      { id: 'L2', from: 's1:2', to: 's1:3', label: '丙' }
+    ]
+  }, 30);
+  assert.equal(relabeled.links.find((l) => l.id === 'L1').label, '乙');
+  assert.equal(relabeled.links.find((l) => l.id === 'L2').label, '丙');
+
+  const other = mergePatch(relabeled, { links: [{ id: 'L2', from: 's1:2', to: 's1:3' }] }, 40);
+  assert.equal(other.links.find((l) => l.id === 'L1').label, '乙', 'L1 不受影响');
+  assert.equal(other.links.find((l) => l.id === 'L2').label, undefined);
+
+  /* 客户端那一侧也走一遍：label 键被删掉 → clientPatchToState → mergePatch */
+  const patch = clientPatchToState({ links: [{ id: 'L1', kind: 'link', from: 's1:1', to: 's1:2' }] });
+  assert.equal('label' in patch.links[0], false, '规整时不会凭空补一个空标签');
+  const end = mergePatch(relabeled, patch, 50);
+  assert.equal(end.links.find((l) => l.id === 'L1').label, undefined, '转一圈回来标签确实没了');
+});
+
 test('超限时截断，不给界面塞进无穷数据（NFR-1）', () => {
   const many = {};
   for (let i = 0; i < LIMITS.positions + 50; i += 1) many[`s1:${i + 1}`] = { x: i, y: i };
@@ -257,6 +296,29 @@ test('两次写入是累加的，不是覆盖', async () => {
   const got = await store.read('fam');
   assert.deepEqual(got.state.hiddenBlocks, ['s1:1'], '第一次写的还在');
   assert.deepEqual(got.state.alias, { 's1:2': '二' });
+});
+
+/* 回归：write 是"读-改-写"，两个并发请求不排队时，后一个会拿着读到的旧状态覆盖前一个。
+   客户端的串行化只管得住自己那一份（多窗口、脚本调用、重放都拦不住），Host 侧必须自己排队。 */
+test('并发写入排队执行：后一个不会拿着旧状态抹掉前一个', async () => {
+  const store = createStore(fakeDomain(), () => 100);
+  await Promise.all([
+    store.write('fam', { hiddenBlocks: ['s1:1'] }),
+    store.write('fam', { alias: { 's1:2': '二' } })
+  ]);
+  const got = await store.read('fam');
+  assert.deepEqual(got.state.hiddenBlocks, ['s1:1'], '先写的不该被覆盖');
+  assert.deepEqual(got.state.alias, { 's1:2': '二' }, '后写的照常落盘');
+});
+
+test('排队不改失败语义：前一个失败，后一个照样排队执行、且不覆盖原记录', async () => {
+  const domain = fakeDomain({ fam: { version: 99, links: [] } });
+  const store = createStore(domain, () => 1);
+  const first = store.write('fam', { hiddenBlocks: ['s1:1'] });
+  const second = store.write('fam', { hiddenBlocks: ['s2:2'] });
+  await assert.rejects(() => first, (e) => e.code === 'incompatible-version');
+  await assert.rejects(() => second, (e) => e.code === 'incompatible-version');
+  assert.deepEqual(domain.records.get('fam'), { version: 99, links: [] }, '原记录始终没被动过');
 });
 
 test('记录版本不认识时：报不兼容、只读、且**绝不覆盖**', async () => {

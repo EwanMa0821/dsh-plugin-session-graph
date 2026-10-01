@@ -219,10 +219,43 @@ export function normalizeSessions(raw) {
 }
 
 /**
+ * 找出所有「彼此为父」的环成员。
+ *
+ * 从每个会话沿父链上溯，撞回走过的节点就说明这里有环，把环上那一段收下。
+ * 环里的父子关系是自相矛盾的（谁都到不了顶），既不能当普通后代丢在一边，
+ * 也不能随便挑一个当根 —— 挑中的那个会变成"上位"，另一个降成子会话，
+ * 而它们本来就是互指的。挂在环下面的后代不算环成员：那些能正常从环展开。
+ */
+function ringMembersOf(sessions, byId) {
+  const members = new Set();
+  sessions.forEach((s) => {
+    const path = [];
+    const at = new Map();
+    let cur = s.id;
+    while (cur && byId.has(cur)) {
+      if (at.has(cur)) {
+        for (let i = at.get(cur); i < path.length; i += 1) members.add(path[i]);
+        break;
+      }
+      if (members.has(cur)) break;      /* 再往上还是同一个环，不必重走 */
+      at.set(cur, path.length);
+      path.push(cur);
+      const parent = byId.get(cur).parentId;
+      cur = parent && byId.has(parent) ? parent : null;
+    }
+  });
+  return members;
+}
+
+/**
  * 家族范围（FR-3）。
  *
  * 从 currentId 沿 parentId 上溯到无法继续的祖先，再向下展开全部后代。
  * 孤儿（父不在列表）降级为根；血缘成环时把环成员作为根渲染——**绝不丢节点、绝不无限递归**。
+ *
+ * 这里返回的 order 就是 buildGraph 的唯一范围，所以「提示里说已作为根显示、
+ * 实际上却没进 order」等于把这些会话从图、统计、导出里一起抹掉：
+ * 提示必须与范围一致，说显示就真的进 order。
  *
  * @returns {{ rootId: string|null, order: string[], notes: string[], roots: string[] }}
  */
@@ -232,7 +265,7 @@ export function familyOf(sessions, currentId) {
     return { rootId: null, order: [], notes: ['当前会话不在会话列表中'], roots: [] };
   }
 
-  /* 上溯：只沿真实存在于列表里的父链走，遇到环就停 */
+  /* 上溯：只沿真实存在于列表里的父链走，撞回走过的节点就是成环，停 */
   const chain = [];
   const seen = new Set();
   let cursor = currentId;
@@ -245,7 +278,21 @@ export function familyOf(sessions, currentId) {
   }
   const rootId = chain[chain.length - 1];
 
-  /* 下拓：从根深度优先展开后代，环安全 */
+  /* 根候选 = 正统血缘根 + 孤儿 + 环成员。顺序固定（血缘根在最前），
+     家族范围才不会随遍历顺序抖动。 */
+  const rootIds = [];
+  const addRoot = (id) => { if (id && !rootIds.includes(id)) rootIds.push(id); };
+  addRoot(rootId);
+  /* 孤儿：父会话不在列表里，血缘断了，但它自己就是这一支的根。
+     早先只给提示、不纳入 order —— 提示说"已作为根显示"，其实什么都没显示。 */
+  sessions.forEach((s) => { if (s.parentId && !byId.has(s.parentId)) addRoot(s.id); });
+  /* 成环：环成员谁也到不了顶，全部当根。
+     早先的 `chain.length > byId.size` 判定永远不会触发（chain 里去重过），
+     于是这类会话从图、统计、导出里一起消失且毫无提示。 */
+  const ringers = ringMembersOf(sessions, byId);
+  ringers.forEach(addRoot);
+
+  /* 下拓：从每个根深度优先展开后代，visited 兜住环，绝不重复展开 */
   const order = [];
   const visited = new Set();
   const walk = (id) => {
@@ -258,18 +305,18 @@ export function familyOf(sessions, currentId) {
       .sort()
       .forEach(walk);
   };
-  walk(rootId);
+  rootIds.forEach(walk);
 
-  /* 孤儿降级为根 */
   const notes = [];
   sessions.forEach((s) => {
     if (s.parentId && !byId.has(s.parentId)) notes.push(`会话「${s.title}」的父会话已不可见，已作为根显示`);
   });
-  /* 成环检测：上溯长度异常时给出告警 */
-  if (chain.length > byId.size) notes.push('血缘存在环，已按根处理');
+  if (ringers.size) {
+    const names = sessions.filter((s) => ringers.has(s.id)).map((s) => `「${s.title}」`);
+    notes.push(`血缘存在环（${names.join('、')}），环上会话已作为根显示`);
+  }
 
-  const roots = [rootId];
-  return { rootId, order, notes, roots };
+  return { rootId, order, notes, roots: rootIds };
 }
 
 /**

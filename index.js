@@ -11,9 +11,9 @@
  * 因此首装不需要任何依赖与构建脚本。
  */
 
-import { normalizeSessions, buildGraph, clip } from './src/core/model.js';
+import { normalizeSessions, buildGraph, clip, familyOf, sessionOfId } from './src/core/model.js';
 import { render } from './src/core/export.js';
-import { stateToClient } from './src/core/state.js';
+import { stateToClient, LIMITS } from './src/core/state.js';
 import { foldTurns, linkForks } from './src/host/fold.js';
 import { openStore, DOMAIN_NAME } from './src/host/store.js';
 
@@ -51,15 +51,18 @@ function text(body, status) {
 /* --------------------------------------------------------- 数据读取 */
 
 /**
- * 读取一组会话的元信息与轮次。
+ * 读取会话列表的**元信息**，不碰事件流。
  *
- * 会话元信息优先取 header（`parentSession` / `inheritedEventCount` 都在那里）；
- * 轮次由 sessionQuery 的事件流折叠得到。
- * 任何一步读不到都只是**少一点数据**，不让整个请求失败。
+ * 会话元信息优先取 header（`parentSession` / `inheritedEventCount` 都在那里）。
+ * 标题这里只留 header 里的旧值，真正的标题由 resolveTitles 单独折叠 ——
+ * 宿主 header 里**没有** title 字段（见那里的注释）。
+ *
+ * 超过会话数上限抛 **400**：`sessions=` 是客户端可控输入，属于"请求不合法"，
+ * 不是"服务不可用"。原先这个 Error 没有 .status，被 respondRead 兜成 503，
+ * 于是一个纯粹的输入错误被说成了服务错误，浏览器侧还会照着 5xx 去重试/报障。
  */
-export async function readSessions(ctx, ids, limits) {
+export async function readSessionMeta(ctx, ids, limits) {
   const store = service(ctx, 'sessions');
-  const query = service(ctx, 'sessionQuery');
   const live = store && typeof store.list === 'function' ? (store.list() || []) : [];
 
   const raw = [];
@@ -86,26 +89,147 @@ export async function readSessions(ctx, ids, limits) {
   });
 
   if (limits && limits.maxSessions && raw.length > limits.maxSessions) {
-    throw new Error(`会话数超过上限 ${limits.maxSessions}`);
+    throw Object.assign(new Error(`会话数超过上限 ${limits.maxSessions}`), { status: 400 });
   }
 
-  const turnsBySession = {};
-  /* 串行读取：observeSession 会打开一个观察句柄，并发打开没有好处 */
-  for (const r of raw) {
-    turnsBySession[r.id] = await readTurns(query, r);
-  }
+  return raw;
+}
 
-  const sessions = linkForks(
+/**
+ * 哪些会话需要读事件流（NFR-2 的取数预算）。
+ *
+ * 修复前 `sessions.list()` 里每个会话都 observeSession 一遍：40 会话 × 50 轮时，
+ * 连"点一个骨架块载入一轮"这种只要当前家族的请求也会打开 40 个观察句柄、
+ * 回传 2000 条轮次明细（约 1.8 MB）—— 载入一个块却付了整库的代价。
+ * 范围收紧成三块，其余会话**一个事件都不读**：
+ *   1. 当前会话的家族（祖先 + 家族根的全部后代）—— 血缘、派生边与家族判定全靠它
+ *   2. 调用方 `sessions=` 显式点名的会话 —— 冷会话（不在 list() 里）靠它补进来
+ *   3. 被**引用连线**拉进来的会话 —— buildGraph 会把它们并进 scoped，
+ *      不读轮次它们就成了"断裂的引用"，FR-7 的节点会直接消失
+ *
+ * 家族外的会话仍然留在元信息列表里：familyOf 判定根、孤儿与血环看的是整张列表，
+ * 把它们剔掉会改变 notes 与家族根，等于用性能换了错的图。
+ *
+ * 范围只用 header 的 parentId 就能算（familyOf 是纯函数，这里只读不改），
+ * 所以能在读事件**之前**定下来。没给 currentId（旧调用方）时范围就是全部，
+ * 与修复前行为一致。
+ *
+ * @param {Array<object>} records readSessionMeta 的结果
+ * @param {{currentId?: string, named?: string[], links?: Array<object>}} [options]
+ * @returns {Set<string>}
+ */
+export function turnScopeOf(records, options) {
+  const list = Array.isArray(records) ? records : [];
+  const o = options || {};
+  const all = new Set(list.map((r) => r.id));
+  const currentId = o.currentId === undefined || o.currentId === null ? '' : String(o.currentId);
+  if (!currentId || !all.has(currentId)) return all;
+
+  const scope = new Set(familyOf(list, currentId).order);
+  (o.named || []).forEach((id) => { if (all.has(id)) scope.add(id); });
+  /* 连线在路由里统一是**客户端形态**（端点字符串 `sid:turn` / `header:sid`），
+     所以这里和 buildGraph 用同一个 sessionOfId 取终点会话。 */
+  (o.links || []).forEach((l) => {
+    if (!l || l.kind !== 'reference') return;
+    const target = sessionOfId(l.to);
+    if (all.has(target)) scope.add(target);
+  });
+  return scope;
+}
+
+/**
+ * 逐会话折叠标题，失败只回落、不打断整次取数。
+ *
+ * 宿主事实（`@deepseek-ai/dsh-session-query/lib/index.js` 的 readTitle）：
+ * 会话 header 里**没有** title 字段，标题是 `session/title` 日志事件折出来的，
+ * readTitle 是它唯一的入口（"latest title snapshot, or `undefined` when the log
+ * has no title event"），源解析不了或日志读不动时它会**抛**。
+ * 所以：
+ *   - 有 readTitle → 只用它的返回值；返回空或抛错都回落会话 id
+ *     （真实宿主上 header.title 恒为 undefined，旧的回落链其实等价于 id）
+ *   - 没有 readTitle（旧宿主或替身）→ 保留修复前的 header.title 回落链，行为不变
+ *
+ * 只给**会出现在家族数据里**的会话折标题（家族 + 点名 + 被引用拉进来的）：
+ * 家族外又没被点名的会话在 buildGraph 里会被过滤掉，为它们各折一次标题
+ * 等于把刚省下来的事件读取又做一遍，上面那份取数预算就白省了。
+ * readTitle 本身**不开观察句柄**（readTitle → readTitleSnapshot → corpus.projectMany，
+ * 全程只是对内存快照做同步折叠），所以这里也不会多出一堆待释放的句柄。
+ *
+ * @param {object} query sessionQuery 服务
+ * @param {Array<object>} records readSessionMeta 的结果（就地改 title）
+ * @param {Set<string>} [scopeIds] 需要标题的会话；为空表示全部
+ */
+export async function resolveTitles(query, records, scopeIds) {
+  const list = Array.isArray(records) ? records : [];
+  if (!query || typeof query.readTitle !== 'function') return list;
+  for (const r of list) {
+    if (scopeIds && !scopeIds.has(r.id)) continue;
+    try {
+      const raw = await query.readTitle(r.id);
+      /* 本版宿主返回的是折叠好的**标题字符串**
+         （dsh-session-query/lib/index.js：`return (await this.readTitleSnapshot(...)).title`），
+         而 api-catalog 把签名写成了 `Promise<SessionTitleSnapshot | undefined>`。
+         两种形状都认：字符串直接用，对象取它的 title。取不到就回落 id ——
+         无论如何都不能把 "[object Object]" 当成标题写进导出文件。 */
+      const text = typeof raw === 'string' ? raw.trim()
+        : (raw && typeof raw === 'object' && typeof raw.title === 'string' ? raw.title.trim() : '');
+      r.title = text === '' ? r.id : text;
+    } catch {
+      /* 标题只是锦上添花：读不到就用会话 id，绝不让整次取数失败 */
+      r.title = r.id;
+    }
+  }
+  return list;
+}
+
+/**
+ * 按范围读各会话的事件流并折成轮次。
+ *
+ * 串行读取：observeSession 会打开一个观察句柄，并发打开没有好处。
+ * 范围外的会话**连键都不建** —— 有了键，下游就会把"从没读过"当成"读过了、只是没内容"。
+ */
+export async function readTurnsBySession(query, records, scopeIds) {
+  const out = {};
+  for (const r of (Array.isArray(records) ? records : [])) {
+    if (scopeIds && !scopeIds.has(r.id)) continue;
+    out[r.id] = await readTurns(query, r);
+  }
+  return out;
+}
+
+/** 元信息 + 轮次 → buildGraph 的输入（补上由 inheritedEventCount 推导的 forkAtTurn） */
+function assembleSessions(raw, turnsBySession) {
+  const byId = new Map(raw.map((r) => [r.id, r]));
+  return linkForks(
     normalizeSessions(raw.map((r) => ({
       id: r.id, title: r.title, parentId: r.parentId, sessionId: r.id
     }))).map((s) => {
-      const src = raw.find((r) => r.id === s.id);
+      const src = byId.get(s.id);
       return { ...s, inheritedEventCount: src ? src.inheritedEventCount : null };
     }),
     turnsBySession
   );
+}
 
-  return { sessions, turnsBySession };
+/**
+ * 读取一组会话的元信息与轮次（整体读取）。
+ *
+ * 不带 options 时与修复前一致：列表里的会话全读。buildPayload 走的是分步调用 ——
+ * 它必须先用元信息算出家族根、读完存档拿到连线，才能确定要读哪些会话的轮次。
+ *
+ * @param {object} ctx
+ * @param {string[]} ids 调用方显式点名的会话
+ * @param {object} limits
+ * @param {{currentId?: string, named?: string[], links?: Array<object>}|string} [options]
+ */
+export async function readSessions(ctx, ids, limits, options) {
+  const opts = typeof options === 'string' ? { currentId: options } : (options || {});
+  const raw = await readSessionMeta(ctx, ids, limits);
+  const scope = turnScopeOf(raw, { ...opts, named: opts.named || ids });
+  const query = service(ctx, 'sessionQuery');
+  await resolveTitles(query, raw, scope);
+  const turnsBySession = await readTurnsBySession(query, raw, scope);
+  return { sessions: assembleSessions(raw, turnsBySession), turnsBySession };
 }
 
 /**
@@ -220,13 +344,15 @@ export async function buildPayload(ctx, params, limits, store) {
   const includeHidden = params.get('includeHidden') === 'true';
   const ids = (params.get('sessions') || '').split(',').map((s) => s.trim()).filter(Boolean);
 
-  const { sessions, turnsBySession } = await readSessions(ctx, ids, limits);
-  if (!sessions.some((s) => s.id === currentId)) {
+  /* 先只取元信息：家族范围、家族根、存档记录都只需要 header，
+     而"要读哪些会话的轮次"必须在读事件**之前**定下来 —— 否则又是一次全量读取。 */
+  const raw = await readSessionMeta(ctx, ids, limits);
+  if (!raw.some((r) => r.id === currentId)) {
     throw Object.assign(new Error('sessionId 不在可读会话中'), { status: 404 });
   }
 
   /* 持久化状态按**家族根**分片（§5.3）。家族的根在这里算：往上走到没有父会话为止。 */
-  const familyRootId = rootOf(sessions, currentId);
+  const familyRootId = rootOf(raw, currentId);
   const stored = store ? await store.read(familyRootId) : null;
   const saved = stored && stored.state ? stateToClient(stored.state) : null;
 
@@ -234,7 +360,16 @@ export async function buildPayload(ctx, params, limits, store) {
      否则刷新之后界面会与存档对不上。 */
   const hidden = { ...(saved ? saved.hidden : {}), ...parseMap(params.get('hidden')) };
   const alias = { ...(saved ? saved.alias : {}), ...parseMap(params.get('alias')) };
-  const links = (saved && saved.links) || [];
+  /* 连线同理由请求参数补齐（FR-15）：界面上的连线有 400ms 写回防抖，只读模式下更是
+     永远不落盘 —— 只认存档的话，导出文件里一条手动连线都没有，而导出对话框的预览
+     （客户端本地 render）里明明有。参数按 id 覆盖存档，导出的 .mm/.md 用合并结果。 */
+  const links = mergeLinks(saved && saved.links, parseLinks(params.get('links')));
+
+  const query = service(ctx, 'sessionQuery');
+  const scope = turnScopeOf(raw, { currentId, named: ids, links });
+  await resolveTitles(query, raw, scope);
+  const turnsBySession = await readTurnsBySession(query, raw, scope);
+  const sessions = assembleSessions(raw, turnsBySession);
 
   const graph = buildGraph({
     sessions, turnsBySession, currentId, includeHidden, hidden, alias, links
@@ -310,6 +445,54 @@ function parseMap(value) {
   } catch {
     throw Object.assign(new Error('hidden / alias 必须是 JSON 对象'), { status: 400 });
   }
+}
+
+/**
+ * `links=` 查询参数：界面上的连线（客户端内部形态
+ * `{id, kind, from, to, label?}`，端点可能是 `sid:turn` 或 `header:sid`）。
+ *
+ * 只有"不是 JSON 数组"才算参数非法 —— 单条连线的字段残缺不该整单失败：
+ * buildGraph 自己会丢掉 from/to 缺失或自环的条目，这里再做一遍校验只会重复规则。
+ */
+function parseLinks(value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw Object.assign(new Error('links 必须是 JSON 数组'), { status: 400 });
+  }
+  if (!Array.isArray(parsed)) {
+    throw Object.assign(new Error('links 必须是 JSON 数组'), { status: 400 });
+  }
+  /* 与存档同一条 NFR-1 上限：不让一个癫狂的查询串把图撑爆 */
+  return parsed.slice(0, LIMITS.links);
+}
+
+/**
+ * 连线按 id 合并，**参数优先**（FR-15）。
+ *
+ * 存档顺序保持不变（界面上连线的次序不该因为一次导出而变），同 id 的用参数那条
+ * 原地替换；参数里多出来的 id 按参数顺序追加。没有 id 的条目无法定位，只能追加 ——
+ * 生成 id 是客户端的责任，宿主不替它编造稳定标识。
+ */
+function mergeLinks(saved, incoming) {
+  const out = [];
+  const at = new Map();
+  const put = (l, override) => {
+    if (!l || typeof l !== 'object' || Array.isArray(l)) return;
+    const id = typeof l.id === 'string' && l.id !== '' ? l.id : null;
+    if (id !== null && at.has(id)) {
+      if (override) out[at.get(id)] = l;
+      return;
+    }
+    if (id !== null) at.set(id, out.length);
+    out.push(l);
+  };
+  (Array.isArray(saved) ? saved : []).forEach((l) => put(l, false));
+  (Array.isArray(incoming) ? incoming : []).forEach((l) => put(l, true));
+  return out.slice(0, LIMITS.links);
 }
 
 /* --------------------------------------------------------------- 插件 */

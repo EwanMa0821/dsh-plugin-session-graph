@@ -88,6 +88,42 @@ test('foldTurns 统计工具调用次数', () => {
   assert.equal(foldTurns(ROOT_EVENTS)[0].toolCalls, 0);
 });
 
+test('foldTurns 统计交付物：一轮里两条 deliverables/presented 记 2 个', () => {
+  /* 载荷照 `@deepseek-ai/dsh-client-ui-deliverables` 的 isPresentedData 构造：
+     `{ turn, callId, files }` —— 里面**没有**标量计数字段。 */
+  const events = [
+    ev('turn/start', 0, { turn: 1 }),
+    ev('user/message', 1, user('Q')),
+    ev('deliverables/presented', 2, { turn: 1, callId: 'c1', files: [{ path: 'a.txt' }] }),
+    ev('deliverables/presented', 3, { turn: 1, callId: 'c2', files: [{ path: 'b.txt' }] }),
+    ev('turn/end', 4),
+    ev('turn/start', 5, { turn: 2 }),
+    ev('turn/end', 6)
+  ];
+  const turns = foldTurns(events);
+  assert.equal(turns[0].deliverables, 2);
+  assert.equal(turns[1].deliverables, 0, '没有交付物的轮次仍然是 0');
+  /* 回归：以前 deliverables 只在轮次初始化时写 0、从不累加，徽标与详情因此恒为空 */
+  assert.ok(foldTurns(ROOT_EVENTS).every((t) => t.deliverables === 0));
+});
+
+test('交付物计数一路传到块上：界面的 ⧉ 徽标读的就是 b.deliverables', async () => {
+  const events = [
+    ev('turn/start', 0, { turn: 1 }),
+    ev('user/message', 1, user('Q')),
+    ev('deliverables/presented', 2, { turn: 1, callId: 'c1', files: [] }),
+    ev('turn/end', 3)
+  ];
+  const ctx = fakeCtx({
+    sessionQuery: {
+      observeSession: () => Promise.resolve({ events, [Symbol.dispose]() {} })
+    }
+  });
+  const data = JSON.parse((await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), {})).body);
+  assert.equal(data.blocks.find((b) => b.id === 'root:1').deliverables, 1);
+  assert.equal(data.turns.root[0].deliverables, 1);
+});
+
 test('foldTurns 只取首条人类提问，注入的上下文不进入', () => {
   const events = [
     ev('turn/start', 0, { turn: 1 }),
@@ -288,6 +324,192 @@ test('buildPayload 非法 hidden/alias 返回 400', async () => {
   );
 });
 
+/* ------------------------------------------------------------------ 标题 */
+
+test('会话标题走 sessionQuery.readTitle：header 里根本没有 title 字段', async () => {
+  /* 宿主事实（dsh-session-query 的 readTitle）：标题是 `session/title` 日志事件折出来的，
+     会话 header 里**没有** title。以前读 header.title，于是导出里的会话名与文件名恒为原始 id。 */
+  const ctx = fakeCtx({
+    sessions: { list: () => [{ header: { id: 'root', parentSession: null, inheritedEventCount: 0 } }] },
+    sessionQuery: {
+      observeSession: fakeObserve,
+      readTitle: (id) => Promise.resolve(id === 'root' ? '真标题' : undefined)
+    }
+  });
+  const data = JSON.parse((await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), {})).body);
+  assert.equal(data.sessions.find((s) => s.id === 'root').title, '真标题');
+  assert.equal(data.blocks[0].sessionTitle, '真标题', '块的会话名跟着一起走');
+
+  const mm = await buildPayload(ctx, params({ sessionId: 'root', format: 'mm' }), {});
+  assert.match(mm.filename, /真标题/, '导出文件名也用标题，而不是原始 id');
+});
+
+test('readTitle 返回空时标题回落会话 id', async () => {
+  /* readTitle 的语义就是"日志里没有标题事件时返回 undefined"，这不是异常 */
+  const ctx = fakeCtx({
+    sessionQuery: { observeSession: fakeObserve, readTitle: () => Promise.resolve(undefined) }
+  });
+  const data = JSON.parse((await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), {})).body);
+  assert.equal(data.sessions.find((s) => s.id === 'root').title, 'root');
+});
+
+test('readTitle 若返回快照对象（api-catalog 的签名）也能取到标题', async () => {
+  /* 本版实现返回的是标题字符串，api-catalog 却写着返回 SessionTitleSnapshot ——
+     两种都认，绝不能把 "[object Object]" 当成标题写进导出文件。 */
+  const ctx = fakeCtx({
+    sessionQuery: {
+      observeSession: fakeObserve,
+      readTitle: () => Promise.resolve({ session: { id: 'root' }, title: '快照标题' })
+    }
+  });
+  const data = JSON.parse((await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), {})).body);
+  assert.equal(data.sessions.find((s) => s.id === 'root').title, '快照标题');
+});
+
+test('readTitle 抛错时标题回落会话 id，其余字段不受影响', async () => {
+  /* 回归：读标题要走日志折叠，会话不存在/日志读不动都会抛 —— 只降级，不让整次取数失败。
+     这里夹具的 header 里**有**标题，正是为了钉住"读不到就回落 id"：宿主 header 上没有标题，
+     所以回落 id 才是与真实宿主一致的行为。 */
+  const ctx = fakeCtx({
+    sessionQuery: { observeSession: fakeObserve, readTitle: () => { throw new Error('日志读不动'); } }
+  });
+  const data = JSON.parse((await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), {})).body);
+  assert.equal(data.sessions.find((s) => s.id === 'root').title, 'root');
+  assert.equal(data.sessions.find((s) => s.id === 'child').title, 'child');
+  assert.equal(data.stats.blocks, 4, '块、边、轮次一点没少');
+  assert.equal(data.edges.length, 1);
+});
+
+test('宿主没有 readTitle 时不抛错，标题仍旧退回 header 里的值', async () => {
+  /* 旧宿主 / 替身没有这个 API 时保持修复前的行为，不因为取不到标题就把数据弄丢 */
+  const data = JSON.parse((await buildPayload(fakeCtx(), params({ sessionId: 'root', format: 'json' }), {})).body);
+  assert.equal(data.sessions.length, 2);
+  assert.equal(data.sessions.find((s) => s.id === 'root').title, '根会话');
+  assert.ok(data.sessions.every((s) => typeof s.title === 'string' && s.title !== ''));
+});
+
+/* ------------------------------------------------- 取数范围（NFR-2 预算） */
+
+/** 2 轮的独立会话，与 root/child 没有血缘 —— 家族的"外面" */
+const OUTSIDE_EVENTS = [
+  ev('turn/start', 0, { turn: 1 }),
+  ev('user/message', 1, user('外面 Q1')),
+  ev('assistant/message', 2, assistant('外面 A1')),
+  ev('turn/end', 3),
+  ev('turn/start', 4, { turn: 2 }),
+  ev('user/message', 5, user('外面 Q2')),
+  ev('turn/end', 6)
+];
+
+/**
+ * 列表里除家族（root → child）外还有一个独立根 outside。
+ * 记录每个会话被 observeSession 的次数，用来断言"没读"。
+ */
+function familyCtx(extraEvents = {}) {
+  const seen = [];
+  const ctx = {
+    sessions: {
+      list: () => [
+        { header: { id: 'root', parentSession: null, inheritedEventCount: 0 } },
+        { header: { id: 'child', parentSession: 'root', inheritedEventCount: 13 } },
+        { header: { id: 'outside', parentSession: null, inheritedEventCount: 0 } }
+      ]
+    },
+    sessionQuery: {
+      observeSession: (id) => {
+        seen.push(id);
+        const events = id === 'root' ? ROOT_EVENTS
+          : id === 'child' ? CHILD_EVENTS
+            : (extraEvents[id] || []);
+        return Promise.resolve({ events, [Symbol.dispose]() {} });
+      },
+      readTitle: (id) => Promise.resolve(`标题-${id}`)
+    }
+  };
+  return { ctx, seen };
+}
+
+test('家族外的会话不读事件，但仍留在会话列表里（血缘判定不变）', async () => {
+  /* 回归：以前 list() 里每个会话都 observeSession 一遍，40 会话 × 50 轮时要开 40 个观察句柄、
+     回传 1.8 MB 轮次明细，哪怕这次请求只要当前家族。 */
+  const { ctx, seen } = familyCtx();
+  const out = await readSessions(ctx, [], {}, { currentId: 'root' });
+  assert.deepEqual(seen.slice().sort(), ['child', 'root'], '家族内（含后代）照读，家族外一条不读');
+  assert.ok(out.sessions.some((s) => s.id === 'outside'),
+    '家族外会话仍留在会话列表里 —— familyOf 判定家族根/孤儿/血环看的是整张列表');
+  assert.equal(out.turnsBySession.root.length, 3);
+  assert.equal(out.turnsBySession.child.length, 1, '家族内的轮次一条不少');
+  assert.equal(out.turnsBySession.outside, undefined, '没读过就不建键，免得被当成"读过但没内容"');
+});
+
+test('buildPayload 只回传家族范围内的轮次明细', async () => {
+  const { ctx, seen } = familyCtx();
+  const data = JSON.parse((await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), {})).body);
+  assert.deepEqual(seen.filter((id) => id === 'outside'), [], '没有为家族外会话打开观察句柄');
+  assert.equal(data.turns.root.length, 3);
+  assert.equal(data.turns.child.length, 1);
+  assert.ok(!data.turns.outside, '省下来的就是这份明细');
+  assert.equal(data.stats.sessions, 2, '家族数据里只有家族成员');
+  assert.ok(data.sessions.some((s) => s.id === 'child'), '后代没有被漏掉');
+});
+
+test('被 sessions= 显式点名的家族外会话仍然被读取', async () => {
+  const { ctx, seen } = familyCtx({ outside: OUTSIDE_EVENTS });
+  const data = JSON.parse((await buildPayload(ctx,
+    params({ sessionId: 'root', format: 'json', sessions: 'outside' }), {})).body);
+  assert.ok(seen.includes('outside'), '点名的会话必须读');
+  assert.equal(data.turns.outside.length, 2, '点名会话的轮次齐全');
+  assert.equal(data.turns.root.length, 3, '当前家族照旧');
+});
+
+test('sessions= 补齐冷父会话时家族向上延伸，派生边仍落在父会话的块上', async () => {
+  /* 客户端用 sessions= 补齐目录里有、但当前不活跃的会话：冷父会话回到列表里，
+     familyOf 才能把家族根往上提，子会话的分叉源才有块可挂。
+     范围收紧不能把这条路上的祖先排除掉 —— 祖先属于"当前会话的家族"。 */
+  const coldTurns = [
+    ev('turn/start', 0, { turn: 1 }),
+    ev('user/message', 1, user('冷 Q1')),
+    ev('assistant/message', 2, assistant('冷 A1')),
+    ev('turn/end', 3),
+    ev('turn/start', 4, { turn: 2 }),
+    ev('user/message', 5, user('冷 Q2')),
+    ev('turn/end', 7)
+  ];
+  const ctx = {
+    sessions: {
+      list: () => [{ header: { id: 'current', parentSession: 'cold', inheritedEventCount: 4 } }]
+    },
+    sessionQuery: {
+      observeSession: (id) => Promise.resolve({
+        events: id === 'cold' ? coldTurns : [],
+        [Symbol.dispose]() {}
+      }),
+      readTitle: (id) => Promise.resolve(`标题-${id}`)
+    }
+  };
+  const data = JSON.parse((await buildPayload(ctx,
+    params({ sessionId: 'current', sessions: 'cold', format: 'json' }), {})).body);
+  assert.equal(data.rootId, 'cold', '家族根提到了冷父会话');
+  assert.deepEqual(data.order, ['cold', 'current']);
+  assert.equal(data.edges.length, 1);
+  assert.equal(data.edges[0].from, 'cold:1', '注入的父会话轮次被读到，分叉源才算得出来');
+  assert.equal(data.edges[0].to, 'current:empty');
+  assert.equal(data.sessions.find((s) => s.id === 'cold').title, '标题-cold');
+});
+
+test('被引用连线拉进来的会话仍然读轮次（否则 FR-7 的引用节点会消失）', async () => {
+  /* 范围收紧要连"被引用拉进来"的会话一起收进来：buildGraph 会把它们并进 scoped，
+     不读轮次它们就成了断裂引用，导出里整个节点都没了。 */
+  const { ctx, seen } = familyCtx({ outside: OUTSIDE_EVENTS });
+  const links = JSON.stringify([{ id: 'R1', kind: 'reference', from: 'root:1', to: 'header:outside' }]);
+  const data = JSON.parse((await buildPayload(ctx,
+    params({ sessionId: 'root', format: 'json', links }), {})).body);
+  assert.ok(seen.includes('outside'), '被引用拉进来的会话要读');
+  assert.ok(data.sessions.some((s) => s.id === 'outside'), '它并进了家族数据');
+  const edge = data.edges.find((e) => e.kind === 'reference');
+  assert.ok(edge && edge.broken === false, '引用边两端都在，不是断裂边');
+});
+
 test('buildPayload 超上限不再报 413，改为降级返回骨架块（FR-4）', async () => {
   const ctx = fakeCtx();
   const out = await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), { maxBlocks: 3 });
@@ -335,13 +557,13 @@ test('buildPayload 尊重 includeHidden', async () => {
 
 /* ------------------------------------------------------------- 路由 */
 
-function captureRoute(over = {}) {
+function captureRoute(over = {}, config = { maxBlocks: 3000 }) {
   const registered = [];
   const ctx = fakeCtx({
     connection: { fetch: { register: (opts) => { registered.push(opts); return () => {}; } } },
     ...over
   });
-  apply(ctx, { maxBlocks: 3000 });
+  apply(ctx, config);
   return registered[0];
 }
 
@@ -417,6 +639,21 @@ test('json 格式不带 content-disposition，避免误触发下载', async () =
     'http://x/api/session.graph-export?sessionId=root&format=json'));
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('content-disposition'), null);
+});
+
+test('sessions 超上限是客户端输入错误：返回 400，而不是 503', async () => {
+  /* 回归：这个 Error 以前没有 .status，被 respondRead 兜成 503 ——
+     一个纯粹的输入错误被说成服务错误，浏览器侧还会照着 5xx 去重试/报障。 */
+  const route = captureRoute({}, { maxSessions: 1 });
+  const res = await route.fetch(new Request(
+    'http://x/api/session.graph-export?sessionId=root&format=json'));
+  assert.equal(res.status, 400);
+  assert.match(await res.text(), /上限/);
+
+  /* 同一处改动不能把别的语义一起带跑：sessionId 不可读仍然是 404 */
+  const missing = await captureRoute().fetch(new Request(
+    'http://x/api/session.graph-export?sessionId=nope&format=json'));
+  assert.equal(missing.status, 404);
 });
 
 /* ----------------------------------------------------------- 持久化 */
@@ -627,6 +864,70 @@ test('导出文件会带上存档里的手动连线（FR-15）', async () => {
   const body = await res.text();
   assert.match(body, /<arrowlink DESTINATION="ID_\d+"/, '手动连线导出成箭头链接');
   assert.match(body, /因为/, '连线标签进了根备注');
+});
+
+test('只读模式下导出也带上界面上的连线：links 参数（FR-15）', async () => {
+  /* 界面上的连线有 400ms 写回防抖，只读模式下更是永不落盘；导出对话框的预览走客户端
+     本地 render，于是"预览里有、导出文件里一条都没有"。 */
+  const route = captureRoute();        /* 没有 storageDomain → 只读 */
+  const links = JSON.stringify([
+    { id: 'P1', kind: 'link', from: 'root:1', to: 'child:1', label: '因为' }
+  ]);
+
+  const bare = await route.fetch(new Request(
+    'http://x/api/session.graph-export?sessionId=root&format=mm'));
+  assert.ok(!(await bare.text()).includes('<arrowlink'), '不带参数时确实没有连线可导 —— 这正是缺陷本身');
+
+  const res = await route.fetch(new Request(
+    `http://x/api/session.graph-export?sessionId=root&format=mm&links=${encodeURIComponent(links)}`));
+  const body = await res.text();
+  assert.match(body, /<arrowlink DESTINATION="ID_\d+"/, '参数里的连线导出成箭头链接');
+  assert.match(body, /因为/, '连线标签进了根备注');
+});
+
+test('links 参数与存档按 id 合并、参数优先，md 导出同样带上', async () => {
+  const domain = fakeStorageDomain(new Map([
+    ['root', {
+      version: 1,
+      positions: {},
+      alias: {},
+      collapsedSessions: [],
+      hiddenBlocks: [],
+      links: [{
+        id: 'L1', kind: 'link',
+        from: { sessionId: 'root', turn: 1 }, to: { sessionId: 'child', turn: 1 },
+        label: '存档标签'
+      }]
+    }]
+  ]));
+  const route = captureRoute({ storageDomain: domain });
+  await settle();
+
+  const links = JSON.stringify([
+    { id: 'L1', kind: 'link', from: 'root:1', to: 'child:1', label: '参数标签' },
+    { id: 'L2', kind: 'link', from: 'root:2', to: 'child:1', label: '新连线' }
+  ]);
+  const res = await route.fetch(new Request(
+    `http://x/api/session.graph-export?sessionId=root&format=md&links=${encodeURIComponent(links)}`));
+  const body = await res.text();
+  assert.match(body, /参数标签/, '同 id 的条目用参数那条');
+  assert.ok(!body.includes('存档标签'), '没有留下第二份');
+  assert.match(body, /新连线/, '参数里多出来的连线也带上');
+
+  const rows = body.split('## 手动连线')[1].split('\n').filter((l) => l.startsWith('- `'));
+  assert.equal(rows.length, 2, '合并后是两条，不是三条');
+});
+
+test('links 参数不是 JSON 数组时返回 400', async () => {
+  const route = captureRoute();
+  const bad = await route.fetch(new Request(
+    'http://x/api/session.graph-export?sessionId=root&format=json&links=%7Boops'));
+  assert.equal(bad.status, 400);
+  assert.match(await bad.text(), /links/);
+
+  const notArray = await route.fetch(new Request(
+    'http://x/api/session.graph-export?sessionId=root&format=json&links=%7B%22a%22%3A1%7D'));
+  assert.equal(notArray.status, 400, '合法 JSON 但不是数组，同样算参数非法');
 });
 
 /* ------------------------------------------ 超规模降级（FR-4） */

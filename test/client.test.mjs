@@ -1915,3 +1915,244 @@ test('组件卸载后 window 上不留任何监听，待发写入也被取消', 
     serverReply = { ...serverReply, state: null };
   }
 });
+
+/* `sessions=` 的用途是把 Host 活跃列表里没有的**家族成员**补进来（例如已归档的父会话），
+   不是"请把整个目录读一遍"。报全量会让 Host 侧按家族收敛取数的优化失效 ——
+   点一个骨架块又变成重读整库。这条用例专门盯住"只报家族内"。 */
+test('sessions= 只报家族内的会话：家族外的会话不该进请求（否则 Host 会读全库）', async () => {
+  const savedList = ctx.sessions.list;
+  const byId = {
+    ...Object.fromEntries(FAMILY.map((s) => [s.id, { ...s, sessionId: s.id }])),
+    outsider: { id: 'outsider', title: '别的家族', parentId: null, sessionId: 'outsider' }
+  };
+  ctx.sessions.list = source({ byId });
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    render(ctx.slots.Component, props);
+    const url = fetchCalls[fetchCalls.length - 1];
+    assert.match(url, /sessions=root%2Cancor%2Cinvest/, '只报家族内的三个会话');
+    assert.ok(!url.includes('outsider'), '家族外的会话不能进 sessions=：' + url);
+  } finally {
+    ctx.sessions.list = savedList;
+  }
+});
+
+/* ============================================================================
+   回归：这一批是"装完插件整个界面坏掉"以及若干静默失效的直接原因
+   ============================================================================ */
+
+/* 宿主取视图标签时**直接调用**这个 thunk（ui-slots 的 resolveSlotLabel 是
+   `typeof label === 'function' ? label() : label`，没有任何兜底），
+   而且调用时机与组件无关：注册槽位、**切换会话**（activateView 里又取一次 viewTabs）、
+   换语言都会跑。它必须在模块作用域可用 —— 早先写成 `() => t('view.title')`，
+   而 t 只活在 GraphView 里，于是宿主一取标签就抛 ReferenceError：切会话切不动、
+   输入框也跟着废掉。现有用例只断言了槽位形状，从没调用过 label()，所以没抓到。 */
+test('视图标签在模块作用域可解析：宿主取标签不抛错（回归：曾经整个界面被它带崩）', () => {
+  const label = ctx.slots.options.label;
+  assert.equal(typeof label, 'function');
+  assert.doesNotThrow(() => label(), '宿主 resolveSlotLabel 会直接调用它，抛错会打断 activateView');
+  assert.equal(label(), '图谱', '默认中文');
+  assert.notEqual(label(), 'view.title', '绝不能把键名当文案显示');
+});
+
+test('切语言后视图标签跟着变，且仍然不抛错', () => {
+  const label = ctx.slots.options.label;
+  const before = ctx.locale.getSnapshot().active;
+  try {
+    ctx.locale.set({ active: 'en' });
+    assert.equal(label(), 'Graph');
+  } finally {
+    ctx.locale.set({ active: before });
+  }
+  assert.equal(label(), '图谱', '切回来要跟着回来');
+});
+
+test('宿主解析器缺席时视图标签退回本地字典，而不是抛错', () => {
+  const label = ctx.slots.options.label;
+  const savedResolver = ctx.locale.resolveText;
+  const before = ctx.locale.getSnapshot().active;
+  try {
+    delete ctx.locale.resolveText;
+    ctx.locale.set({ active: 'en' });
+    assert.equal(label(), 'Graph');
+  } finally {
+    ctx.locale.resolveText = savedResolver;
+    ctx.locale.set({ active: before });
+  }
+});
+
+/* 400ms 防抖窗口里删两条连线时，合并补丁曾用对象展开把前一次的 removeLinkIds
+   覆盖掉；而 Host 侧的 links 是按 id 合并的，于是被覆盖掉的那条连线在存档里"复活"。 */
+test('防抖窗口内连删两条连线：removeLinkIds 取并集，不能只报最后一条', async () => {
+  serverReply = {
+    ...serverReply,
+    state: blankState({
+      links: [
+        { id: 'L1', kind: 'link', from: 'root:1', to: 'root:2', label: '甲' },
+        { id: 'L2', kind: 'link', from: 'root:1', to: 'root:3', label: '乙' }
+      ]
+    })
+  };
+  const before = postCalls.length;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+
+    /* 点标签选中边 → 面板里点删除；两次都落在同一个防抖窗口内 */
+    const labelOf = (text) => elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-elabel') && n.props.children === text);
+    const delBtn = (t) => elements(t).find((n) => n.props && n.props.className === 'sg-act sg-danger');
+
+    labelOf('甲').props.onClick({ stopPropagation() {} });
+    tree = render(ctx.slots.Component, props);
+    delBtn(tree).props.onClick();
+    tree = render(ctx.slots.Component, props);
+
+    labelOf('乙').props.onClick({ stopPropagation() {} });
+    tree = render(ctx.slots.Component, props);
+    delBtn(tree).props.onClick();
+
+    await new Promise((r) => setTimeout(r, 520));
+    const sent = postCalls.slice(before).map((c) => c.patch.removeLinkIds || []).flat();
+    assert.deepEqual([...new Set(sent)].sort(), ['L1', 'L2'],
+      '两次删除的 id 都要上报，否则被覆盖掉的那条会在存档里复活');
+    const last = postCalls[postCalls.length - 1].patch;
+    assert.deepEqual(last.links, [], '界面上两条都没了');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+/* 拖会话头是"平移画布"（所有非块节点都走平移），而 mouseup 之后浏览器必补一个 click：
+   不加防护时，一拖会话头就顺带把会话切走。块上早就防了，会话头漏了。 */
+test('拖会话头平移后不会顺带切换会话', () => {
+  resetComponent();
+  const tree = render(ctx.slots.Component, props);
+  delete ctx.opened;
+
+  /* 取一个**非当前**会话的头（当前会话点了也不会切） */
+  const headOf = (t, title) => elements(t).find((n) => typeof n.props.className === 'string'
+    && n.props.className.includes('sg-label') && n.props.onClick
+    && textsOf(n).some((x) => x.includes(title)));
+  const head = headOf(tree, '锚定效应');
+  assert.ok(head, '找得到非当前会话的会话头');
+
+  /* 在画布上按下（会话头不是块 → 走平移）、拖过阈值、松手 */
+  const wrap = elements(tree).find((n) => typeof n.props.className === 'string'
+    && n.props.className.includes('sg-canvas-wrap'));
+  wrap.props.onMouseDown({ button: 0, clientX: 100, clientY: 100, target: { closest: () => null }, preventDefault() {} });
+  fire('mousemove', { clientX: 160, clientY: 100, preventDefault() {} });
+  fire('mouseup', { clientX: 160, clientY: 100, target: { closest: () => null } });
+
+  /* 松手后浏览器补的那一次 click 落在会话头上 */
+  head.props.onClick();
+  assert.equal(ctx.opened, undefined, '拖出来的那一次 click 不能当成切换会话');
+
+  /* 真正的单击仍然要能切会话 */
+  const head2 = headOf(render(ctx.slots.Component, props), '锚定效应');
+  head2.props.onClick();
+  assert.equal(ctx.opened, 'ancor', '单击照旧切换会话');
+});
+
+/* 「折叠其他会话」原先是个死按钮：只改自己的高亮，没有任何渲染读它。
+   需求 FR-5 / FR-11：折叠非当前会话的块，只保留会话头与派生边，可就地展开。 */
+test('「折叠其他会话」真的折叠：只留会话头与派生边，且可就地展开', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+
+    const shown = () => elements(tree).filter((n) => n.props && n.props['data-sg-node'])
+      .map((n) => n.props['data-sg-node']);
+    assert.equal(shown().length, 10, '默认：家族内全部会话的块都画');
+
+    const btn = elements(tree).find((n) => n.props && typeof n.props.className === 'string'
+      && n.props.className.includes('sg-btn') && String(n.props.children).includes('折叠其他会话'));
+    btn.props.onClick();
+    tree = render(ctx.slots.Component, props);
+
+    const after = shown();
+    assert.ok(after.every((id) => id.startsWith('root:')), '只剩当前会话的块：' + after.join(','));
+    assert.equal(elements(tree).filter((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-label')).length, 3, '三个会话头都还在，骨架没断');
+    assert.ok(elements(tree).some((n) => n.props && n.props['data-sg-edge']), '派生边还在');
+
+    /* 折叠后派生边的终点要退到会话头，不能画到看不见的块上 */
+    const drawn = elements(tree).filter((n) => n.props && n.props['data-sg-edge']);
+    const nodeIds = new Set(elements(tree).filter((n) => n.props && n.props['data-sg-node'])
+      .map((n) => n.props['data-sg-node']));
+    assert.ok(nodeIds.size > 0);
+    drawn.forEach((p) => assert.ok(typeof p.props.d === 'string' && p.props.d.startsWith('M')));
+
+    /* 会话头上的 ▸ 展开回来 */
+    const chev = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-expand') && n.props.children === '▸');
+    assert.ok(chev, '折叠的会话头上有展开入口');
+    chev.props.onClick({ stopPropagation() {} });
+    tree = render(ctx.slots.Component, props);
+    assert.ok(shown().some((id) => id.startsWith('ancor:')), '展开后该会话的块回来了');
+
+    /* 关掉开关：恢复默认全展开 */
+    const btn2 = elements(tree).find((n) => n.props && typeof n.props.className === 'string'
+      && n.props.className.includes('sg-btn') && String(n.props.children).includes('折叠其他会话'));
+    btn2.props.onClick();
+    tree = render(ctx.slots.Component, props);
+    assert.equal(shown().length, 10, '关掉后回到全展开');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+/* 没有可用会话 id 时，取数 effect 直接 return，`loaded` 永远是 false，
+   而"首次装配中"的判定是 `!loaded && 块数 === 0` —— 界面就一直转，什么都不会发生。 */
+test('没有可用会话 id 时不卡在「首次装配中」，而是给出空态', async () => {
+  resetComponent();
+  const bare = { ...ctx.slots.options.inject(''), ...slotKit() };
+  render(ctx.slots.Component, bare);
+  await tick();
+  const tree = render(ctx.slots.Component, bare);
+  assert.ok(!textIn(tree).includes('正在装配'), '不能一直显示装配中');
+  assert.ok(textIn(tree).includes('还没有可显示的轮次'), '要给空态，而不是空转：' + textIn(tree).slice(0, 80));
+});
+
+/* 编辑连线标签原先每敲一个字符就 remember() + persist()：撤销变成"退一个字符"，
+   50 步历史也会被一次输入冲光。改名输入框早就是"先攒后提交"，标签要对齐。 */
+test('编辑连线标签：编辑期间不写回，回车后才落一次盘、只占一格撤销', async () => {
+  serverReply = {
+    ...serverReply,
+    state: blankState({ links: [{ id: 'L1', kind: 'link', from: 'root:1', to: 'root:2', label: '甲' }] })
+  };
+  const before = postCalls.length;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-elabel')).props.onClick({ stopPropagation() {} });
+    tree = render(ctx.slots.Component, props);
+
+    const input = elements(tree).find((n) => n.props && n.props.className === 'sg-linkdraft-in sg-wide');
+    assert.ok(input, '标签输入框在');
+    input.props.onChange({ target: { value: '甲乙' } });
+    input.props.onChange({ target: { value: '甲乙丙' } });
+    await new Promise((r) => setTimeout(r, 520));
+    assert.equal(postCalls.length, before, '编辑期间一个字节都不写');
+
+    const input2 = elements(render(ctx.slots.Component, props))
+      .find((n) => n.props && n.props.className === 'sg-linkdraft-in sg-wide');
+    input2.props.onKeyDown({ key: 'Enter', stopPropagation() {} });
+    await new Promise((r) => setTimeout(r, 520));
+    assert.equal(postCalls.length, before + 1, '回车只落一次盘');
+    const sent = postCalls[postCalls.length - 1].patch.links;
+    assert.equal(sent[0].label, '甲乙丙');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});

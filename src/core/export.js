@@ -17,7 +17,17 @@ import { clip, plain, sessionOfId, summarize, tidy } from './model.js';
 
 export const FORMATS = ['mm', 'md'];
 
+/**
+ * XML 1.0 的 Char 不允许的字符：C0 控制字符（\t \n \r 例外）与 U+FFFE/U+FFFF。
+ *
+ * 真实会话正文里带着 ANSI 转义（ESC = U+001B）与 NUL，只转义 & < > " ' 是拦不住它们的 ——
+ * 结果是**整个 .mm 文件都不是合法 XML**（不是少一行，是解析器直接罢工）。
+ * 所以这里直接丢掉，而不是换成实体：这些字符在思维导图里也没有任何可显示的含义。
+ */
+const XML_ILLEGAL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]/g;
+
 const escXml = (v) => String(v === undefined || v === null ? '' : v)
+  .replace(XML_ILLEGAL, '')
   .replace(/&/g, '&amp;')
   .replace(/</g, '&lt;')
   .replace(/>/g, '&gt;')
@@ -40,8 +50,14 @@ function inlineHtml(text) {
     .replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, '<a href="$2">$1</a>');
 }
 
-/** 表格分隔行（`|---|---|`）在思维导图里只是噪声，丢掉 */
-const isTableRule = (line) => /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line) && line.includes('-');
+/**
+ * 表格分隔行（`|---|---|`）在思维导图里只是噪声，丢掉。
+ *
+ * 必须**同时**含 `|` 才算分隔行：早先只按"字符全在 [\s:|-] 里且至少一个 -"判断，
+ * 于是 `---`、`--` 这类 Markdown 水平线也被当成表格规则吃掉 —— 那是一行真内容。
+ */
+const isTableRule = (line) =>
+  line.includes('|') && /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line);
 
 /**
  * 把一段 Markdown 正文逐行转成 `<p>`，首行带标签（如「问」）。返回**数组**，
@@ -88,10 +104,25 @@ export function stamp(at) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/** 文件名安全化：路径非法字符替换、长度截断、空标题回落 */
+/**
+ * 去掉孤立代理码元。
+ *
+ * 截断救不了输入本身就畸形的标题（正文被截过、上游拼接出错等），
+ * 而孤立代理会让 encodeURIComponent 抛 URIError —— 下载链接根本拼不出来。
+ */
+const stripLoneSurrogates = (s) => s
+  .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
+  .replace(/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '$1');
+
+/**
+ * 文件名安全化：路径非法字符替换、长度截断、空标题回落。
+ *
+ * 截断必须按**码点**，不能按 UTF-16 码元：`'x'.repeat(59) + '😀'` 这类标题
+ * 切在 60 个码元上会留下半个代理对（0xD83D），随后 encodeURIComponent 抛 URIError。
+ */
 export function safeFilename(title, fallback = 'session-graph') {
   const base = plain(title).replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim();
-  return (base || fallback).slice(0, 60);
+  return stripLoneSurrogates([...(base || fallback)].slice(0, 60).join(''));
 }
 
 /** 导出文件名：`会话图谱-<家族根标题>.mm|.md` */
@@ -141,13 +172,56 @@ export function buildTree(graph, options = {}) {
      被引用拉进来的会话不算根 —— 它们挂在源块之下（refsAt），
      否则同一个会话会在导出结果里出现两遍。 */
   const pulled = new Set(graph.referenced || []);
-  const roots = graph.order
+  const baseRoots = graph.order
     .map((id) => bySession.get(id))
     .filter((s) => s && !pulled.has(s.id) && (!s.parentId || !bySession.has(s.parentId)));
 
+  const childrenOf = new Map();
+  graph.sessions.forEach((s) => {
+    if (!s.parentId) return;
+    if (!childrenOf.has(s.parentId)) childrenOf.set(s.parentId, []);
+    childrenOf.get(s.parentId).push(s.id);
+  });
+
+  /* 哪些会话真的会被画出来？从根往下走一遍：子会话全部会挂上，而**只有可见块的
+     引用连线才拉得动会话** —— 源块被隐藏时 buildGraph 根本不生成那条引用边（FR-11）。
+     早先没有这一步，只把"源块 id 命中"当唯一出口：源块一被隐藏，被引用的会话
+     既不是根、也没有挂载点，于是一整个会话从 .mm/.md 里消失，连一句提示都没有。 */
+  const live = new Set();
+  const mark = (seed) => {
+    const stack = seed.map((s) => s.id);
+    while (stack.length) {
+      const sid = stack.pop();
+      if (!sid || live.has(sid) || !bySession.has(sid)) continue;
+      live.add(sid);
+      (childrenOf.get(sid) || []).forEach((id) => stack.push(id));
+      blocksOf(sid).forEach((b) => refsAt(b.id).forEach((id) => stack.push(id)));
+    }
+  };
+  mark(baseRoots);
+
+  /* order 里的会话必须**恰好出现一次**：没被任何节点接住的（引用源块被隐藏、
+     血缘成环谁也不是根）补成根，绝不静默丢节点。 */
+  const extraRoots = graph.order
+    .map((id) => bySession.get(id))
+    .filter((s) => s && !live.has(s.id));
+  mark(extraRoots);
+  const roots = [...baseRoots, ...extraRoots];
+
+  /* 同一个会话只能出现在一处：补出来的根与树内挂载可能指向同一个会话
+     （成环、同一条引用被多块引用），渲染期用这个集合兜住"恰好一次"。 */
+  const rendered = new Set();
+  const enter = (sid) => {
+    if (rendered.has(sid)) return false;
+    rendered.add(sid);
+    return true;
+  };
+
   const skipped = [];
   const keptLinks = [];
-  const visible = new Set(graph.blocks.map((b) => b.id));
+  /* 只有真的会被输出的块才算"可见"。按 graph.blocks 判断会造出指向不存在节点的
+     `<arrowlink DESTINATION>` —— 悬空目标在思维导图里是硬错误，不是少画一条线。 */
+  const visible = new Set(graph.blocks.filter((b) => live.has(b.sessionId)).map((b) => b.id));
   links.forEach((l) => {
     if (l.kind === 'reference') return;                       /* 引用关系已由树结构表达 */
     if (visible.has(l.from) && visible.has(l.to)) keptLinks.push(l);
@@ -160,7 +234,11 @@ export function buildTree(graph, options = {}) {
     linkFrom.get(l.from).push(l);
   });
 
-  return { roots, blocksOf, childrenAt, leftoverChildren, refsAt, keptLinks, linkFrom, skipped };
+  return {
+    roots, blocksOf, childrenAt, leftoverChildren, refsAt, keptLinks, linkFrom, skipped, enter,
+    /* 被引用拉进来、却因源块不可见而只能当根的会话：导出里要给出诚实提示 */
+    promotedRoots: extraRoots.filter((s) => pulled.has(s.id))
+  };
 }
 
 /* ------------------------------------------------------------------ .mm */
@@ -224,6 +302,8 @@ export function toFreeMind(graph, options = {}) {
 
   function sessionNode(s, depth, mode) {
     if (!s) return;
+    /* 同一个会话只画一次：补出来的根与树内挂载可能指向同一个会话（成环、重复引用） */
+    if (!tree.enter(s.id)) return;
     const ref = mode === 'ref';
     const label = ref && /^引用[:：]/.test(s.title) ? s.title : (ref ? `引用：${s.title}` : s.title);
     out.push(`${pad(depth)}<node TEXT="${escXml(label)}" ID="${idOf(`S:${s.id}`)}">`);
@@ -254,6 +334,10 @@ export function toFreeMind(graph, options = {}) {
     '分叉出来的会话挂在它的分叉源块之下；手动连线导出为箭头链接。'
   ];
   if (graph.stats.hiddenSkipped) note.push(`有 ${graph.stats.hiddenSkipped} 个块因被隐藏而未导出。`);
+  /* 引用源块被隐藏时，被引用的会话只能当根 —— 这件事必须说出来，不能悄悄改变结构 */
+  if (tree.promotedRoots.length) {
+    note.push(`有 ${tree.promotedRoots.length} 个被引用的会话因源块不可见，已作为根导出。`);
+  }
   tree.keptLinks.forEach((l) => note.push(`连线：${l.from} → ${l.to}${l.label ? `（${l.label}）` : ''}`));
   tree.skipped.forEach((l) => note.push(`未导出的连线：${l.from} → ${l.to}${l.label ? `（${l.label}）` : ''}`));
   rich('NOTE', 1, note.map((n) => `<p>${escXml(n)}</p>`));
@@ -282,6 +366,10 @@ export function toMarkdown(graph, options = {}) {
   out.push(`> 导出时间 ${options.stamp || stamp()} · 会话 ${graph.stats.sessions} 个 · 块 ${graph.stats.blocks} 个`);
   out.push('>');
   out.push('> 每个块内用 **问** / **答** 两段区分用户提问与助手回答，正文按其原有 Markdown 结构缩进呈现。', '');
+  /* 引用源块被隐藏时，被引用的会话只能当根 —— 这件事必须说出来，不能悄悄改变结构 */
+  if (tree.promotedRoots.length) {
+    out.push(`> 有 ${tree.promotedRoots.length} 个被引用的会话因源块不可见，已作为根导出。`, '');
+  }
 
   function blockItem(block, depth) {
     const alias = block.alias ? `（${block.alias}）` : '';
@@ -300,6 +388,8 @@ export function toMarkdown(graph, options = {}) {
 
   function sessionItem(s, depth, mode) {
     if (!s) return;
+    /* 同一个会话只列一次：补出来的根与树内挂载可能指向同一个会话（成环、重复引用） */
+    if (!tree.enter(s.id)) return;
     const mark = mode === 'ref' ? '🔗 引用' : '⑂ 分叉';
     const label = mode === 'ref' ? s.title.replace(/^引用[:：]\s*/, '') : s.title;
     out.push(`${ind(depth)}- **${mark} → ${label}**`);
@@ -310,6 +400,8 @@ export function toMarkdown(graph, options = {}) {
   }
 
   tree.roots.forEach((s) => {
+    /* 补根与树内挂载可能撞到同一个会话：先到先画，后到的跳过 */
+    if (!tree.enter(s.id)) return;
     out.push(`## ${s.title}`, '');
     tree.blocksOf(s.id).forEach((b) => blockItem(b, 0));
     tree.leftoverChildren(s.id).forEach((c) => sessionItem(c, 0, 'fork'));

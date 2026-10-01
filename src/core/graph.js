@@ -209,10 +209,13 @@ export function fitView(nodes, viewportWidth, viewportHeight, padding = 48) {
  * 键盘在相邻块之间移动选中（FR-5 / NFR-5）。
  * 只在按键方向的 ±45° 锥内取候选，命中后再按「同轴优先」打分——
  * 否则在列末按方向键会跳到邻列去，观感上是乱飞。
+ *
+ * **只在块之间走**：需求写的就是「在相邻块之间移动选中」，会话头不是块 ——
+ * 选中它右栏没有任何块级信息可给，只会让详情面板空掉。
  * @returns {string|null} 下一个节点 id；无处可去时返回 null
  */
 export function moveSelection(nodes, selectedId, key) {
-  const walkable = nodes.filter((n) => n.kind === 'block' || n.kind === 'header');
+  const walkable = nodes.filter((n) => n.kind === 'block');
   if (!walkable.length) return null;
   const cur = walkable.find((n) => n.id === selectedId) || walkable[0];
   const dir = { ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] }[key];
