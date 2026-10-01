@@ -1,0 +1,153 @@
+{
+  "note": "从真实会话日志提取的**事件形状**（类型 + 字段名 + 字段类型），不含任何内容。由 scripts/make-fixtures.mjs 生成；test/fixture.test.mjs 用它核对折叠逻辑读的字段路径。",
+  "records": 1296,
+  "types": [
+    "agent/inbox/spliced",
+    "approval/asked",
+    "approval/decided",
+    "compaction/start",
+    "session",
+    "session-log-deepseek/delivery-accepted",
+    "session/end-seed",
+    "step/start",
+    "tool/call",
+    "turn/end"
+  ],
+  "shapes": {
+    "session": {
+      "count": 1,
+      "keys": {
+        "type": "string",
+        "version": "number",
+        "id": "string",
+        "createdAt": "number",
+        "cwd": "string",
+        "isSeeded": "boolean",
+        "delegationDepth": "number",
+        "agentPreset": "string"
+      },
+      "data": null
+    },
+    "session-log-deepseek/delivery-accepted": {
+      "count": 642,
+      "keys": {
+        "type": "string",
+        "seq": "number",
+        "time": "number",
+        "data": "object"
+      },
+      "data": {
+        "sessionId": "string",
+        "sessionFormatVersion": "number",
+        "throughSeq": "number"
+      }
+    },
+    "step/start": {
+      "count": 614,
+      "keys": {
+        "type": "string",
+        "seq": "number",
+        "time": "number",
+        "data": "object"
+      },
+      "data": {
+        "turn": "number",
+        "step": "number"
+      }
+    },
+    "tool/call": {
+      "count": 10,
+      "keys": {
+        "type": "string",
+        "seq": "number",
+        "time": "number",
+        "data": "object"
+      },
+      "data": {
+        "turn": "number",
+        "step": "number",
+        "callId": "string",
+        "name": "string",
+        "arguments": "string"
+      }
+    },
+    "agent/inbox/spliced": {
+      "count": 11,
+      "keys": {
+        "type": "string",
+        "seq": "number",
+        "time": "number",
+        "data": "object"
+      },
+      "data": {
+        "target": "string",
+        "start": "number",
+        "inserted": "array<object>"
+      }
+    },
+    "turn/end": {
+      "count": 4,
+      "keys": {
+        "type": "string",
+        "seq": "number",
+        "time": "number",
+        "data": "object"
+      },
+      "data": {
+        "turn": "number",
+        "reason": "object"
+      }
+    },
+    "session/end-seed": {
+      "count": 6,
+      "keys": {
+        "type": "string",
+        "seq": "number",
+        "time": "number",
+        "data": "object"
+      },
+      "data": {}
+    },
+    "approval/asked": {
+      "count": 4,
+      "keys": {
+        "type": "string",
+        "seq": "number",
+        "time": "number",
+        "data": "object"
+      },
+      "data": {
+        "id": "string",
+        "toolName": "string",
+        "callId": "string",
+        "reason": "string"
+      }
+    },
+    "approval/decided": {
+      "count": 3,
+      "keys": {
+        "type": "string",
+        "seq": "number",
+        "time": "number",
+        "data": "object"
+      },
+      "data": {
+        "id": "string",
+        "outcome": "string"
+      }
+    },
+    "compaction/start": {
+      "count": 1,
+      "keys": {
+        "type": "string",
+        "seq": "number",
+        "time": "number",
+        "data": "object"
+      },
+      "data": {
+        "compactionId": "string",
+        "turn": "number"
+      }
+    }
+  }
+}
