@@ -1885,3 +1885,33 @@ test('字典注册落在 effect 作用域内（NFR-4）', () => {
   assert.ok(ctx.effects.some((e) => typeof e.label === 'string' && e.label.includes('dictionaries')),
     '字典注册包在 ctx.effect 里：' + ctx.effects.map((e) => e.label).join(', '));
 });
+
+/* ------------------------------------- 卸载不留残留（验收 22 / NFR-4） */
+
+test('组件卸载后 window 上不留任何监听，待发写入也被取消', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+
+    const live = () => [...listeners.values()].reduce((n, s) => n + s.size, 0);
+    assert.ok(live() > 0, '挂载时确实注册了全局监听');
+
+    /* 造一个待发写入：定时器还挂着 */
+    tree = selectBlock('root:1');
+    elements(tree).find((n) => n.props && n.props.className === 'sg-act'
+      && String(n.props.children).includes('隐藏此块')).props.onClick();
+    const postsBefore = postCalls.length;
+
+    resetComponent();                       /* 等价于卸载：会跑所有清理 */
+    assert.equal(live(), 0, '卸载后全局监听清零，实际剩 ' + live());
+
+    /* 待发的写入也不该再发出去 */
+    await new Promise((r) => setTimeout(r, 520));
+    assert.equal(postCalls.length, postsBefore, '卸载后不再写回');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
