@@ -171,7 +171,7 @@ export function turnsFromTimeline(timeline) {
     if (!Number.isFinite(turn) || seen.has(turn)) return;
     seen.add(turn);
     const endSeq = numOrNull(rec.end && rec.end.seq);
-    out.push({
+    const item = {
       turn,
       startSeq: numOrNull(rec.start && rec.start.seq) ?? numOrNull(rec.seq),
       endSeq,
@@ -180,7 +180,11 @@ export function turnsFromTimeline(timeline) {
       status: rec.status === 'failed' ? 'failed' : endSeq === null ? 'open' : 'done',
       toolCalls: Number(rec.toolCalls ?? rec.toolCallCount ?? 0) || 0,
       deliverables: Number(rec.deliverables ?? rec.deliverableCount ?? 0) || 0
-    });
+    };
+    /* 时间线上若已经判过"这一轮是不是继承的"，原样传下去（布尔值，两端都传）；
+       `undefined` 才表示"没判过"，那时才轮到按序号判。 */
+    if (typeof rec.inherited === 'boolean') item.inherited = rec.inherited;
+    out.push(item);
   };
 
   if (order.length) order.forEach((k, i) => take(get(k), i + 1));
@@ -211,11 +215,60 @@ export function normalizeSessions(raw) {
       parentId,
       /* 分叉源轮次。上游没有这个字段时留 null，派生边会退回挂到会话头 */
       forkAtTurn: numOrNull(s.forkAtTurn ?? s.forkAt ?? s.parentTurn),
+      /* 继承的事件条数（子会话 header 里有）：自有轮次从它之后开始（FR-8）。
+         宿主折叠时已经按日志里的 `session/end-seed` 标过一遍，这里留着是为了让
+         **本地时间线**那份数据也能判出来（它只有轮次号与序号、没有事件类型）。 */
+      inheritedEventCount: numOrNull(
+        s.inheritedEventCount ?? (s.header ? s.header.inheritedEventCount : null)
+      ),
       blank: !!s.blank,
       origin: str(s.origin) || 'session'
     });
   });
   return out;
+}
+
+/**
+ * 会话继承前缀的收尾序号（FR-8）。
+ *
+ * 分叉出来的子会话，日志开头是**父会话那段历史的副本**（DSH 播种时写进去的），
+ * 后面才是用户新问的内容。`inheritedEventCount` 是继承的事件条数，
+ * 所以闭区间切点 = 条数 − 1 —— 与 host 侧 `forkTurnFromChild` 同一口径。
+ *
+ * **只对分叉出来的会话（有父会话）成立**：没有父会话就谈不上继承前缀，一律返回 null。
+ * 这条守卫是必需的 —— 万一上游把某个继承事件数安到了根会话头上（这个字段的来源不止
+ * 一处：会话对象、header、请求参数），按序号猜就会把用户自己的轮次判成继承的，
+ * 于是**整轮对话从图上消失**，而现象与"这个会话本来就空"一模一样，极难分辨。
+ *
+ * 判不出来（没有父会话、没有这个字段、或它不是正数）时返回 null：**判不出来就不标**，
+ * 宁可多画一轮，也不能凭空把用户的轮次藏起来。宿主按日志逐轮给出的 `inherited`
+ * 标记不受这条守卫影响 —— 那是权威结论，由 `isInheritedTurn` 优先采信。
+ */
+export function inheritedBoundary(session) {
+  if (!session || !session.parentId) return null;
+  const count = numOrNull(session.inheritedEventCount);
+  return count === null || count <= 0 ? null : count - 1;
+}
+
+/**
+ * 这一轮是否落在继承前缀里。
+ *
+ * 判据分两层，**顺序不能反**：
+ *   1. 轮次上已经有明确布尔值就听它 —— 宿主折日志时按 `session/end-seed` 判过，
+ *      那是权威结论；它说 `false`（自有）就不能再按序号翻案。
+ *   2. 没有标记时才按序号猜：本地时间线只有 `startSeq`（轮次的序号），
+ *      用会话的继承事件数算出的切点来判。
+ * 两套判据都得不到结论时返回 false —— 宁可多画一轮，也不凭空藏用户的轮次。
+ */
+function isInheritedTurn(turn, boundary) {
+  if (!turn || typeof turn !== 'object') return false;
+  if (turn.inherited === true) return true;
+  if (turn.inherited === false) return false;
+  if (boundary === null) return false;
+  const start = numOrNull(turn.startSeq);
+  if (start !== null) return start <= boundary;
+  const end = numOrNull(turn.endSeq);
+  return end !== null && end <= boundary;
 }
 
 /**
@@ -363,13 +416,32 @@ export function buildGraph(input) {
   const referencedIds = [...scopedIds].filter((id) => fam.order.indexOf(id) < 0);
   const order = [...fam.order, ...referencedIds];
 
-  /* 每个会话的全部轮次（**不过滤隐藏**）。端点是否被隐藏必须按全集判断，
-     否则"被隐藏的块"会与"从未载入的轮次"混同，导致派生边悄悄改挂到会话头。 */
+  /* 每个会话的**自有**轮次（不过滤隐藏，也不含继承前缀）。
+     端点是否被隐藏必须按全集判断，否则"被隐藏的块"会与"从未载入的轮次"混同，
+     导致派生边悄悄改挂到会话头。
+
+     继承前缀（分叉带过来的父会话历史）在这里就剔掉（FR-8）：它在源会话里
+     已经有一份块，子会话再画一遍就是**同一轮内容出现两次** ——
+     用户看到的"子会话越用越长、越看越乱"正是这么来的。
+
+     `index` 是它在该会话**自有**轮次里的序号（1 起）：界面上「第 N 轮」显示的是它；
+     `turn` 仍是日志里的真实轮次号 —— 块 id、分叉切点、导出的树结构全靠它。 */
   const allBySession = new Map();
+  const inheritedIds = new Set();
+  let inheritedSkipped = 0;
+  let inheritedEdges = 0;
   scoped.forEach((s) => {
-    allBySession.set(s.id, (turnsBySession[s.id] || []).map((t) => ({
-      ...t, id: blockId(s.id, t.turn)
-    })));
+    const boundary = inheritedBoundary(s);
+    const own = [];
+    (turnsBySession[s.id] || []).forEach((t) => {
+      if (isInheritedTurn(t, boundary)) {
+        inheritedSkipped += 1;
+        inheritedIds.add(blockId(s.id, t.turn));
+        return;
+      }
+      own.push({ ...t, index: own.length + 1, id: blockId(s.id, t.turn) });
+    });
+    allBySession.set(s.id, own);
   });
 
   /* 块 */
@@ -386,6 +458,7 @@ export function buildGraph(input) {
         sessionId: s.id,
         sessionTitle: s.title,
         turn: t.turn,
+        index: t.index,
         startSeq: t.startSeq ?? null,
         endSeq: t.endSeq ?? null,
         prompt: tidy(t.prompt),
@@ -405,8 +478,10 @@ export function buildGraph(input) {
   });
 
   /* 派生边：
-       起点 = 源会话中该轮次的块；该轮次**不存在**（未载入）时退回源会话会话头
-       终点 = 子会话首个自有轮次的块；子会话无轮次时用空子会话节点
+       起点 = 源会话中该轮次的块；该轮次**不存在**（未载入，或它本身在源会话里
+              也是继承来的、没有自己的块）时退回源会话会话头
+       终点 = 子会话**首个自有轮次**的块（allBySession 已经剔掉继承前缀，
+              所以 `mineAll[0]` 就是它）；子会话无自有轮次时用空子会话节点
      任一端点被隐藏时整条边一并消失（FR-11），而不是改挂到会话头 */
   const edges = [];
   scoped.forEach((s) => {
@@ -455,6 +530,10 @@ export function buildGraph(input) {
     const from = refToId(l.from) || str(l.from);
     const to = refToId(l.to) || str(l.to);
     if (!from || !to || from === to) return;
+    /* 端点落在继承块上：那块现在不画了（FR-8），线也就没有落点 ——
+       与"端点被隐藏"同样处理，整条边不画，**但数据照样留在存档里**，不替用户删。
+       这里**不受** `includeHidden` 影响：继承块是任何开关都调不出来的。 */
+    if (inheritedIds.has(from) || inheritedIds.has(to)) { inheritedEdges += 1; return; }
     if (!includeHidden && (hidden[from] || hidden[to])) return;
     edges.push({
       id: str(l.id) || `${l.kind}:${from}->${to}`,
@@ -478,7 +557,12 @@ export function buildGraph(input) {
     blocks: blocks.length,
     hiddenSkipped,
     edges: edges.length,
-    incomplete
+    incomplete,
+    /* 因为属于继承前缀而没进图的轮次（轮）与连线（条）。
+       单独报出来是因为它**不能**混进 hiddenSkipped：那是一件用户能撤销的事，
+       而继承块是任何开关都调不出来的；排查与将来的角标提示要靠这两个数。 */
+    inheritedSkipped,
+    inheritedEdges
   };
 
   return {

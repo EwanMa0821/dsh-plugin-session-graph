@@ -266,9 +266,11 @@ export function toFreeMind(graph, options = {}) {
   }
 
   function blockNode(block, depth) {
+    /* 轮次号用**会话内序号**（`block.index`），与画布上的标签同一口径：
+       子会话剔掉继承前缀后从 1 起数，导出的思维导图才不会出现"第 2 轮"却没有第 1 轮。 */
     const title = block.alias
       ? `✎ ${block.alias}`
-      : `第 ${block.turn} 轮 · ${clip(summarize(block.prompt), 24)}`;
+      : `第 ${block.index} 轮 · ${clip(summarize(block.prompt), 24)}`;
     const bg = block.current ? ' BACKGROUND_COLOR="#e4edfd"' : '';
     out.push(`${pad(depth)}<node TEXT="${escXml(title)}" ID="${idOf(block.id)}"${bg}>`);
     /* 第 1 层：节点富文本里「问」「答」两段（正文里的换行原样保留） */
@@ -280,7 +282,7 @@ export function toFreeMind(graph, options = {}) {
     rich('NOTE', depth + 1, [
       ...paragraphList(block.prompt, '问：'),
       ...paragraphList(block.response, '答：'),
-      `<p>元信息：${escXml(block.sessionTitle)} · 第 ${block.turn} 轮 · ` +
+      `<p>元信息：${escXml(block.sessionTitle)} · 第 ${block.index} 轮 · ` +
       `${block.toolCalls} 个工具 · ${block.deliverables} 个交付物</p>`
     ]);
     if (block.status === 'open') out.push(`${pad(depth + 1)}<icon BUILTIN="hourglass"/>`);
@@ -373,7 +375,7 @@ export function toMarkdown(graph, options = {}) {
 
   function blockItem(block, depth) {
     const alias = block.alias ? `（${block.alias}）` : '';
-    out.push(`${ind(depth)}- **第 ${block.turn} 轮**${alias}`, '');
+    out.push(`${ind(depth)}- **第 ${block.index} 轮**${alias}`, '');
     /* 正文以缩进块嵌入，而不是拼在 `- **问**：` 后面 ——
        拼在后面会让表格、代码块、多段列表全塌成一行。 */
     out.push(`${ind(depth + 1)}- **问**`, '');

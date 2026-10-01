@@ -10,7 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { foldTurns, isHumanTurn, textOf, forkTurnFromChild, linkForks } from '../src/host/fold.js';
+import { foldTurns, isHumanTurn, textOf, forkTurnFromChild, linkForks, seedBoundaryOf } from '../src/host/fold.js';
 import { apply, buildPayload, readSessions, skeletonize, skeletonizeTurns, SKELETON_PREVIEW } from '../index.js';
 
 /* --------------------------------------------------------------- 夹具 */
@@ -40,11 +40,31 @@ const ROOT_EVENTS = [
   ev('turn/end', 12)
 ];
 
+/* 子会话 = 从 root 第 3 轮分叉出来的：日志开头是父会话前 13 条事件（seq 0..12）的
+   **继承前缀**，自有内容从 seq 13 起，轮次号也接着父会话往下排 —— 所以它自有的
+   第一轮是第 2 轮，而第 1 轮（继承来的那份）在图谱上不画：源会话里已经有一份块（FR-8）。
+   早先这里把自有轮次写成 seq 0..3，等于"子会话的自有内容落在继承前缀里"，
+   与 `inheritedEventCount: 13` 自相矛盾 —— 夹具失真，正是这次修复才照出来的。 */
 const CHILD_EVENTS = [
+  ev('turn/start', 13, { turn: 2 }),
+  ev('user/message', 14, user('子会话提问')),
+  ev('assistant/message', 15, assistant('子会话回答')),
+  ev('turn/end', 16)
+];
+
+/* 带**继承前缀原文**的子会话日志：seq 0..3 是继承来的第 1 轮，seq 4 是
+   `session/end-seed`（继承部分到此为止），seq 5 起才是它自己问的第 2 轮。
+   形状照真实日志（`session/end-seed` 只带 seq，data 是空对象）。 */
+const SEEDED_CHILD_EVENTS = [
   ev('turn/start', 0, { turn: 1 }),
-  ev('user/message', 1, user('子会话提问')),
-  ev('assistant/message', 2, assistant('子会话回答')),
-  ev('turn/end', 3)
+  ev('user/message', 1, user('继承来的提问')),
+  ev('assistant/message', 2, assistant('继承来的回答')),
+  ev('turn/end', 3),
+  ev('session/end-seed', 4),
+  ev('turn/start', 5, { turn: 2 }),
+  ev('user/message', 6, user('子会话新问的')),
+  ev('assistant/message', 7, assistant('子会话新答的')),
+  ev('turn/end', 8)
 ];
 
 /* 观察句柄是异步的、且需要释放 —— 与产品自身的会话日志导出一致 */
@@ -62,7 +82,7 @@ const fakeCtx = (extra = {}) => ({
   sessions: {
     list: () => [
       { header: { id: 'root', title: '根会话', parentSession: null, inheritedEventCount: 0 } },
-      { header: { id: 'child', title: '子会话', parentSession: 'root', inheritedEventCount: 13 } }
+      { header: { id: 'child', title: '子会话', parentSession: 'root', inheritedEventCount: 13, isSeeded: true } }
     ]
   },
   sessionQuery: { observeSession: fakeObserve },
@@ -273,6 +293,150 @@ test('linkForks 给子会话补上 forkAtTurn，已有值时不动', () => {
   assert.equal(linked[2].forkAtTurn, 7, '显式值优先');
 });
 
+/* --------------------------------------------------- 继承前缀（FR-8） */
+
+test('继承边界：只看被播种出来的会话；日志里的 session/end-seed 优先，其次才是 header 的继承事件数', () => {
+  const seeded = { isSeeded: true };
+  assert.equal(seedBoundaryOf(SEEDED_CHILD_EVENTS, seeded), 4, 'seed 那条事件的序号就是边界');
+  /* 没有 seed 事件时退回"条数 − 1"，与 forkTurnFromChild 同一口径 */
+  assert.equal(seedBoundaryOf(CHILD_EVENTS, { isSeeded: true, inheritedEventCount: 13 }), 12);
+  /* 两条线索都没有：判不出来就返回 null，绝不能凭空把轮次当成继承的 */
+  assert.equal(seedBoundaryOf(CHILD_EVENTS, { isSeeded: true, inheritedEventCount: 0 }), null);
+  assert.equal(seedBoundaryOf(CHILD_EVENTS, { isSeeded: true, inheritedEventCount: null }), null);
+  assert.equal(seedBoundaryOf(null, seeded), null);
+  assert.equal(seedBoundaryOf([null, 'x', {}], seeded), null, '垃圾输入不抛错');
+  /* **没被播种出来的会话一律不判**：源会话日志里也有 session/end-seed（它被分叉的切点），
+     拿它当继承边界就会把源会话自己的轮次判成继承的、整轮从图上消失 */
+  assert.equal(seedBoundaryOf(SEEDED_CHILD_EVENTS, { isSeeded: false, inheritedEventCount: 13 }), null);
+  assert.equal(seedBoundaryOf(SEEDED_CHILD_EVENTS, { inheritedEventCount: 13 }), null, '状态未知同样不判');
+});
+
+test('foldTurns 按 session/end-seed 标出继承前缀：继承的 true、自有的 false', () => {
+  const turns = foldTurns(SEEDED_CHILD_EVENTS, { isSeeded: true });
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].turn, 1);
+  assert.equal(turns[0].inherited, true, 'seed 之前的第 1 轮是继承来的');
+  assert.equal(turns[0].prompt, '继承来的提问', '标了继承也照样折出内容');
+  assert.equal(turns[1].inherited, false,
+    'seed 之后的第 2 轮必须是显式 false —— 下游才分得清"自有"与"没判过"');
+});
+
+test('源会话日志里的 session/end-seed 不代表它自己继承了内容（回归：整轮对话从图上消失）', () => {
+  /* 从某个会话分叉出去时，DSH 会在**源会话**的日志里也打一条 session/end-seed 标出切点。
+     源会话自己没有被播种（isSeeded 为假），把那条当继承边界，它的轮次就会被当继承内容
+     藏起来 —— 现象是"我那一轮对话丢了"，而那个会话在界面上长得跟空会话一模一样。 */
+  const sourceEvents = [
+    ev('turn/start', 0, { turn: 1 }),
+    ev('user/message', 1, user('我自己的提问')),
+    ev('assistant/message', 2, assistant('我自己的回答')),
+    ev('turn/end', 3),
+    ev('session/end-seed', 4)                    /* 被分叉出去时留下的切点 */
+  ];
+  const turns = foldTurns(sourceEvents, { isSeeded: false, inheritedEventCount: 22 });
+  assert.equal(turns.length, 1);
+  assert.equal('inherited' in turns[0], false, '源会话自己的轮次不是继承来的');
+  assert.equal(turns[0].prompt, '我自己的提问');
+});
+
+test('没有 seed 事件时按继承事件数标继承前缀', () => {
+  const events = [
+    ev('turn/start', 0, { turn: 1 }),
+    ev('user/message', 1, user('继承来的提问')),
+    ev('turn/end', 3),
+    ev('turn/start', 13, { turn: 2 }),
+    ev('user/message', 14, user('新问的')),
+    ev('turn/end', 16)
+  ];
+  const turns = foldTurns(events, { isSeeded: true, inheritedEventCount: 13 });
+  assert.equal(turns[0].inherited, true);
+  assert.equal(turns[1].inherited, false);
+  /* 边界判不出来时**一个标记都不写**：不能假称自己判过（否则下游会把它当自有的权威结论） */
+  assert.equal('inherited' in foldTurns(events)[0], false);
+  assert.equal('inherited' in foldTurns(events, { isSeeded: true })[0], false, '有 isSeeded 但没有条数/seed');
+});
+
+test('带继承前缀的子会话：第 1 轮不画，块与派生边都落在自有轮次上', async () => {
+  const ctx = fakeCtx({
+    sessionQuery: {
+      observeSession: (id) => Promise.resolve({
+        events: id === 'root' ? ROOT_EVENTS : id === 'child' ? SEEDED_CHILD_EVENTS : [],
+        [Symbol.dispose]() {}
+      })
+    }
+  });
+  const links = JSON.stringify([{ id: 'Lx', kind: 'link', from: 'root:1', to: 'child:1' }]);
+  const data = JSON.parse((await buildPayload(ctx, params({ sessionId: 'root', format: 'json', links }), {})).body);
+
+  assert.deepEqual(data.blocks.map((b) => b.id), ['root:1', 'root:2', 'root:3', 'child:2'],
+    '子会话继承来的第 1 轮不在图里');
+  assert.equal(data.blocks.find((b) => b.id === 'child:2').index, 1, '会话内序号从 1 起');
+  assert.equal(data.blocks.find((b) => b.id === 'child:2').turn, 2, '真实轮次号不变');
+  assert.equal(data.stats.inheritedSkipped, 1);
+  assert.equal(data.stats.inheritedEdges, 1, '指向继承块的连线不画，但要报出来');
+  assert.equal(data.edges.some((e) => e.id === 'Lx'), false);
+  const branch = data.edges.find((e) => e.kind === 'branch');
+  assert.equal(branch.from, 'root:3', '分叉源仍是源会话第 3 轮');
+  assert.equal(branch.to, 'child:2', '终点是子会话首个自有轮次');
+  /* 轮次明细里仍然带着标记：客户端首屏用本地时间线建图时要靠它 */
+  assert.equal(data.turns.child[0].inherited, true);
+});
+
+test('端到端：源会话日志里有分叉切点，它自己的块照画（回归：父会话整轮不见）', async () => {
+  const sourceEvents = [
+    ev('turn/start', 0, { turn: 1 }),
+    ev('user/message', 1, user('我自己的提问')),
+    ev('assistant/message', 2, assistant('我自己的回答')),
+    ev('turn/end', 3),
+    ev('session/end-seed', 4)                 /* 它被分叉出去时留下的切点 */
+  ];
+  const ctx = fakeCtx({
+    sessionQuery: {
+      observeSession: (id) => Promise.resolve({
+        events: id === 'root' ? sourceEvents : [],
+        [Symbol.dispose]() {}
+      })
+    }
+  });
+  const data = JSON.parse((await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), {})).body);
+  assert.ok(data.blocks.some((b) => b.id === 'root:1'), '源会话自己的那一轮照画');
+  assert.equal(data.stats.inheritedSkipped, 0, '它不是被播种出来的，没有"继承内容"这回事');
+});
+
+/* ------------------------------------------- 读不到 ≠ 没有轮次（FR-13） */
+test('轮次读不到的会话要单独回传，还带上原因，不能与"空会话"混成一个样', async () => {
+  const ctx = fakeCtx({
+    sessionQuery: {
+      observeSession: (id) => (id === 'child'
+        ? Promise.reject(new Error('boom'))
+        : Promise.resolve({ events: ROOT_EVENTS, [Symbol.dispose]() {} }))
+    }
+  });
+  const data = JSON.parse((await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), {})).body);
+  assert.deepEqual(data.unread.map((u) => u.id), ['child'], '读不到的会话被点名');
+  assert.match(data.unread[0].reason, /boom/, '原因一起带上 —— 否则下次还得再猜一轮');
+  assert.deepEqual(data.turns.child, [], '它就是空数组 —— 但另外登记了，界面才分得开');
+  assert.equal(data.turns.root.length, 3, '读得出来的会话不受影响');
+});
+
+test('句柄形状不对（没有 events）同样算没读到，不当成"这个会话没有轮次"', async () => {
+  const ctx = fakeCtx({ sessionQuery: { observeSession: () => Promise.resolve({ nope: true }) } });
+  const data = JSON.parse((await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), {})).body);
+  assert.deepEqual(data.unread.map((u) => u.id).sort(), ['child', 'root']);
+  assert.match(data.unread[0].reason, /events/);
+});
+
+test('全都读到时不发 unread 字段：不给载荷添噪音', async () => {
+  const ctx = fakeCtx();
+  const data = JSON.parse((await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), {})).body);
+  assert.equal('unread' in data, false);
+});
+
+test('全都读到时不发 unread 字段：不给载荷添噪音', async () => {
+  const ctx = fakeCtx();
+  const data = JSON.parse((await buildPayload(ctx, params({ sessionId: 'root', format: 'json' }), {})).body);
+  assert.equal('unread' in data, false);
+});
+
 /* --------------------------------------------------------- 请求处理 */
 
 test('buildPayload(format=json) 返回家族数据且不触发下载', async () => {
@@ -286,7 +450,7 @@ test('buildPayload(format=json) 返回家族数据且不触发下载', async () 
   assert.equal(data.stats.blocks, 4, '3 + 1');
   assert.equal(data.edges.length, 1);
   assert.equal(data.edges[0].from, 'root:3', '派生边落在第 3 轮上');
-  assert.equal(data.edges[0].to, 'child:1');
+  assert.equal(data.edges[0].to, 'child:2');
 });
 
 test('异步观察句柄被 await，并且用完即释放', async () => {
@@ -411,7 +575,7 @@ function familyCtx(extraEvents = {}) {
     sessions: {
       list: () => [
         { header: { id: 'root', parentSession: null, inheritedEventCount: 0 } },
-        { header: { id: 'child', parentSession: 'root', inheritedEventCount: 13 } },
+        { header: { id: 'child', parentSession: 'root', inheritedEventCount: 13, isSeeded: true } },
         { header: { id: 'outside', parentSession: null, inheritedEventCount: 0 } }
       ]
     },
@@ -851,7 +1015,7 @@ test('导出文件会带上存档里的手动连线（FR-15）', async () => {
       hiddenBlocks: [],
       links: [{
         id: 'L1', kind: 'link',
-        from: { sessionId: 'root', turn: 1 }, to: { sessionId: 'child', turn: 1 },
+        from: { sessionId: 'root', turn: 1 }, to: { sessionId: 'child', turn: 2 },
         label: '因为'
       }]
     }]
@@ -871,7 +1035,7 @@ test('只读模式下导出也带上界面上的连线：links 参数（FR-15）
      本地 render，于是"预览里有、导出文件里一条都没有"。 */
   const route = captureRoute();        /* 没有 storageDomain → 只读 */
   const links = JSON.stringify([
-    { id: 'P1', kind: 'link', from: 'root:1', to: 'child:1', label: '因为' }
+    { id: 'P1', kind: 'link', from: 'root:1', to: 'child:2', label: '因为' }
   ]);
 
   const bare = await route.fetch(new Request(
@@ -895,7 +1059,7 @@ test('links 参数与存档按 id 合并、参数优先，md 导出同样带上'
       hiddenBlocks: [],
       links: [{
         id: 'L1', kind: 'link',
-        from: { sessionId: 'root', turn: 1 }, to: { sessionId: 'child', turn: 1 },
+        from: { sessionId: 'root', turn: 1 }, to: { sessionId: 'child', turn: 2 },
         label: '存档标签'
       }]
     }]
@@ -904,8 +1068,8 @@ test('links 参数与存档按 id 合并、参数优先，md 导出同样带上'
   await settle();
 
   const links = JSON.stringify([
-    { id: 'L1', kind: 'link', from: 'root:1', to: 'child:1', label: '参数标签' },
-    { id: 'L2', kind: 'link', from: 'root:2', to: 'child:1', label: '新连线' }
+    { id: 'L1', kind: 'link', from: 'root:1', to: 'child:2', label: '参数标签' },
+    { id: 'L2', kind: 'link', from: 'root:2', to: 'child:2', label: '新连线' }
   ]);
   const res = await route.fetch(new Request(
     `http://x/api/session.graph-export?sessionId=root&format=md&links=${encodeURIComponent(links)}`));

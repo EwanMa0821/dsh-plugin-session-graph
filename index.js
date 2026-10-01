@@ -73,8 +73,15 @@ export async function readSessionMeta(ctx, ids, limits) {
     raw.push({
       id,
       title: String(header.title ?? (s && s.title) ?? id),
-      parentId: header.parentSession ?? header.parentSessionId ?? null,
+      /* 血缘字段两种形状都认：真正挂上来的会话给的是 `header.parentSession`，
+         而会话列表项（summary）给的是 `parentId` —— 只认前者会让整棵血缘在 Host 侧断掉。 */
+      parentId: header.parentSession ?? header.parentSessionId
+        ?? (s && s.parentId) ?? (s && s.parentSessionId) ?? null,
       inheritedEventCount: header.inheritedEventCount ?? (s && s.inheritedEventCount) ?? null,
+      /* 自己是不是被播种出来的（分叉出来的会话）。**必须带着它**：源会话日志里也有
+         `session/end-seed`（标出它被分叉的切点），而源会话自己没有继承任何内容 ——
+         分不清这两者，源会话的轮次就会被误判成继承的、整轮从图上消失。 */
+      isSeeded: header.isSeeded === true || (s && s.isSeeded === true),
       /* 冷会话不在 list() 里；调用方可通过 ids 显式点名 */
       session: s
     });
@@ -85,7 +92,7 @@ export async function readSessionMeta(ctx, ids, limits) {
   (ids || []).forEach((id) => {
     if (!id || known.has(id)) return;
     known.add(id);
-    raw.push({ id, title: id, parentId: null, inheritedEventCount: null, session: null });
+    raw.push({ id, title: id, parentId: null, inheritedEventCount: null, isSeeded: false, session: null });
   });
 
   if (limits && limits.maxSessions && raw.length > limits.maxSessions) {
@@ -187,12 +194,14 @@ export async function resolveTitles(query, records, scopeIds) {
  *
  * 串行读取：observeSession 会打开一个观察句柄，并发打开没有好处。
  * 范围外的会话**连键都不建** —— 有了键，下游就会把"从没读过"当成"读过了、只是没内容"。
+ *
+ * @param {Map<string, string>} [unread] 收集"没读到轮次"的会话 id → 原因
  */
-export async function readTurnsBySession(query, records, scopeIds) {
+export async function readTurnsBySession(query, records, scopeIds, unread) {
   const out = {};
   for (const r of (Array.isArray(records) ? records : [])) {
     if (scopeIds && !scopeIds.has(r.id)) continue;
-    out[r.id] = await readTurns(query, r);
+    out[r.id] = await readTurns(query, r, unread);
   }
   return out;
 }
@@ -239,21 +248,43 @@ export async function readSessions(ctx, ids, limits, options) {
  * （产品自身的会话日志导出就是 `await` 它、读 `.events`、再释放）。
  * 这里必须 await，否则拿到的是 Promise，`.events` 恒为 undefined，
  * 结果就是"路由 200 但每个会话 0 轮"。
+ *
+ * `rec.inheritedEventCount` 一并交给折叠：子会话日志里的继承前缀（分叉带过来的
+ * 父会话历史）要按它/按 `session/end-seed` 标出来，图谱才不会把继承的内容
+ * 在子会话里重复画一遍（FR-8）。
+ *
+ * **读不到 ≠ 没有轮次。** 拿不到句柄、或句柄形状不对时，以前这里静默返回空数组，
+ * 界面上那一格就变成「空子会话 · 尚未提问」—— 用户看到的是"我那一轮对话丢了"，
+ * 而排查时一条线索都没有。现在把**原因**一起记进 `unread`，由上层回传给界面说明。
+ *
+ * @param {object} query sessionQuery 服务
+ * @param {object} rec readSessionMeta 的记录
+ * @param {Map<string, string>} [unread] 收集"没读到轮次"的会话 id → 原因
  */
-async function readTurns(query, rec) {
-  if (!query || typeof query.observeSession !== 'function') return [];
+async function readTurns(query, rec, unread) {
+  const unreadNow = (reason) => {
+    if (unread) unread.set(rec.id, reason);
+    return [];
+  };
+  if (!query || typeof query.observeSession !== 'function') return unreadNow('宿主没有会话查询服务');
   let observed;
   try {
     observed = await query.observeSession(rec.id);
-  } catch {
-    /* 会话不存在或不在查询索引里：留空，由上层决定怎么呈现 */
-    return [];
+  } catch (error) {
+    /* 会话不存在、不在查询索引里、日志正在被写……都落到这里。原因原样带上：
+       只报"没读到"而不报"为什么"，下次还得再猜一轮。 */
+    return unreadNow('观察会话失败：' + String((error && error.message) || error).slice(0, 160));
   }
   try {
     const events = observed && Array.isArray(observed.events) ? observed.events
       : Array.isArray(observed) ? observed
         : null;
-    return events ? foldTurns(events) : [];
+    /* 句柄形状不对同样是"没读到"，不能当成"这个会话没有轮次" */
+    if (!events) return unreadNow('观察句柄里没有 events');
+    return foldTurns(events, {
+      inheritedEventCount: rec.inheritedEventCount,
+      isSeeded: rec.isSeeded
+    });
   } finally {
     /* 观察句柄是资源，用完要还 */
     try {
@@ -368,7 +399,9 @@ export async function buildPayload(ctx, params, limits, store) {
   const query = service(ctx, 'sessionQuery');
   const scope = turnScopeOf(raw, { currentId, named: ids, links });
   await resolveTitles(query, raw, scope);
-  const turnsBySession = await readTurnsBySession(query, raw, scope);
+  /* 读不到的会话要单独回传：界面上那一格是"空会话"还是"没读到"，必须分得开 */
+  const unread = new Map();
+  const turnsBySession = await readTurnsBySession(query, raw, scope, unread);
   const sessions = assembleSessions(raw, turnsBySession);
 
   const graph = buildGraph({
@@ -399,6 +432,9 @@ export async function buildPayload(ctx, params, limits, store) {
         edges: graph.edges,
         /* 各会话的轮次明细，供客户端给"其他会话"也画出块（FR-3） */
         turns: turnsOut,
+        /* 这些会话的轮次**没读到**（不是"没有轮次"），并带上原因。界面据此说明、
+           给重试入口；否则读失败与空会话长得一模一样，用户会以为自己的对话丢了（FR-13）。 */
+        ...(unread.size ? { unread: [...unread].map(([id, reason]) => ({ id, reason })) } : {}),
         /* 持久化状态：客户端拿它初始化隐藏/别名/连线/布局；writable 为 false 时只读 */
         state: saved,
         writable: !!(store && stored && stored.writable),

@@ -144,6 +144,9 @@ const CSS = `
 /* 降级那一段要能悬停看全文，所以单独把指针事件放回来（整块仍是 none，
    免得角标盖住下面的连线交互） */
 .sg-corner-diag{pointer-events:auto;color:var(--dsw-alias-label-warning,#b26a00);cursor:help}
+/* 角标里可点的那几条（例如「N 个会话的轮次没读到 · 点此重试」） */
+.sg-corner-act{pointer-events:auto;cursor:pointer;text-decoration:underline}
+.sg-corner-act:hover{color:var(--dsw-alias-label-primary)}
 /* 空态 / 加载态 / 错误态 */
 .sg-state{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:7;
   display:flex;flex-direction:column;gap:9px;align-items:flex-start;
@@ -166,6 +169,13 @@ const CSS = `
 .sg-e-ref{fill:none;stroke:var(--dsw-alias-label-caption);stroke-width:1.7;stroke-dasharray:1.5 4.5}
 /* 端点已不存在的边：保留数据但画不出来，用样式说明而不假装它不存在 */
 .sg-e-broken{stroke:var(--dsw-alias-state-error-primary);stroke-dasharray:2 3;opacity:.55}
+/* 连线的**点击热区**：线本身只有 1.6 像素，靠它点不中 —— 于是只有"有标签的连线"
+   能通过标签选中，未命名的连线选不上、也就删不掉（FR-9 要求"点击已有边或其标签选中它"）。
+   热区是同一条路径的透明粗描边；pointer-events 必须先被 svg 关掉、再由它自己打开。
+   块节点在 DOM 里排在 svg 之后，命中优先级仍高于热区（线从块下穿过时不会抢点击）。 */
+.sg-e-hit{fill:none;stroke:transparent;stroke-width:14;pointer-events:stroke;cursor:pointer}
+/* 悬停时把对应那条线加粗，让"可以点"这件事看得见（:has 不被支持时这条自动失效） */
+.sg-e-link:has(+ .sg-e-hit:hover),.sg-e-ref:has(+ .sg-e-hit:hover){stroke-width:2.8}
 /* 边标签：落在边中点，过长截断、悬停看全文（FR-9） */
 .sg-elabel{position:absolute;transform:translate(-50%,-50%);max-width:150px;padding:1px 6px;
   border-radius:5px;background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-elevation-stroke);
@@ -209,6 +219,11 @@ const CSS = `
 .sg-node.sg-empty{cursor:default;border:1.5px dashed var(--dsw-alias-border-l4);background:transparent;
   box-shadow:none;display:grid;place-items:center;text-align:center;font-size:11.5px;
   color:var(--dsw-alias-label-caption);pointer-events:none}
+/* 「轮次没读到」的格子：与"空子会话"用颜色和可点区分开 —— 它不是空会话，是取数失败，
+   点一下就地重试（rect 原本 pointer-events:none，这里要单独放回指针事件） */
+.sg-node.sg-empty-unread{pointer-events:auto;cursor:pointer;
+  border-color:var(--dsw-alias-label-warning,#b26a00);color:var(--dsw-alias-label-secondary)}
+.sg-node.sg-empty-unread:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .sg-hd{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dsw-alias-label-caption)}
 .sg-hd .sg-turn{font-weight:600}
 .sg-hd .sg-dot{width:5px;height:5px;border-radius:50%;background:var(--dsw-alias-state-success-primary)}
@@ -456,6 +471,18 @@ function useSource(source) {
   return value;
 }
 
+/**
+ * 宿主回传的"轮次没读到"清单 → `[{id, reason}]`。
+ * 契约是 `[{id, reason}]`；老版本宿主（只发 id 数组）也认，免得升级期间两种形状打架。
+ */
+function unreadListOf(raw) {
+  return (Array.isArray(raw) ? raw : [])
+    .map((u) => (u && typeof u === 'object'
+      ? { id: String(u.id || ''), reason: String(u.reason || '') }
+      : { id: String(u === undefined || u === null ? '' : u), reason: '' }))
+    .filter((u) => u.id !== '');
+}
+
 /** 会话列表快照 → 数组。宿主可能给它套好几层壳，这里尽量都认。 */
 function listOf(snapshot) {
   if (!snapshot) return [];
@@ -679,6 +706,10 @@ function GraphView(props) {
   const [reloadNonce, setReloadNonce] = React.useState(0);
   /* 超规模时被 Host 降级成骨架的块（FR-4）：只显示轮次号与提问预览 */
   const [skeletonIds, setSkeletonIds] = React.useState(() => new Set());
+  /* 轮次**没读到**的会话（宿主回传 `{id, reason}`，FR-13）。它们与"空会话"在图上
+     长得一模一样，不单独说明的话，用户看到的就是"我那一轮对话丢了"。 */
+  const [unreadInfo, setUnreadInfo] = React.useState(() => []);
+  const unreadIds = React.useMemo(() => new Set(unreadInfo.map((u) => u.id)), [unreadInfo]);
   /* 用户点过「载入」的轮次：下次取数点名要它们的完整数据（FR-4 的分页载入） */
   const [fullIds, setFullIds] = React.useState([]);
   /* 存档里的家族根 id 与视口，写回时要用 */
@@ -737,6 +768,8 @@ function GraphView(props) {
         if (!alive) return;
         if (!data) { setLoaded(true); loadedRef.current = true; return; }
         if (data.turns) setRemote(data.turns);
+        /* 这一批里哪些会话的轮次没读到、为什么；下一次取数若读到了会自动清空 */
+        setUnreadInfo(unreadListOf(data.unread));
         /* 哪些块被降级成骨架，由 Host 的权威块表说了算（FR-4） */
         setSkeletonIds(new Set((Array.isArray(data.blocks) ? data.blocks : [])
           .filter((b) => b && b.skeleton)
@@ -1552,10 +1585,22 @@ function GraphView(props) {
         : null);
     }
     if (n.kind === 'empty') {
+      /* 「空会话」与「没读到」必须分开说：前者是还没提问，后者是我们的取数失败了。
+         两者共用一个框时，用户看到的是"我那一轮对话怎么会丢"（FR-13）。 */
+      const miss = unreadInfo.find((u) => u.id === n.sessionId);
       return h('div', {
-        key: n.id, className: 'sg-node sg-empty',
-        style: { left: n.x, top: n.y, width: n.w, minHeight: n.h }
-      }, h('span', null, t('block.emptyChild')));
+        key: n.id,
+        className: 'sg-node sg-empty' + (miss ? ' sg-empty-unread' : ''),
+        style: { left: n.x, top: n.y, width: n.w, minHeight: n.h },
+        ...(miss
+          ? {
+            role: 'button',
+            tabIndex: 0,
+            title: miss.reason || t('block.unread'),
+            onClick: (ev) => { ev.stopPropagation(); retry(); }
+          }
+          : {})
+      }, h('span', null, t(miss ? 'block.unread' : 'block.emptyChild')));
     }
     const b = n.block;
     /* FR-13：部分块数据读不出来时**该块降级**，而不是整张图报错。
@@ -1587,13 +1632,16 @@ function GraphView(props) {
       'data-sg-node': n.id,
       tabIndex: 0,
       role: 'button',
-      'aria-label': t('block.ariaLabel', { turn: b.turn, prompt: clip(digest(b.prompt), 120) }),
+      /* 界面上的「第 N 轮」用**会话内序号**（`index`）：子会话剔掉继承前缀之后
+         从 1 开始数，用户看到的就是它新问的第几轮。`turn` 是日志里的真实轮次号，
+         只用于块 id、分叉切点与"去对话视图找第 N 轮"的指路。 */
+      'aria-label': t('block.ariaLabel', { turn: b.index, prompt: clip(digest(b.prompt), 120) }),
       style: { left: n.x, top: n.y, width: n.w, minHeight: n.h },
       onDoubleClick: (e) => { e.stopPropagation(); doFork(b.sessionId, b.turn); },
       onKeyDown: (e) => { if (e.key === 'Enter') { e.stopPropagation(); setSelected(n.id); } }
     },
     h('div', { className: 'sg-hd' },
-      h('span', { className: 'sg-turn' }, t('block.turn', { turn: b.turn })),
+      h('span', { className: 'sg-turn' }, t('block.turn', { turn: b.index })),
       h('span', { className: 'sg-dot' + (b.status === 'open' ? ' sg-open' : b.status === 'failed' ? ' sg-failed' : '') }),
       h('span', { className: 'sg-sp' }),
       badges),
@@ -1623,20 +1671,37 @@ function GraphView(props) {
     }
     return e;
   });
-  const edges = edgeList.map((e) => {
+  /* 每条边画两份：可见的线 + 手动的**点击热区**（见 .sg-e-hit 的注释）。
+     派生边不给热区 —— 它不可删、右栏也只是只读信息，给个能点的热区反而让人以为能操作。 */
+  const edges = edgeList.flatMap((e) => {
     const d = edgePath(e, nodeMap);
-    if (!d) return null;
+    if (!d) return [];
     const cls = e.kind === 'link' ? 'sg-e-link'
       : e.kind === 'reference' ? 'sg-e-ref' : 'sg-e-branch';
-    return h('path', {
+    const out = [h('path', {
       key: e.id,
       className: cls + (e.broken ? ' sg-e-broken' : ''),
       d,
       'data-sg-edge': e.id,
       markerEnd: e.kind === 'branch' || e.kind === 'link'
         ? 'url(#sg-arrow-solid)' : 'url(#sg-arrow-hollow)'
-    });
-  }).filter(Boolean);
+    })];
+    if (e.kind === 'link' || e.kind === 'reference') {
+      out.push(h('path', {
+        key: e.id + ':hit',
+        className: 'sg-e-hit',
+        d,
+        'data-sg-edge': e.id,
+        onClick: (ev) => {
+          ev.stopPropagation();
+          /* 拖出来的平移会补一个 click：与块、会话头同一条规矩，平移过的点击不算选中 */
+          if (suppressClickRef.current) { suppressClickRef.current = false; return; }
+          setSelectedEdge(e.id);
+        }
+      }));
+    }
+    return out;
+  });
 
   /* 标签落在边中点；过长由 CSS 截断，title 给完整文本（FR-9）。
      密集档起不画标签 —— 那是边渲染里最贵的一块（NFR-1）。 */
@@ -1679,6 +1744,18 @@ function GraphView(props) {
     cornerNotes.push(t('corner.incomplete', { n: fmtNum(graph.stats.incomplete) }));
   }
   if (brokenCount > 0) cornerNotes.push(t('corner.broken', { n: fmtNum(brokenCount) }));
+  /* 轮次没读到的会话：说得清"少了什么、为什么"，并给一个就地重试的入口（FR-13） */
+  if (!graph.error && unreadInfo.length > 0) {
+    cornerNotes.push(h('span', {
+      key: 'unread',
+      className: 'sg-corner-act',
+      title: unreadInfo.map((u) => {
+        const hd = nodeMap.get('header:' + u.id);
+        return `${(hd && hd.title) || u.id}：${u.reason || t('block.unread')}`;
+      }).join('\n'),
+      onClick: retry
+    }, t('corner.unread', { n: fmtNum(unreadInfo.length) })));
+  }
 
   /* 降级留痕（见 degrade）：角标给数字与最近一条原因，悬停看全部。
      这一条的存在意义就是——下次出问题时**一张截图**就能说清哪一步退让了。 */
@@ -1807,7 +1884,7 @@ function GraphView(props) {
       if (!n) return id + t('link.missing');
       if (n.kind === 'header') return n.title;
       const b = n.block;
-      return t('block.turnOf', { turn: b.turn, title: b.alias || clip(digest(b.prompt), 20) || b.sessionTitle });
+      return t('block.turnOf', { turn: b.index, title: b.alias || clip(digest(b.prompt), 20) || b.sessionTitle });
     };
     return [
       h('div', { key: 'hd', className: 'sg-side-hd' },
@@ -1864,7 +1941,7 @@ function GraphView(props) {
     return [
       /* 固定区：头部 */
       h('div', { key: 'hd', className: 'sg-side-hd' },
-        h('span', { className: 'sg-t' }, t('block.turn', { turn: b.turn })),
+        h('span', { className: 'sg-t' }, t('block.turn', { turn: b.index })),
         h('span', { className: 'sg-s' }, b.sessionTitle),
         h('button', {
           className: 'sg-x',
@@ -1900,7 +1977,7 @@ function GraphView(props) {
         h('div', { className: 'sg-meta' },
           h('span', { className: 'sg-k' }, t('side.session')), h('span', { className: 'sg-v' }, b.sessionTitle),
           h('span', { className: 'sg-k' }, t('side.turn')), h('span', { className: 'sg-v' },
-            total ? t('side.turnOfTotal', { turn: fmtNum(b.turn), total: fmtNum(total) }) : fmtNum(b.turn)),
+            total ? t('side.turnOfTotal', { turn: fmtNum(b.index), total: fmtNum(total) }) : fmtNum(b.index)),
           h('span', { className: 'sg-k' }, t('link.status')), h('span', { className: 'sg-v' },
             open ? t('side.statusOpen') : b.status === 'failed' ? t('side.statusFailed') : t('side.statusDone')),
           h('span', { className: 'sg-k' }, t('side.toolCalls')), h('span', { className: 'sg-v' }, String(b.toolCalls)),

@@ -178,7 +178,7 @@ function turnsFromTimeline(timeline) {
     if (!Number.isFinite(turn) || seen.has(turn)) return;
     seen.add(turn);
     const endSeq = numOrNull(rec.end && rec.end.seq);
-    out.push({
+    const item = {
       turn,
       startSeq: numOrNull(rec.start && rec.start.seq) ?? numOrNull(rec.seq),
       endSeq,
@@ -187,7 +187,11 @@ function turnsFromTimeline(timeline) {
       status: rec.status === 'failed' ? 'failed' : endSeq === null ? 'open' : 'done',
       toolCalls: Number(rec.toolCalls ?? rec.toolCallCount ?? 0) || 0,
       deliverables: Number(rec.deliverables ?? rec.deliverableCount ?? 0) || 0
-    });
+    };
+    /* 时间线上若已经判过"这一轮是不是继承的"，原样传下去（布尔值，两端都传）；
+       `undefined` 才表示"没判过"，那时才轮到按序号判。 */
+    if (typeof rec.inherited === 'boolean') item.inherited = rec.inherited;
+    out.push(item);
   };
 
   if (order.length) order.forEach((k, i) => take(get(k), i + 1));
@@ -218,11 +222,60 @@ function normalizeSessions(raw) {
       parentId,
       /* 分叉源轮次。上游没有这个字段时留 null，派生边会退回挂到会话头 */
       forkAtTurn: numOrNull(s.forkAtTurn ?? s.forkAt ?? s.parentTurn),
+      /* 继承的事件条数（子会话 header 里有）：自有轮次从它之后开始（FR-8）。
+         宿主折叠时已经按日志里的 `session/end-seed` 标过一遍，这里留着是为了让
+         **本地时间线**那份数据也能判出来（它只有轮次号与序号、没有事件类型）。 */
+      inheritedEventCount: numOrNull(
+        s.inheritedEventCount ?? (s.header ? s.header.inheritedEventCount : null)
+      ),
       blank: !!s.blank,
       origin: str(s.origin) || 'session'
     });
   });
   return out;
+}
+
+/**
+ * 会话继承前缀的收尾序号（FR-8）。
+ *
+ * 分叉出来的子会话，日志开头是**父会话那段历史的副本**（DSH 播种时写进去的），
+ * 后面才是用户新问的内容。`inheritedEventCount` 是继承的事件条数，
+ * 所以闭区间切点 = 条数 − 1 —— 与 host 侧 `forkTurnFromChild` 同一口径。
+ *
+ * **只对分叉出来的会话（有父会话）成立**：没有父会话就谈不上继承前缀，一律返回 null。
+ * 这条守卫是必需的 —— 万一上游把某个继承事件数安到了根会话头上（这个字段的来源不止
+ * 一处：会话对象、header、请求参数），按序号猜就会把用户自己的轮次判成继承的，
+ * 于是**整轮对话从图上消失**，而现象与"这个会话本来就空"一模一样，极难分辨。
+ *
+ * 判不出来（没有父会话、没有这个字段、或它不是正数）时返回 null：**判不出来就不标**，
+ * 宁可多画一轮，也不能凭空把用户的轮次藏起来。宿主按日志逐轮给出的 `inherited`
+ * 标记不受这条守卫影响 —— 那是权威结论，由 `isInheritedTurn` 优先采信。
+ */
+function inheritedBoundary(session) {
+  if (!session || !session.parentId) return null;
+  const count = numOrNull(session.inheritedEventCount);
+  return count === null || count <= 0 ? null : count - 1;
+}
+
+/**
+ * 这一轮是否落在继承前缀里。
+ *
+ * 判据分两层，**顺序不能反**：
+ *   1. 轮次上已经有明确布尔值就听它 —— 宿主折日志时按 `session/end-seed` 判过，
+ *      那是权威结论；它说 `false`（自有）就不能再按序号翻案。
+ *   2. 没有标记时才按序号猜：本地时间线只有 `startSeq`（轮次的序号），
+ *      用会话的继承事件数算出的切点来判。
+ * 两套判据都得不到结论时返回 false —— 宁可多画一轮，也不凭空藏用户的轮次。
+ */
+function isInheritedTurn(turn, boundary) {
+  if (!turn || typeof turn !== 'object') return false;
+  if (turn.inherited === true) return true;
+  if (turn.inherited === false) return false;
+  if (boundary === null) return false;
+  const start = numOrNull(turn.startSeq);
+  if (start !== null) return start <= boundary;
+  const end = numOrNull(turn.endSeq);
+  return end !== null && end <= boundary;
 }
 
 /**
@@ -370,13 +423,32 @@ function buildGraph(input) {
   const referencedIds = [...scopedIds].filter((id) => fam.order.indexOf(id) < 0);
   const order = [...fam.order, ...referencedIds];
 
-  /* 每个会话的全部轮次（**不过滤隐藏**）。端点是否被隐藏必须按全集判断，
-     否则"被隐藏的块"会与"从未载入的轮次"混同，导致派生边悄悄改挂到会话头。 */
+  /* 每个会话的**自有**轮次（不过滤隐藏，也不含继承前缀）。
+     端点是否被隐藏必须按全集判断，否则"被隐藏的块"会与"从未载入的轮次"混同，
+     导致派生边悄悄改挂到会话头。
+
+     继承前缀（分叉带过来的父会话历史）在这里就剔掉（FR-8）：它在源会话里
+     已经有一份块，子会话再画一遍就是**同一轮内容出现两次** ——
+     用户看到的"子会话越用越长、越看越乱"正是这么来的。
+
+     `index` 是它在该会话**自有**轮次里的序号（1 起）：界面上「第 N 轮」显示的是它；
+     `turn` 仍是日志里的真实轮次号 —— 块 id、分叉切点、导出的树结构全靠它。 */
   const allBySession = new Map();
+  const inheritedIds = new Set();
+  let inheritedSkipped = 0;
+  let inheritedEdges = 0;
   scoped.forEach((s) => {
-    allBySession.set(s.id, (turnsBySession[s.id] || []).map((t) => ({
-      ...t, id: blockId(s.id, t.turn)
-    })));
+    const boundary = inheritedBoundary(s);
+    const own = [];
+    (turnsBySession[s.id] || []).forEach((t) => {
+      if (isInheritedTurn(t, boundary)) {
+        inheritedSkipped += 1;
+        inheritedIds.add(blockId(s.id, t.turn));
+        return;
+      }
+      own.push({ ...t, index: own.length + 1, id: blockId(s.id, t.turn) });
+    });
+    allBySession.set(s.id, own);
   });
 
   /* 块 */
@@ -393,6 +465,7 @@ function buildGraph(input) {
         sessionId: s.id,
         sessionTitle: s.title,
         turn: t.turn,
+        index: t.index,
         startSeq: t.startSeq ?? null,
         endSeq: t.endSeq ?? null,
         prompt: tidy(t.prompt),
@@ -412,8 +485,10 @@ function buildGraph(input) {
   });
 
   /* 派生边：
-       起点 = 源会话中该轮次的块；该轮次**不存在**（未载入）时退回源会话会话头
-       终点 = 子会话首个自有轮次的块；子会话无轮次时用空子会话节点
+       起点 = 源会话中该轮次的块；该轮次**不存在**（未载入，或它本身在源会话里
+              也是继承来的、没有自己的块）时退回源会话会话头
+       终点 = 子会话**首个自有轮次**的块（allBySession 已经剔掉继承前缀，
+              所以 `mineAll[0]` 就是它）；子会话无自有轮次时用空子会话节点
      任一端点被隐藏时整条边一并消失（FR-11），而不是改挂到会话头 */
   const edges = [];
   scoped.forEach((s) => {
@@ -462,6 +537,10 @@ function buildGraph(input) {
     const from = refToId(l.from) || str(l.from);
     const to = refToId(l.to) || str(l.to);
     if (!from || !to || from === to) return;
+    /* 端点落在继承块上：那块现在不画了（FR-8），线也就没有落点 ——
+       与"端点被隐藏"同样处理，整条边不画，**但数据照样留在存档里**，不替用户删。
+       这里**不受** `includeHidden` 影响：继承块是任何开关都调不出来的。 */
+    if (inheritedIds.has(from) || inheritedIds.has(to)) { inheritedEdges += 1; return; }
     if (!includeHidden && (hidden[from] || hidden[to])) return;
     edges.push({
       id: str(l.id) || `${l.kind}:${from}->${to}`,
@@ -485,7 +564,12 @@ function buildGraph(input) {
     blocks: blocks.length,
     hiddenSkipped,
     edges: edges.length,
-    incomplete
+    incomplete,
+    /* 因为属于继承前缀而没进图的轮次（轮）与连线（条）。
+       单独报出来是因为它**不能**混进 hiddenSkipped：那是一件用户能撤销的事，
+       而继承块是任何开关都调不出来的；排查与将来的角标提示要靠这两个数。 */
+    inheritedSkipped,
+    inheritedEdges
   };
 
   return {
@@ -1010,9 +1094,11 @@ function toFreeMind(graph, options = {}) {
   }
 
   function blockNode(block, depth) {
+    /* 轮次号用**会话内序号**（`block.index`），与画布上的标签同一口径：
+       子会话剔掉继承前缀后从 1 起数，导出的思维导图才不会出现"第 2 轮"却没有第 1 轮。 */
     const title = block.alias
       ? `✎ ${block.alias}`
-      : `第 ${block.turn} 轮 · ${clip(summarize(block.prompt), 24)}`;
+      : `第 ${block.index} 轮 · ${clip(summarize(block.prompt), 24)}`;
     const bg = block.current ? ' BACKGROUND_COLOR="#e4edfd"' : '';
     out.push(`${pad(depth)}<node TEXT="${escXml(title)}" ID="${idOf(block.id)}"${bg}>`);
     /* 第 1 层：节点富文本里「问」「答」两段（正文里的换行原样保留） */
@@ -1024,7 +1110,7 @@ function toFreeMind(graph, options = {}) {
     rich('NOTE', depth + 1, [
       ...paragraphList(block.prompt, '问：'),
       ...paragraphList(block.response, '答：'),
-      `<p>元信息：${escXml(block.sessionTitle)} · 第 ${block.turn} 轮 · ` +
+      `<p>元信息：${escXml(block.sessionTitle)} · 第 ${block.index} 轮 · ` +
       `${block.toolCalls} 个工具 · ${block.deliverables} 个交付物</p>`
     ]);
     if (block.status === 'open') out.push(`${pad(depth + 1)}<icon BUILTIN="hourglass"/>`);
@@ -1117,7 +1203,7 @@ function toMarkdown(graph, options = {}) {
 
   function blockItem(block, depth) {
     const alias = block.alias ? `（${block.alias}）` : '';
-    out.push(`${ind(depth)}- **第 ${block.turn} 轮**${alias}`, '');
+    out.push(`${ind(depth)}- **第 ${block.index} 轮**${alias}`, '');
     /* 正文以缩进块嵌入，而不是拼在 `- **问**：` 后面 ——
        拼在后面会让表格、代码块、多段列表全塌成一行。 */
     out.push(`${ind(depth + 1)}- **问**`, '');
@@ -1724,6 +1810,9 @@ const UI = {
   'block.response': { zh: '回答', en: 'Response' },
   'block.notLoaded': { zh: '（未载入）', en: '(not loaded)' },
   'block.emptyChild': { zh: '空子会话 · 尚未提问', en: 'Empty child session · no prompt yet' },
+  /* 与「空子会话」严格区分：这一格是**没读到**轮次（宿主取数失败），不是没有轮次。
+     两者长得一样时，用户会以为自己的对话丢了 —— 这正是必须分开的原因（FR-13）。 */
+  'block.unread': { zh: '这一格的轮次没读到 · 点此重试', en: 'Turns here could not be read · click to retry' },
 
   'side.meta': { zh: '元信息', en: 'Details' },
   'side.session': { zh: '会话', en: 'Session' },
@@ -1774,6 +1863,11 @@ const UI = {
   },
   'corner.incomplete': { zh: '{n} 个块数据不完整', en: '{n} blocks have incomplete data' },
   'corner.broken': { zh: '{n} 条连线指向已不存在的块', en: '{n} links point to blocks that no longer exist' },
+  /* 轮次没读到的会话：与"空会话"长得一样，必须说出来并给重试入口（FR-13） */
+  'corner.unread': {
+    zh: '{n} 个会话的轮次没读到 · 点此重试',
+    en: '{n} sessions could not be read · click to retry'
+  },
   /* 降级留痕：宿主形状对不上时插件会退一步继续，这里把"退过"说出来 */
   'corner.degraded': {
     zh: '降级 {n} 项 · 最近：{why}',
@@ -2092,6 +2186,9 @@ const CSS = `
 /* 降级那一段要能悬停看全文，所以单独把指针事件放回来（整块仍是 none，
    免得角标盖住下面的连线交互） */
 .sg-corner-diag{pointer-events:auto;color:var(--dsw-alias-label-warning,#b26a00);cursor:help}
+/* 角标里可点的那几条（例如「N 个会话的轮次没读到 · 点此重试」） */
+.sg-corner-act{pointer-events:auto;cursor:pointer;text-decoration:underline}
+.sg-corner-act:hover{color:var(--dsw-alias-label-primary)}
 /* 空态 / 加载态 / 错误态 */
 .sg-state{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:7;
   display:flex;flex-direction:column;gap:9px;align-items:flex-start;
@@ -2114,6 +2211,13 @@ const CSS = `
 .sg-e-ref{fill:none;stroke:var(--dsw-alias-label-caption);stroke-width:1.7;stroke-dasharray:1.5 4.5}
 /* 端点已不存在的边：保留数据但画不出来，用样式说明而不假装它不存在 */
 .sg-e-broken{stroke:var(--dsw-alias-state-error-primary);stroke-dasharray:2 3;opacity:.55}
+/* 连线的**点击热区**：线本身只有 1.6 像素，靠它点不中 —— 于是只有"有标签的连线"
+   能通过标签选中，未命名的连线选不上、也就删不掉（FR-9 要求"点击已有边或其标签选中它"）。
+   热区是同一条路径的透明粗描边；pointer-events 必须先被 svg 关掉、再由它自己打开。
+   块节点在 DOM 里排在 svg 之后，命中优先级仍高于热区（线从块下穿过时不会抢点击）。 */
+.sg-e-hit{fill:none;stroke:transparent;stroke-width:14;pointer-events:stroke;cursor:pointer}
+/* 悬停时把对应那条线加粗，让"可以点"这件事看得见（:has 不被支持时这条自动失效） */
+.sg-e-link:has(+ .sg-e-hit:hover),.sg-e-ref:has(+ .sg-e-hit:hover){stroke-width:2.8}
 /* 边标签：落在边中点，过长截断、悬停看全文（FR-9） */
 .sg-elabel{position:absolute;transform:translate(-50%,-50%);max-width:150px;padding:1px 6px;
   border-radius:5px;background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-elevation-stroke);
@@ -2157,6 +2261,11 @@ const CSS = `
 .sg-node.sg-empty{cursor:default;border:1.5px dashed var(--dsw-alias-border-l4);background:transparent;
   box-shadow:none;display:grid;place-items:center;text-align:center;font-size:11.5px;
   color:var(--dsw-alias-label-caption);pointer-events:none}
+/* 「轮次没读到」的格子：与"空子会话"用颜色和可点区分开 —— 它不是空会话，是取数失败，
+   点一下就地重试（rect 原本 pointer-events:none，这里要单独放回指针事件） */
+.sg-node.sg-empty-unread{pointer-events:auto;cursor:pointer;
+  border-color:var(--dsw-alias-label-warning,#b26a00);color:var(--dsw-alias-label-secondary)}
+.sg-node.sg-empty-unread:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .sg-hd{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dsw-alias-label-caption)}
 .sg-hd .sg-turn{font-weight:600}
 .sg-hd .sg-dot{width:5px;height:5px;border-radius:50%;background:var(--dsw-alias-state-success-primary)}
@@ -2404,6 +2513,18 @@ function useSource(source) {
   return value;
 }
 
+/**
+ * 宿主回传的"轮次没读到"清单 → `[{id, reason}]`。
+ * 契约是 `[{id, reason}]`；老版本宿主（只发 id 数组）也认，免得升级期间两种形状打架。
+ */
+function unreadListOf(raw) {
+  return (Array.isArray(raw) ? raw : [])
+    .map((u) => (u && typeof u === 'object'
+      ? { id: String(u.id || ''), reason: String(u.reason || '') }
+      : { id: String(u === undefined || u === null ? '' : u), reason: '' }))
+    .filter((u) => u.id !== '');
+}
+
 /** 会话列表快照 → 数组。宿主可能给它套好几层壳，这里尽量都认。 */
 function listOf(snapshot) {
   if (!snapshot) return [];
@@ -2627,6 +2748,10 @@ function GraphView(props) {
   const [reloadNonce, setReloadNonce] = React.useState(0);
   /* 超规模时被 Host 降级成骨架的块（FR-4）：只显示轮次号与提问预览 */
   const [skeletonIds, setSkeletonIds] = React.useState(() => new Set());
+  /* 轮次**没读到**的会话（宿主回传 `{id, reason}`，FR-13）。它们与"空会话"在图上
+     长得一模一样，不单独说明的话，用户看到的就是"我那一轮对话丢了"。 */
+  const [unreadInfo, setUnreadInfo] = React.useState(() => []);
+  const unreadIds = React.useMemo(() => new Set(unreadInfo.map((u) => u.id)), [unreadInfo]);
   /* 用户点过「载入」的轮次：下次取数点名要它们的完整数据（FR-4 的分页载入） */
   const [fullIds, setFullIds] = React.useState([]);
   /* 存档里的家族根 id 与视口，写回时要用 */
@@ -2685,6 +2810,8 @@ function GraphView(props) {
         if (!alive) return;
         if (!data) { setLoaded(true); loadedRef.current = true; return; }
         if (data.turns) setRemote(data.turns);
+        /* 这一批里哪些会话的轮次没读到、为什么；下一次取数若读到了会自动清空 */
+        setUnreadInfo(unreadListOf(data.unread));
         /* 哪些块被降级成骨架，由 Host 的权威块表说了算（FR-4） */
         setSkeletonIds(new Set((Array.isArray(data.blocks) ? data.blocks : [])
           .filter((b) => b && b.skeleton)
@@ -3500,10 +3627,22 @@ function GraphView(props) {
         : null);
     }
     if (n.kind === 'empty') {
+      /* 「空会话」与「没读到」必须分开说：前者是还没提问，后者是我们的取数失败了。
+         两者共用一个框时，用户看到的是"我那一轮对话怎么会丢"（FR-13）。 */
+      const miss = unreadInfo.find((u) => u.id === n.sessionId);
       return h('div', {
-        key: n.id, className: 'sg-node sg-empty',
-        style: { left: n.x, top: n.y, width: n.w, minHeight: n.h }
-      }, h('span', null, t('block.emptyChild')));
+        key: n.id,
+        className: 'sg-node sg-empty' + (miss ? ' sg-empty-unread' : ''),
+        style: { left: n.x, top: n.y, width: n.w, minHeight: n.h },
+        ...(miss
+          ? {
+            role: 'button',
+            tabIndex: 0,
+            title: miss.reason || t('block.unread'),
+            onClick: (ev) => { ev.stopPropagation(); retry(); }
+          }
+          : {})
+      }, h('span', null, t(miss ? 'block.unread' : 'block.emptyChild')));
     }
     const b = n.block;
     /* FR-13：部分块数据读不出来时**该块降级**，而不是整张图报错。
@@ -3535,13 +3674,16 @@ function GraphView(props) {
       'data-sg-node': n.id,
       tabIndex: 0,
       role: 'button',
-      'aria-label': t('block.ariaLabel', { turn: b.turn, prompt: clip(digest(b.prompt), 120) }),
+      /* 界面上的「第 N 轮」用**会话内序号**（`index`）：子会话剔掉继承前缀之后
+         从 1 开始数，用户看到的就是它新问的第几轮。`turn` 是日志里的真实轮次号，
+         只用于块 id、分叉切点与"去对话视图找第 N 轮"的指路。 */
+      'aria-label': t('block.ariaLabel', { turn: b.index, prompt: clip(digest(b.prompt), 120) }),
       style: { left: n.x, top: n.y, width: n.w, minHeight: n.h },
       onDoubleClick: (e) => { e.stopPropagation(); doFork(b.sessionId, b.turn); },
       onKeyDown: (e) => { if (e.key === 'Enter') { e.stopPropagation(); setSelected(n.id); } }
     },
     h('div', { className: 'sg-hd' },
-      h('span', { className: 'sg-turn' }, t('block.turn', { turn: b.turn })),
+      h('span', { className: 'sg-turn' }, t('block.turn', { turn: b.index })),
       h('span', { className: 'sg-dot' + (b.status === 'open' ? ' sg-open' : b.status === 'failed' ? ' sg-failed' : '') }),
       h('span', { className: 'sg-sp' }),
       badges),
@@ -3571,20 +3713,37 @@ function GraphView(props) {
     }
     return e;
   });
-  const edges = edgeList.map((e) => {
+  /* 每条边画两份：可见的线 + 手动的**点击热区**（见 .sg-e-hit 的注释）。
+     派生边不给热区 —— 它不可删、右栏也只是只读信息，给个能点的热区反而让人以为能操作。 */
+  const edges = edgeList.flatMap((e) => {
     const d = edgePath(e, nodeMap);
-    if (!d) return null;
+    if (!d) return [];
     const cls = e.kind === 'link' ? 'sg-e-link'
       : e.kind === 'reference' ? 'sg-e-ref' : 'sg-e-branch';
-    return h('path', {
+    const out = [h('path', {
       key: e.id,
       className: cls + (e.broken ? ' sg-e-broken' : ''),
       d,
       'data-sg-edge': e.id,
       markerEnd: e.kind === 'branch' || e.kind === 'link'
         ? 'url(#sg-arrow-solid)' : 'url(#sg-arrow-hollow)'
-    });
-  }).filter(Boolean);
+    })];
+    if (e.kind === 'link' || e.kind === 'reference') {
+      out.push(h('path', {
+        key: e.id + ':hit',
+        className: 'sg-e-hit',
+        d,
+        'data-sg-edge': e.id,
+        onClick: (ev) => {
+          ev.stopPropagation();
+          /* 拖出来的平移会补一个 click：与块、会话头同一条规矩，平移过的点击不算选中 */
+          if (suppressClickRef.current) { suppressClickRef.current = false; return; }
+          setSelectedEdge(e.id);
+        }
+      }));
+    }
+    return out;
+  });
 
   /* 标签落在边中点；过长由 CSS 截断，title 给完整文本（FR-9）。
      密集档起不画标签 —— 那是边渲染里最贵的一块（NFR-1）。 */
@@ -3627,6 +3786,18 @@ function GraphView(props) {
     cornerNotes.push(t('corner.incomplete', { n: fmtNum(graph.stats.incomplete) }));
   }
   if (brokenCount > 0) cornerNotes.push(t('corner.broken', { n: fmtNum(brokenCount) }));
+  /* 轮次没读到的会话：说得清"少了什么、为什么"，并给一个就地重试的入口（FR-13） */
+  if (!graph.error && unreadInfo.length > 0) {
+    cornerNotes.push(h('span', {
+      key: 'unread',
+      className: 'sg-corner-act',
+      title: unreadInfo.map((u) => {
+        const hd = nodeMap.get('header:' + u.id);
+        return `${(hd && hd.title) || u.id}：${u.reason || t('block.unread')}`;
+      }).join('\n'),
+      onClick: retry
+    }, t('corner.unread', { n: fmtNum(unreadInfo.length) })));
+  }
 
   /* 降级留痕（见 degrade）：角标给数字与最近一条原因，悬停看全部。
      这一条的存在意义就是——下次出问题时**一张截图**就能说清哪一步退让了。 */
@@ -3755,7 +3926,7 @@ function GraphView(props) {
       if (!n) return id + t('link.missing');
       if (n.kind === 'header') return n.title;
       const b = n.block;
-      return t('block.turnOf', { turn: b.turn, title: b.alias || clip(digest(b.prompt), 20) || b.sessionTitle });
+      return t('block.turnOf', { turn: b.index, title: b.alias || clip(digest(b.prompt), 20) || b.sessionTitle });
     };
     return [
       h('div', { key: 'hd', className: 'sg-side-hd' },
@@ -3812,7 +3983,7 @@ function GraphView(props) {
     return [
       /* 固定区：头部 */
       h('div', { key: 'hd', className: 'sg-side-hd' },
-        h('span', { className: 'sg-t' }, t('block.turn', { turn: b.turn })),
+        h('span', { className: 'sg-t' }, t('block.turn', { turn: b.index })),
         h('span', { className: 'sg-s' }, b.sessionTitle),
         h('button', {
           className: 'sg-x',
@@ -3848,7 +4019,7 @@ function GraphView(props) {
         h('div', { className: 'sg-meta' },
           h('span', { className: 'sg-k' }, t('side.session')), h('span', { className: 'sg-v' }, b.sessionTitle),
           h('span', { className: 'sg-k' }, t('side.turn')), h('span', { className: 'sg-v' },
-            total ? t('side.turnOfTotal', { turn: fmtNum(b.turn), total: fmtNum(total) }) : fmtNum(b.turn)),
+            total ? t('side.turnOfTotal', { turn: fmtNum(b.index), total: fmtNum(total) }) : fmtNum(b.index)),
           h('span', { className: 'sg-k' }, t('link.status')), h('span', { className: 'sg-v' },
             open ? t('side.statusOpen') : b.status === 'failed' ? t('side.statusFailed') : t('side.statusDone')),
           h('span', { className: 'sg-k' }, t('side.toolCalls')), h('span', { className: 'sg-v' }, String(b.toolCalls)),

@@ -1,7 +1,8 @@
 /**
  * 会话图谱 · Host 侧折叠
  *
- * 纯函数：把会话事件流折成轮次记录，并从「继承事件数」反推分叉源轮次。
+ * 纯函数：把会话事件流折成轮次记录，标出分叉带过来的**继承前缀**，
+ * 并从「继承事件数」反推分叉源轮次。
  * 事件载荷的确切形状未经运行时核实（见 README「验证边界」），
  * 因此这里一律**防御性读取**：字段缺失就不填，绝不抛错。
  */
@@ -81,17 +82,75 @@ export function textOf(payload) {
 }
 
 /**
+ * 继承前缀的收尾序号（FR-8）。
+ *
+ * 分叉时 DSH 把父会话的事件前缀**真的写进子会话日志**，继承部分结束时补一条
+ * `session/end-seed`（形状见 `test/fixtures/session-shapes.json`：`{type, seq, time, data}`，
+ * `data` 是空对象 —— 边界只能读 `seq`）。这条事件就是"自有内容从这里开始"的权威边界。
+ *
+ * **前提：这条会话自己是被播种出来的（`isSeeded`）。** 同一条事件在**源会话**的日志里
+ * 也会出现 —— 那是"我从这里被复制走"的切点，源会话自己并没有继承任何内容。
+ * 把两者混为一谈，源会话自己的轮次就会被判成继承的、整轮从图里消失，而现象与
+ * "这个会话本来就空"一模一样（实测踩到过：分叉之后，**父会话整轮不见了**）。
+ * 所以 `isSeeded` 不是 true 时**一律不判**。
+ *
+ * `inheritedEventCount` 是另一条线索（header 里有、日志里没有时用它兜底）：它是继承的
+ * **事件条数**，所以闭区间切点 = 条数 − 1，与 `forkTurnFromChild` 同一口径。
+ * 两条线索都没有时返回 null —— 判不出来就**不标**，不能凭空把用户的轮次当成继承的。
+ *
+ * 一条会话里出现多条 `session/end-seed` 时取**最早**那条：后面那些（它自己后来又被
+ * 分叉出去时留下的）不影响它继承前缀的长度。
+ *
+ * @param {Array<object>} events 按 seq 升序的会话事件
+ * @param {{inheritedEventCount?: number|null, isSeeded?: boolean}} [options]
+ * @returns {number|null} 继承前缀的最后一个序号；判不出来时为 null
+ */
+export function seedBoundaryOf(events, options) {
+  const o = options || {};
+  if (o.isSeeded !== true) return null;
+
+  let seq = null;
+  (events || []).forEach((ev) => {
+    if (!ev || typeof ev !== 'object') return;
+    if (str(ev.type) !== 'session/end-seed') return;
+    const s = numOrNull(ev.seq);
+    if (s !== null && (seq === null || s < seq)) seq = s;
+  });
+  if (seq !== null) return seq;
+
+  const count = numOrNull(o.inheritedEventCount);
+  return count === null || count <= 0 ? null : count - 1;
+}
+
+/** 这一轮是否落在继承前缀里：按起点判，起点缺失时退到终点 */
+const isInheritedTurn = (turn, boundary) => {
+  if (boundary === null) return false;
+  const start = numOrNull(turn.startSeq);
+  if (start !== null) return start <= boundary;
+  const end = numOrNull(turn.endSeq);
+  return end !== null && end <= boundary;
+};
+
+/**
  * 事件流 → 轮次记录。
  *
  * 轮次边界用 `turn/start` 与 `turn/end`；
  * 提问取该轮首条人类消息，回答取该轮最后一条带文本的助手消息（与轮次大纲一致）。
  * 没有 `turn/end` 的轮次保持 `open`，`endSeq` 为 null —— 它不可分叉。
  *
+ * 继承前缀里的轮次（分叉带过来的父会话历史）由 `session/end-seed` /
+ * `inheritedEventCount` 判出，并**一律标上布尔值**（继承 `true`、自有 `false`）：
+ * 它们在源会话里已经有一份块，图谱不再画第二遍（FR-8）。判不出边界时一个字段都不写，
+ * 下游据此知道"这份数据没判过"，不会拿它当权威结论。
+ * 注意**只有自己被播种出来的会话**才判（见 `seedBoundaryOf`）。
+ *
  * @param {Array<object>} events 按 seq 升序的会话事件
+ * @param {{inheritedEventCount?: number|null, isSeeded?: boolean}} [options]
  * @returns {Array<object>} 轮次记录
  */
-export function foldTurns(events) {
+export function foldTurns(events, options) {
   const turns = [];
+  const boundary = seedBoundaryOf(events, options);
   let cur = null;
 
   /* endSeq 为 null 表示这一轮没有被 turn/end 闭合。
@@ -100,6 +159,12 @@ export function foldTurns(events) {
     if (!cur) return;
     cur.endSeq = numOrNull(endSeq);
     cur.status = cur.endSeq === null ? 'open' : 'done';
+    /* 有边界就把话**说全**：继承的标 true，自有的标 false。
+       只标 true 的话，下游拿到"没有标记"就分不清"这是自有轮次"还是
+       "这份数据根本没判过边界" —— 于是只好再按序号猜一遍，两套判据一旦不一致
+       （header 里的条数与日志里的 seed 事件对不上时就会），自有的轮次会被误藏。
+       `false` 就是"宿主已经判过，它是自有的"。 */
+    if (boundary !== null) cur.inherited = isInheritedTurn(cur, boundary);
     turns.push(cur);
     cur = null;
   };

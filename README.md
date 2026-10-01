@@ -29,8 +29,9 @@
 | | |
 |---|---|
 | **图谱视图** | 与「对话」「轨迹」并列的第三个视图；整族会话（自己 + 祖先 + 所有分叉）一起出现 |
-| **块** | 一轮交互一个块，显示轮次、状态、提问与回答摘要、工具调用与交付物计数 |
+| **块** | 一轮交互一个块，显示轮次、状态、提问与回答摘要、工具调用与交付物计数；轮次号是**会话内序号**（子会话从它自己新问的第一轮起数） |
 | **分叉** | 双击块，或选中后点「从这里分叉」，从那一轮的结束边界切出一条新会话 |
+| **继承不重复** | 分叉带过来的父会话历史**不再画一遍** —— 它在源会话里已经各有一份块，子会话只留新问的内容 |
 | **连线** | 手动把两个块接起来，表达"结论 B 建立在 A 之上"这类跨分支关系 |
 | **隐藏** | 把探索过程中的死胡同折叠起来；被隐藏块的连线一并消失，导出时记录跳过数量 |
 | **导出** | FreeMind `.mm` 与 Markdown `.md`，可直接导入 XMind / Freeplane / MindManager |
@@ -63,6 +64,7 @@
 |---|---|
 | 点视图标签栏的 **图谱** | 进入图谱，与「对话」「轨迹」并列 |
 | 单击块 | 右侧详情：完整提问、完整回答、元信息与操作 |
+| 单击连线 | 选中它：右栏改标签、删除该连线。线只有 1.6 像素宽，实际点的是它周围的透明热区 —— **没有标签的连线同样点得中**（悬停时线会加粗） |
 | **双击块** | 从该轮分叉出新会话（继承到该轮为止的完整历史） |
 | 拖空白 | 平移视口 |
 | **拖块** | 移动块，连线跟随，松手后写入自有布局 |
@@ -133,7 +135,7 @@
 src/core/model.js    块、边、家族范围、图模型（纯函数）
 src/core/graph.js    分层布局、路径、适应视图、键盘导航（纯函数）
 src/core/export.js   FreeMind .mm 与 Markdown .md（纯函数）
-src/host/fold.js     事件流 → 轮次；由继承事件数反推分叉源
+src/host/fold.js     事件流 → 轮次；按 session/end-seed 标出继承前缀，由继承事件数反推分叉源
 src/client/app.js    客户端应用
 ```
 
@@ -151,7 +153,7 @@ src/client/app.js    客户端应用
 ## 开发
 
 ```bash
-node scripts/run-tests.mjs           # 281 项测试，在同一进程内运行
+node scripts/run-tests.mjs           # 315 项测试，在同一进程内运行
 node scripts/check-package.mjs       # 清单、图标、patch、产物是否过期、服务访问越界
 node scripts/check-host-contract.mjs # 宿主契约核对（本机没装 DSH 就自动跳过）
 node scripts/build-client.mjs        # 改过 src/ 之后必须跑
@@ -200,6 +202,7 @@ node scripts/check-host-contract.mjs "D:\Software\DeepSeekHarness\resources\app.
 | `sessionQuery.observeSession(id)` | **异步**，返回需要释放（`Symbol.dispose`）的观察句柄；`await` 之后才有 `.events` |
 | Host 服务名 | `sessions` / `sessionQuery` / `sessionPersistence` / `attachments`，用 `ctx.get(name)` 读 |
 | 分叉切点 | 子会话 header 的 `inheritedEventCount - 1` 就是源会话的切点 seq，找出 `endSeq` 等于它的那一轮即可 |
+| 继承前缀 | 分叉出来的子会话，日志开头是**父会话那段历史的副本**（轮次号也接着排），继承部分以 `session/end-seed` 收尾；它的 `seq` 就是切点 seq（`inheritedEventCount - 1` 是同一件事的另一条线索，日志里没有这条事件时才用它）。继承轮次**不进图**：源会话里已经有一份块。**同一条事件在源会话日志里也会出现**（标出它被分叉的切点，实测就在父会话 seq 22），所以只有 header 里 `isSeeded` 为真的会话才按它判 —— 否则会把源会话**自己的**轮次当成继承内容藏掉，现象是"我那一轮对话丢了" |
 | 客户端分叉 | `ctx.sessions.fork({sessionId, atSeq, increaseTitle})`；失败抛 `SessionForkError` |
 | Fetch 路由 | `ctx.connection.fetch.register({path, methods, requestBody, fetch})` |
 | 下载 | `document.createElement('a')` → 设 `href` → **不挂到 `document.body`** 直接 `click()` |
@@ -240,6 +243,7 @@ node scripts/check-host-contract.mjs "D:\Software\DeepSeekHarness\resources\app.
 |---|---|
 | 图谱视图 | 与「对话」「轨迹」并列；整族会话一起呈现 |
 | 分叉 | 双击块，或选中后从该轮的结束边界切出新会话 |
+| 继承前缀不重复 | 子会话只画它自己新问的轮次（继承来的在源会话里已有块）；轮次号按会话内序号显示，导出同口径 |
 | 手动连线 | 拖块右下圆点、或详情面板「连接到…」再点目标；标签可就地编辑与删除 |
 | 重命名 | 块可设别名（图谱上带 ✎），留空恢复自动标题 |
 | 撤销 | 工具条 `↶ 撤销` 与 `Ctrl+Z` 逐步回退，上限 50 步 |
@@ -251,6 +255,7 @@ node scripts/check-host-contract.mjs "D:\Software\DeepSeekHarness\resources\app.
 | 跨会话跳转 | 点会话头切换；归档会话禁用并说明原因；家族范围不随当前会话变化 |
 | 引用式新建会话 | 详情面板「⧉ 新建引用式会话」：建一个**不继承历史**的独立会话，记一条引用边（点线 + 空心箭头）并切过去 |
 | 空/加载/错误态 | 空态给「去对话视图开始提问」入口；首次装配骨架屏；装配失败可重试且不影响其余功能；单块数据读不出来时该块降级并在图角报数 |
+| 取数失败留痕 | 某个会话的轮次**没读到**时，那一格与图角都明说"没读到 · 点此重试"，悬停给出**原因**，不再冒充「空子会话 · 尚未提问」—— 否则用户会以为自己的对话丢了 |
 | 未载入轮次 | 超块数预算时不再整图失败，而是把超出的块降成骨架块（保留轮次号与提问预览），点一下即载入完整内容 |
 | 规模降级 | 按块数分档：>800 省略块内正文与边标签，>3000 只画骨架 + 当前会话（可 ▸ 就地展开）；布局超预算时提示 |
 

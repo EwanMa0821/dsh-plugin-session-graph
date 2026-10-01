@@ -51,6 +51,16 @@ test('我们确实在用的字段：step/start.turn、turn/end.turn、tool/call.
   assert.equal(shape('tool/call').data.name, 'string', 'tool/call 带工具名');
 });
 
+test('继承前缀的边界只读 session/end-seed 的 seq —— 它的 data 是空对象', () => {
+  /* FR-8：子会话日志开头是父会话历史的副本，`session/end-seed` 标出继承部分到此为止。
+     折叠逻辑只读它的 seq（`src/host/fold.js` 的 seedBoundaryOf）。 */
+  assert.ok(has('session/end-seed'), '真实日志里有播种结束事件');
+  const s = shape('session/end-seed');
+  assert.equal(s.keys.type, 'string');
+  assert.equal(s.keys.seq, 'number', '边界靠 seq 定位');
+  assert.deepEqual(s.data, {}, 'data 里没有字段可读：谁去读 data.xxx，这条用例会提醒他');
+});
+
 /* ---------------------------------------------------------------------------
  * 已知缺口：折叠逻辑读的是**另一套词汇**
  *

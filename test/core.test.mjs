@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 
 import {
   GRAPH_VERSION, blockId, emptyId, increasedTitle, uniqueTitle, sessionOfId,
-  turnsFromTimeline, normalizeSessions, familyOf, buildGraph, plain, clip
+  turnsFromTimeline, normalizeSessions, familyOf, buildGraph, inheritedBoundary, plain, clip
 } from '../src/core/model.js';
 import {
   layout, bounds, edgePath, edgeMidpoint, fitView, moveSelection, curve, orth, DEFAULT_LAYOUT
@@ -1253,4 +1253,177 @@ test('血缘内的会话照旧当根', () => {
   assert.deepEqual(g.referenced, [], '没有引用边时不该有"引用拉进来的"会话');
   const { content } = toFreeMind(g, { links: [] });
   assert.ok(content.includes('读懂'), '家族根照常导出');
+});
+
+/* ------------------------------------------------ 继承前缀不进图（FR-8）
+ *
+ * 分叉出来的子会话，日志开头是父会话那段历史的副本。它在源会话里已经有一份块，
+ * 子会话再画一遍就是同一轮内容出现两次 —— 用户看到的就是"子会话越用越长、越看越乱"。
+ * 所以：继承轮次不生成块（任何开关都调不出来），派生边终点改成**首个自有轮次**，
+ * 界面上的「第 N 轮」按会话内序号显示（`index`）。
+ */
+
+/** 子会话：继承 20 条事件（切点 19）→ 它的第 1 轮（startSeq 10）是继承来的 */
+const forkSessions = (over = {}) => normalizeSessions([
+  { id: 'root', title: '根会话' },
+  {
+    id: 'sub', title: '根会话 (1)', parentId: 'root', forkAtTurn: 1,
+    inheritedEventCount: 20, ...over
+  }
+]);
+
+const forkTurns = (subTurns) => ({
+  root: [turn(1, '根问', '根答')],
+  sub: subTurns
+});
+
+test('inheritedBoundary 用"条数 − 1"；没有父会话/非正数/缺失都算判不出来', () => {
+  const sub = (extra) => ({ id: 'sub', parentId: 'root', ...extra });
+  assert.equal(inheritedBoundary(sub({ inheritedEventCount: 20 })), 19);
+  assert.equal(inheritedBoundary(sub({ inheritedEventCount: 1 })), 0, '只继承 1 条时切点是 0');
+  assert.equal(inheritedBoundary(sub({ inheritedEventCount: 0 })), null);
+  assert.equal(inheritedBoundary(sub({ inheritedEventCount: null })), null);
+  assert.equal(inheritedBoundary(sub({})), null, '没有这个字段 = 判不出来，不是"切点在 0"');
+  assert.equal(inheritedBoundary(null), null);
+  /* 根会话没有父会话，就谈不上继承前缀 —— 上游塞了条数也不许按序号猜 */
+  assert.equal(inheritedBoundary({ id: 'root', parentId: null, inheritedEventCount: 22 }), null);
+});
+
+test('根会话的轮次永远不会被"按序号猜继承"藏起来', () => {
+  /* 继承事件数这个字段的来源不止一处（会话对象、header、请求参数）。万一它被安到
+     一个根会话头上，按序号猜会让**整轮对话从图上消失**，而现象与"这个会话本来就空"
+     一模一样 —— 这条守卫堵的就是它：没有父会话，就不做序号判据。 */
+  const sessions = normalizeSessions([{ id: 'root', title: '根会话', inheritedEventCount: 22 }]);
+  const g = buildGraph({
+    sessions,
+    turnsBySession: { root: [turn(1, '我自己的提问', '我自己的回答')] },
+    currentId: 'root'
+  });
+  assert.deepEqual(g.blocks.map((b) => b.id), ['root:1'], '根会话的轮次照画');
+  assert.equal(g.stats.inheritedSkipped, 0);
+});
+
+test('继承前缀的轮次不生成块：子会话只画它自己问的', () => {
+  const g = buildGraph({
+    sessions: forkSessions(),
+    turnsBySession: forkTurns([turn(1, '继承来的问', '继承来的答'), turn(2, '新问', '新答')]),
+    currentId: 'sub'
+  });
+  assert.deepEqual(g.blocks.map((b) => b.id), ['root:1', 'sub:2'], '继承的 sub:1 不在图里');
+  assert.equal(g.stats.inheritedSkipped, 1, '少了一轮就要报出来');
+  assert.equal(g.blocks.find((b) => b.id === 'sub:2').index, 1,
+    '会话内序号：它是这个子会话的第 1 块（真实轮次号仍是 2）');
+  assert.equal(g.blocks.find((b) => b.id === 'sub:2').turn, 2, '`turn` 仍是日志里的真实轮次号');
+});
+
+test('宿主标了 inherited 就认标记，没有继承事件数也一样不画', () => {
+  const sessions = normalizeSessions([{ id: 'root', title: '根' }, { id: 'sub', title: '根 (1)', parentId: 'root' }]);
+  const g = buildGraph({
+    sessions,
+    turnsBySession: forkTurns([
+      turn(1, '继承来的问', '继承来的答', { inherited: true }),
+      turn(2, '新问', '新答')
+    ]),
+    currentId: 'sub'
+  });
+  assert.deepEqual(g.blocks.map((b) => b.id), ['root:1', 'sub:2']);
+});
+
+test('判不出继承边界时一轮都不藏：宁可多画，不可凭空藏用户的轮次', () => {
+  const sessions = normalizeSessions([{ id: 'root', title: '根' }, { id: 'sub', title: '根 (1)', parentId: 'root' }]);
+  const g = buildGraph({
+    sessions,
+    turnsBySession: forkTurns([turn(1, '问一', '答一'), turn(2, '问二', '答二')]),
+    currentId: 'sub'
+  });
+  assert.deepEqual(g.blocks.map((b) => b.id), ['root:1', 'sub:1', 'sub:2']);
+  assert.equal(g.stats.inheritedSkipped, 0);
+});
+
+test('继承事件数写在 header 里同样认（客户端拿到的会话项是 header 形状）', () => {
+  const sessions = normalizeSessions([
+    { id: 'root', title: '根' },
+    { id: 'sub', title: '根 (1)', parentId: 'root', header: { inheritedEventCount: 20 } }
+  ]);
+  const g = buildGraph({
+    sessions,
+    turnsBySession: forkTurns([turn(1, '继承来的问', '继承来的答'), turn(2, '新问', '新答')]),
+    currentId: 'sub'
+  });
+  assert.deepEqual(g.blocks.map((b) => b.id), ['root:1', 'sub:2']);
+});
+
+test('派生边挂到子会话的首个自有轮次上，不是那份继承副本', () => {
+  const g = buildGraph({
+    sessions: forkSessions(),
+    turnsBySession: forkTurns([turn(1, '继承来的问', '继承来的答'), turn(2, '新问', '新答')]),
+    currentId: 'sub'
+  });
+  const branch = g.edges.filter((e) => e.kind === 'branch');
+  assert.equal(branch.length, 1);
+  assert.equal(branch[0].from, 'root:1');
+  assert.equal(branch[0].to, 'sub:2', '终点 = 子会话首个自有轮次');
+});
+
+test('刚分叉、还没提问：子会话仍然只留空节点，派生边指向它', () => {
+  const g = buildGraph({
+    sessions: forkSessions(),
+    turnsBySession: forkTurns([turn(1, '继承来的问', '继承来的答')]),
+    currentId: 'sub'
+  });
+  assert.deepEqual(g.blocks.map((b) => b.id), ['root:1'], '只剩源会话的块');
+  const branch = g.edges.find((e) => e.kind === 'branch');
+  assert.equal(branch.to, emptyId('sub'), '空子会话节点是终点');
+  const laid = layout(g);
+  assert.ok(laid.nodes.some((n) => n.id === emptyId('sub')), '空节点真的画出来了');
+});
+
+test('指向继承块的手动连线不画，但数据仍在统计里报出来', () => {
+  const links = [{ id: 'L1', kind: 'link', from: 'root:1', to: 'sub:1', label: '指向继承副本' }];
+  const mk = (extra) => buildGraph({
+    sessions: forkSessions(),
+    turnsBySession: forkTurns([turn(1, '继承来的问', '继承来的答'), turn(2, '新问', '新答')]),
+    currentId: 'sub',
+    links,
+    ...extra
+  });
+  const g = mk({});
+  assert.equal(g.edges.find((e) => e.id === 'L1'), undefined, '那块不画了，线也就没有落点');
+  assert.equal(g.stats.inheritedEdges, 1);
+  /* 「显示已隐藏的块」也调不出继承块 —— 它不属于隐藏，属于不画 */
+  const shown = mk({ includeHidden: true });
+  assert.equal(shown.blocks.some((b) => b.id === 'sub:1'), false);
+  assert.equal(shown.edges.find((e) => e.id === 'L1'), undefined);
+});
+
+test('导出与画布同口径：继承轮次不出现，轮次号按会话内序号', () => {
+  const g = buildGraph({
+    sessions: forkSessions(),
+    turnsBySession: forkTurns([turn(1, '继承来的问', '继承来的答'), turn(2, '新问', '新答')]),
+    currentId: 'sub'
+  });
+  const md = toMarkdown(g).content;
+  const mm = toFreeMind(g).content;
+  assert.equal((md.match(/第 2 轮/g) || []).length, 0, '子会话自有第一块显示"第 1 轮"');
+  assert.equal((md.match(/- \*\*第 1 轮\*\*/g) || []).length, 2, '源的 1 轮 + 子的 1 轮');
+  assert.ok(!md.includes('继承来的问'), '继承内容不进导出');
+  assert.ok(!mm.includes('继承来的问'));
+  assert.ok(mm.includes('第 1 轮 · 新问'), '子会话那块按会话内序号命名');
+});
+
+test('本地时间线若已判过 inherited 就原样传下去（两端都传），没判过就不写字段', () => {
+  const withFlag = turnsFromTimeline({
+    turnOrder: ['a'], turns: { a: { turn: 2, inherited: true, end: { seq: 9 } } }
+  });
+  assert.equal(withFlag[0].inherited, true);
+  /* 显式 false 也要传：它是"这条时间线已经判过、这是自有轮次"的结论，
+     传丢了就会被下游按序号再猜一遍 */
+  const own = turnsFromTimeline({
+    turnOrder: ['a'], turns: { a: { turn: 2, inherited: false, end: { seq: 9 } } }
+  });
+  assert.equal(own[0].inherited, false);
+  const plainTurn = turnsFromTimeline({
+    turnOrder: ['a'], turns: { a: { turn: 1, end: { seq: 9 } } }
+  });
+  assert.equal('inherited' in plainTurn[0], false, '没判过就不写字段');
 });

@@ -116,6 +116,9 @@ export const UI = {
   'block.response': { zh: '回答', en: 'Response' },
   'block.notLoaded': { zh: '（未载入）', en: '(not loaded)' },
   'block.emptyChild': { zh: '空子会话 · 尚未提问', en: 'Empty child session · no prompt yet' },
+  /* 与「空子会话」严格区分：这一格是**没读到**轮次（宿主取数失败），不是没有轮次。
+     两者长得一样时，用户会以为自己的对话丢了 —— 这正是必须分开的原因（FR-13）。 */
+  'block.unread': { zh: '这一格的轮次没读到 · 点此重试', en: 'Turns here could not be read · click to retry' },
 
   'side.meta': { zh: '元信息', en: 'Details' },
   'side.session': { zh: '会话', en: 'Session' },
@@ -166,6 +169,11 @@ export const UI = {
   },
   'corner.incomplete': { zh: '{n} 个块数据不完整', en: '{n} blocks have incomplete data' },
   'corner.broken': { zh: '{n} 条连线指向已不存在的块', en: '{n} links point to blocks that no longer exist' },
+  /* 轮次没读到的会话：与"空会话"长得一样，必须说出来并给重试入口（FR-13） */
+  'corner.unread': {
+    zh: '{n} 个会话的轮次没读到 · 点此重试',
+    en: '{n} sessions could not be read · click to retry'
+  },
   /* 降级留痕：宿主形状对不上时插件会退一步继续，这里把"退过"说出来 */
   'corner.degraded': {
     zh: '降级 {n} 项 · 最近：{why}',

@@ -1279,6 +1279,53 @@ test('存档里的块坐标在加载时就生效（FR-5 验收 1）', async () =
   }
 });
 
+/* 未命名的连线曾经**选不上**：线只有 1.6 像素宽，而唯一的选择入口是边标签，
+   没有标签就不画标签元素 —— 于是"画得出来、删不掉"（FR-9 写的是"点击已有边或其标签选中它"）。
+   现在每条手动/引用连线都带一条透明粗描边的点击热区。 */
+test('没有标签的连线也能点中并删除（靠热区，而不是只靠标签）', async () => {
+  serverReply = {
+    ...serverReply,
+    state: blankState({ links: [{ id: 'L1', kind: 'link', from: 'root:1', to: 'ancor:1' }] })
+  };
+  const before = postCalls.length;
+  try {
+    let tree = await mountLoaded();
+    /* 没有标签 ⇒ 没有 sg-elabel，这正是修复前选不中的那种连线 */
+    assert.equal(elements(tree).find((n) => n.props && n.props.className === 'sg-elabel'), undefined,
+      '这条连线本来就没有标签');
+    const hit = elements(tree).find((n) => n.props && n.props.className === 'sg-e-hit');
+    assert.ok(hit, '边上有一条可点的热区');
+    assert.equal(hit.props['data-sg-edge'], 'L1', '热区认得出是哪条边');
+    hit.props.onClick({ stopPropagation() {} });
+
+    tree = render(ctx.slots.Component, props);
+    const side = elements(tree).find((n) => n.props && n.props.className === 'sg-side');
+    assert.match(JSON.stringify(side.props.children.map((k) => k && k.props && k.props.className)),
+      /sg-side-acts/, '点中之后右栏切成了连线面板');
+
+    const del = elements(tree).find((n) => n.props && typeof n.props.className === 'string'
+      && n.props.className.includes('sg-danger'));
+    assert.ok(del, '面板里有删除按钮');
+    del.props.onClick();
+    await new Promise((r) => setTimeout(r, 520));
+
+    const sent = postCalls.slice(before).find((p) => p.patch.removeLinkIds);
+    assert.deepEqual(sent.patch.removeLinkIds, ['L1'], '删得掉：按 id 上报');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('派生边不给点击热区：它不可删，右栏也只是只读信息', async () => {
+  /* 家族里 root → ancor 本来就有派生边；它不该抢走"点一下就能操作"的预期 */
+  const tree = await mountLoaded();
+  const hitIds = elements(tree)
+    .filter((n) => n.props && n.props.className === 'sg-e-hit')
+    .map((n) => n.props['data-sg-edge']);
+  assert.equal(hitIds.some((id) => String(id).startsWith('branch:')), false,
+    '派生边没有热区：' + JSON.stringify(hitIds));
+});
+
 test('点边标签即选中该连线，可改标签也可删除', async () => {
   serverReply = {
     ...serverReply,
@@ -1627,6 +1674,38 @@ test('空家族显示空态，并提供「去对话视图开始提问」', async
   }
 });
 
+/* 取数失败与"空会话"曾经长得一模一样：那一格画成「空子会话 · 尚未提问」，
+   用户看到的是"我那一轮对话怎么会丢"。现在宿主把读不到的会话单独回传，
+   界面要说明、给重试，并且与真正的空会话在样式上分开（FR-13）。 */
+test('轮次没读到的会话：说明是"没读到"而不是空会话，点一下能重试', async () => {
+  serverReply = {
+    ...serverReply,
+    state: blankState(),
+    turns: { root: REMOTE_TURNS.root, ancor: [], invest: REMOTE_TURNS.invest },
+    unread: [{ id: 'ancor', reason: '观察会话失败：boom' }]
+  };
+  try {
+    const tree = await mountLoaded();
+    assert.match(textIn(tree), /轮次没读到/, '角标把"没读到"说出来');
+    assert.match(textIn(tree), /点此重试/, '并给出重试入口');
+    /* 真正的空会话仍然说"尚未提问"：两种状态不能共用一句话 */
+    assert.ok(!textIn(tree).includes('空子会话 · 尚未提问'), '没读到的格子不再冒充空会话');
+
+    const box = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-empty-unread'));
+    assert.ok(box, '那一格用"没读到"的样式画（不是默认的空会话框）');
+    assert.match(String(box.props.title), /boom/, '原因挂在悬停提示里，排查时不用再猜');
+
+    const callsBefore = fetchCalls.length;
+    box.props.onClick({ stopPropagation() {} });
+    await tick();
+    render(ctx.slots.Component, props);
+    assert.ok(fetchCalls.length > callsBefore, '点一下真的重新取数');
+  } finally {
+    serverReply = { ...serverReply, state: null, turns: REMOTE_TURNS, unread: undefined };
+  }
+});
+
 test('装配失败时视图区域显示错误态，可重试且其余功能不受影响', async () => {
   /* 核心层写得很防御，喂坏数据并不会抛；要触发「装配整体失败」这条兜底路径，
      得让它在建模途中真的炸掉 —— 用一个读属性就抛的 Proxy 当会话条目。 */
@@ -1966,6 +2045,48 @@ test('sessions= 只报家族内的会话：家族外的会话不该进请求（�
     assert.ok(!url.includes('outsider'), '家族外的会话不能进 sessions=：' + url);
   } finally {
     ctx.sessions.list = savedList;
+  }
+});
+
+/* FR-8：分叉出来的子会话里，继承来的轮次不画 —— 它在源会话里已经有一份块了，
+   再铺一遍就是"同一轮内容出现两次"。块按**会话内序号**编号：自有第一块显示"第 1 轮"。 */
+test('子会话的继承轮次不画：族里那张卡片只剩自有块，且从「第 1 轮」开始编号', async () => {
+  const savedList = ctx.sessions.list;
+  const savedReply = serverReply;
+  ctx.sessions.list = source({ byId: {
+    root: { id: 'root', title: '根会话', parentId: null, sessionId: 'root' },
+    sub: {
+      id: 'sub', title: '根会话 (1)', parentId: 'root', sessionId: 'sub',
+      inheritedEventCount: 20          /* 继承 20 条事件 → 切点 19 */
+    }
+  } });
+  serverReply = {
+    ...serverReply, state: null,
+    turns: {
+      root: turnsOf('根', 1),
+      /* sub 的第 1 轮 startSeq 10 落在切点之前（继承来的），第 2 轮 20 才是自己问的 */
+      sub: [turnsOf('继承', 2)[0], turnsOf('新问', 2)[1]]
+    }
+  };
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);          /* 当前会话仍是 root，本地时间线不掺进来 */
+    await tick();
+    const tree = render(ctx.slots.Component, props);
+
+    assert.equal(nodeEl(tree, 'sub:1'), undefined, '继承来的第 1 轮不画');
+    const own = nodeEl(tree, 'sub:2');
+    assert.ok(own, '自有轮次照常画');
+    assert.match(textIn(own), /第 1 轮/, '按会话内序号编号，而不是日志里的第 2 轮');
+    /* 子会话头上的轮数也只算自有轮次（修好之前这里会写「2 轮」） */
+    const subHeader = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-label')
+      && textsOf(n).join(' ').includes('根会话 (1)'));
+    assert.ok(subHeader, '找得到子会话的会话头');
+    assert.match(textsOf(subHeader).join(' '), /1 轮/);
+  } finally {
+    ctx.sessions.list = savedList;
+    serverReply = savedReply;
   }
 });
 
