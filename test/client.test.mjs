@@ -2013,6 +2013,34 @@ test('降级必须留痕：订阅抛错时视图照常渲染，且角标与控�
     '控制台也留痕：' + warnings.join(' | '));
 });
 
+test('取数返回 404：退化成"只看得到本地骨架"的提示，视图仍可用', async () => {
+  /* 异常矩阵的一条：路由没注册（插件 Host 半没加载）时，界面不能装作无事，
+     也不能崩 —— 要明确告诉用户"读不到会话内容"，并给出可操作的重试路径。 */
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = () => Promise.resolve({ ok: false, status: 404, json: async () => null });
+  try {
+    /* 换一个会话 id：hook 槽位跨用例复用，依赖不变 effect 就不会重跑 */
+    const p = { ...ctx.slots.options.inject('invest'), ...slotKit() };
+    render(ctx.slots.Component, p);
+    await tick();
+    const tree = JSON.stringify(render(ctx.slots.Component, p));
+    assert.ok(tree.includes('暂时读不到会话内容'), '给出可操作的提示：' + tree.slice(0, 200));
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('会话服务整个缺席：给出空态，而不是崩溃或一直转圈', () => {
+  const p = {
+    sessionId: '',
+    ctx: { get: () => undefined, locale: { getSnapshot: () => ({ active: 'zh' }), subscribe: () => () => {} } }
+  };
+  let tree;
+  assert.doesNotThrow(() => { tree = render(ctx.slots.Component, p); }, '服务缺席不该让视图抛错');
+  const text = JSON.stringify(tree);
+  assert.ok(text.includes('这个家族里还没有可显示的轮次'), '给出空态文案：' + text.slice(0, 200));
+});
+
 /* ============================================================================
    回归：这一批是"装完插件整个界面坏掉"以及若干静默失效的直接原因
    ============================================================================ */
