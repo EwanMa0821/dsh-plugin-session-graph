@@ -1967,12 +1967,12 @@ test('视图组件外面有兜底：渲染抛错时给出可读的错误卡片�
      现场找不到任何线索。这层外壳必须把异常兜成一张卡片。 */
   const safe = ctx.slots.Component;
   assert.equal(typeof safe, 'function');
-  /* 触发器要选**组件体内确实没有守卫**的那条路：resolveSessionId 会去问
-     props.sessions.current()，它抛错时异常会冒出组件体 —— 正是宿主里那种"白屏"路径。 */
+  /* 触发器选**组件体内没有守卫**的那条路：读 `props.sessions.list` 本身就抛。
+     宿主服务的形状不受我们控制，这类异常会让 host 把视图整片卸掉 —— 正是"白屏"路径。 */
   const boom = {
-    sessionId: '',
+    sessionId: 'root',
     ctx: {},
-    sessions: { list: { getSnapshot: () => ({ byId: {} }), subscribe: () => () => {} }, current() { throw new Error('boom-current'); } }
+    sessions: { get list() { throw new Error('boom-list'); } }
   };
   let tree;
   assert.doesNotThrow(() => { tree = safe(boom); }, '外壳必须吞掉渲染异常');

@@ -2184,7 +2184,14 @@ const CSS = `
 
 /* ------------------------------------------------------------ 小工具 */
 
-/** 订阅一个快照源。只依赖 { getSnapshot, subscribe } 这两个方法。 */
+/**
+ * 订阅一个快照源。只依赖 `{ getSnapshot, subscribe }` 这两个方法。
+ *
+ * **订阅与退订都必须自己守异常。** 它们是 effect 里的同步调用：一旦宿主某个服务
+ * （`locale` / `sessions.list` / `workspaces.list` / 视图 target）的 `subscribe`
+ * 抛错，React 会把这个组件整个卸掉 —— 表现就是**视图区纯白**，
+ * 而标签（另一个纯 thunk）照常显示，看起来"只是没内容"。渲染期的兜底接不住它。
+ */
 function useSource(source) {
   const [value, setValue] = React.useState(() => {
     try { return source && source.getSnapshot ? source.getSnapshot() : undefined; } catch { return undefined; }
@@ -2194,8 +2201,16 @@ function useSource(source) {
     let alive = true;
     const pull = () => { if (alive) { try { setValue(source.getSnapshot()); } catch { /* 源暂时不可读 */ } } };
     pull();
-    const off = source.subscribe(pull);
-    return () => { alive = false; if (typeof off === 'function') off(); };
+    let off;
+    try {
+      off = source.subscribe(pull);
+    } catch {
+      return undefined;                    /* 订阅不上就只用首帧快照，绝不因此白屏 */
+    }
+    return () => {
+      alive = false;
+      try { if (typeof off === 'function') off(); } catch { /* 退订失败不影响卸载 */ }
+    };
   }, [source]);
   return value;
 }
@@ -2217,8 +2232,12 @@ function resolveSessionId(props, snapshot) {
   const sessions = props && props.sessions;
   if (sessions) {
     for (const key of ['current', 'currentId', 'activeId']) {
-      const v = typeof sessions[key] === 'function' ? sessions[key]() : sessions[key];
-      if (typeof v === 'string' && v) return v;
+      /* 逐项守卫：这里是在**猜**宿主服务的形状，猜到的可能是需要上下文的函数 ——
+         它抛错会让整片视图变白屏，代价太大。 */
+      try {
+        const v = typeof sessions[key] === 'function' ? sessions[key]() : sessions[key];
+        if (typeof v === 'string' && v) return v;
+      } catch { /* 换个来源继续找 */ }
     }
   }
   const list = listOf(snapshot);
@@ -2390,10 +2409,11 @@ function GraphView(props) {
       return sessionKey;                     /* 家族算不出来时退回全量，宁可慢不要漏 */
     }
   }, [sessionsNorm, sessionId, sessionKey]);
-  const localTurns = React.useMemo(
-    () => turnsFromTimeline(graphSnapshot && graphSnapshot.timeline),
-    [graphSnapshot]
-  );
+  const localTurns = React.useMemo(() => {
+    /* 装配器的时间线形状不在我们手里：读不动就当没有本地轮次，
+       绝不让它把整片视图带成白屏。 */
+    try { return turnsFromTimeline(graphSnapshot && graphSnapshot.timeline); } catch { return []; }
+  }, [graphSnapshot]);
 
   /* 家族里其他会话的轮次要向 Host 取（本地的装配器时间线只覆盖当前会话）。
      取不到就退化成"只有当前会话有块"——家族骨架仍然完整。 */
@@ -2581,19 +2601,23 @@ function GraphView(props) {
        本地时间线更新更快，但它的轮次记录里**没有问答文本**（文本在 data 这个 Map 里，
        按插件定义键存放），远程读的是原始事件、文本是齐的——
        整条覆盖会把文本抹成空。 */
-    const byTurn = new Map((out[sessionId] || []).map((t) => [t.turn, t]));
-    localTurns.forEach((t) => {
-      const prev = byTurn.get(t.turn) || {};
-      byTurn.set(t.turn, {
-        ...prev,
-        ...t,
-        prompt: t.prompt || prev.prompt || '',
-        response: t.response || prev.response || '',
-        toolCalls: t.toolCalls || prev.toolCalls || 0,
-        deliverables: t.deliverables || prev.deliverables || 0
+    try {
+      const byTurn = new Map((Array.isArray(out[sessionId]) ? out[sessionId] : []).map((t) => [t.turn, t]));
+      localTurns.forEach((t) => {
+        const prev = byTurn.get(t.turn) || {};
+        byTurn.set(t.turn, {
+          ...prev,
+          ...t,
+          prompt: t.prompt || prev.prompt || '',
+          response: t.response || prev.response || '',
+          toolCalls: t.toolCalls || prev.toolCalls || 0,
+          deliverables: t.deliverables || prev.deliverables || 0
+        });
       });
-    });
-    out[sessionId] = [...byTurn.values()].sort((a, b) => a.turn - b.turn);
+      out[sessionId] = [...byTurn.values()].sort((a, b) => a.turn - b.turn);
+    } catch {
+      /* 远程载荷形状意外时保留原样，不让它把视图带成白屏 */
+    }
     return out;
   }, [remote, localTurns, sessionId]);
 
