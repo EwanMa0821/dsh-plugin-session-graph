@@ -15,7 +15,7 @@ import { normalizeSessions, buildGraph, clip, familyOf, sessionOfId } from './sr
 import { render } from './src/core/export.js';
 import { stateToClient, LIMITS } from './src/core/state.js';
 import { foldTurns, linkForks } from './src/host/fold.js';
-import { openStore, DOMAIN_NAME } from './src/host/store.js';
+import { openStore, findOrphanRecords, DOMAIN_NAME } from './src/host/store.js';
 
 export const name = 'dsh-plugin-session-graph';
 
@@ -567,12 +567,44 @@ export function apply(ctx, config) {
       store = opened;
       holder.store = opened;
       holder.ready = true;
+
+      /* 存储会不会无声长大：报告可能再也读不到的家族记录数。
+         **只报告，不删除** —— 冷会话（在磁盘上但没被打开）不在活跃列表里，
+         照"不在活跃列表就删"会删掉仍然存在的会话的存档，而宿主目前没有可靠的
+         "会话是否还在"探针（`readTitle` 返回 undefined 只表示日志里没有标题事件）。
+         详见 src/host/store.js 的 findOrphanRecords。 */
+      void findOrphanRecords(opened, { knownIds: liveSessionIds(ctx) })
+        .then((scan) => {
+          if (!scan.supported || scan.candidates.length === 0) return;
+          try {
+            if (logger && typeof logger.warn === 'function') {
+              logger.warn(`会话图谱：存储里有 ${scan.candidates.length} 条家族记录（共 ${scan.total} 条）`
+                + '对应的会话已不在活跃列表里且很久未更新。它们可能是冷会话的存档，'
+                + '所以不会自动删除；如需清理请先确认这些会话确实已删除。');
+            }
+          } catch { /* 日志不可用不影响主流程 */ }
+        })
+        .catch(() => { /* 扫描失败只是少了提示，不影响任何功能 */ });
     });
   };
 
   /* 服务已就绪时同步注册；否则等它出现再注册，插件本体不会卡住 */
   if (typeof ctx.inject === 'function') ctx.inject(['connection'], register);
   else register(ctx);
+}
+
+/** 宿主活跃会话 id。**冷会话不在这里** —— 所以它只能用来"排除确定还活着的"，
+ * 不能反过来推断某个会话已经消失（见 findOrphanRecords 的说明）。 */
+function liveSessionIds(ctx) {
+  try {
+    const store = service(ctx, 'sessions');
+    const list = store && typeof store.list === 'function' ? (store.list() || []) : [];
+    return list
+      .map((s) => String((s && s.header && s.header.id) ?? (s && s.id) ?? ''))
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
 }
 
 async function respondRead(holder, ctx, request, limits) {

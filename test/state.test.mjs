@@ -16,7 +16,7 @@ import {
   sanitizeState, migrateState, mergePatch, stateToClient, clientPatchToState, sessionsInState
 } from '../src/core/state.js';
 import {
-  DOMAIN_SPEC, DOMAIN_NAME, TABLE_NAME, familyRecordSchema, createStore, openStore
+  DOMAIN_SPEC, DOMAIN_NAME, TABLE_NAME, familyRecordSchema, createStore, openStore, findOrphanRecords
 } from '../src/host/store.js';
 
 /* ------------------------------------------------------------ id ↔ Ref */
@@ -422,4 +422,67 @@ test('领域声明跟着迁移表走：没有迁移时不下发 compatibleVersio
     assert.deepEqual(DOMAIN_SPEC.compatibleVersions, keys);
   }
   assert.equal(DOMAIN_SPEC.version, STATE_VERSION);
+});
+
+/* -------------------------------------------------------------- 记录回收 */
+
+test('listKeys：能枚举就给键，枚举不了返回 null（不是空数组）', () => {
+  /* "枚举不了"和"一条都没有"是两件事：回收逻辑一旦把前者当后者，
+     就会以为整个存储都是空的。 */
+  const withKeys = createStore({
+    table: () => ({ get: () => undefined, put: async () => {}, delete: async () => true, keys: () => new Set(['a', 'b']) })
+  });
+  assert.deepEqual(withKeys.listKeys(), ['a', 'b']);
+
+  const withoutKeys = createStore({ table: () => ({ get: () => undefined, put: async () => {}, delete: async () => true }) });
+  assert.equal(withoutKeys.listKeys(), null, '后端不支持枚举时必须说"不知道"');
+});
+
+test('findOrphanRecords 只报告候选，绝不删除；判据不足时不候选', async () => {
+  const old = Date.now() - 200 * 24 * 60 * 60 * 1000;
+  const fresh = Date.now();
+  const records = new Map([
+    ['alive-cold', { version: STATE_VERSION, updatedAt: old }],      /* 不在活跃列表里，但可能是冷会话 */
+    ['alive-hot', { version: STATE_VERSION, updatedAt: old }],
+    ['fresh-one', { version: STATE_VERSION, updatedAt: fresh }],
+    ['broken', { version: STATE_VERSION + 1, updatedAt: old }]       /* 版本不认识：不候选 */
+  ]);
+  let deleted = 0;
+  const store = createStore({
+    table: () => ({
+      get: (k) => records.get(k),
+      put: async (k, v) => { records.set(k, v); },
+      delete: async (k) => { deleted += 1; records.delete(k); return true; },
+      keys: () => [...records.keys()]
+    })
+  });
+
+  const scan = await findOrphanRecords(store, { knownIds: ['alive-hot'], now: Date.now() });
+  assert.equal(scan.supported, true);
+  assert.equal(scan.total, 4);
+  assert.deepEqual(scan.candidates, ['alive-cold'], '只报告"不在活跃列表且很久没动"的，且版本不认识的排除在外');
+  assert.equal(deleted, 0, '只报告不删除 —— 冷会话的存档不能因为"没被打开"就被删掉');
+  assert.equal(records.size, 4, '一条都不能少');
+});
+
+test('findOrphanRecords 在已知集合为空时绝不判定（否则会把整个存储当孤儿）', async () => {
+  const store = createStore({
+    table: () => ({
+      get: () => ({ version: STATE_VERSION, updatedAt: 1 }),
+      put: async () => {},
+      delete: async () => true,
+      keys: () => ['x', 'y']
+    })
+  });
+  const scan = await findOrphanRecords(store, { knownIds: [] });
+  assert.equal(scan.supported, true);
+  assert.equal(scan.total, 2, '记录数照报');
+  assert.deepEqual(scan.candidates, [], '但没有已知集合就不做任何判定');
+});
+
+test('findOrphanRecords 在后端不支持枚举时安静退出', async () => {
+  const store = createStore({ table: () => ({ get: () => undefined, put: async () => {}, delete: async () => true }) });
+  const scan = await findOrphanRecords(store, { knownIds: ['a'] });
+  assert.equal(scan.supported, false);
+  assert.deepEqual(scan.candidates, []);
 });

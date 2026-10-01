@@ -90,6 +90,71 @@ export const DOMAIN_SPEC = {
 };
 
 /**
+ * 把后端给的键集合尽量读成字符串数组；认不出来就返回 null。
+ * `keys()` 可能给数组、Set、Map 或任意可迭代对象 —— 都认，但**不猜**未知形状。
+ */
+function toKeyArray(value) {
+  if (Array.isArray(value)) return value.map(String);
+  if (value instanceof Set) return [...value].map(String);
+  if (value instanceof Map) return [...value.keys()].map(String);
+  if (value && typeof value[Symbol.iterator] === 'function') {
+    try { return [...value].map(String); } catch { return null; }
+  }
+  return null;
+}
+
+/**
+ * 找出"可能再也读不到"的家族记录并**只报告，不删除**。
+ *
+ * 背景：记录以家族根会话 id 为键，会话被删或家族换了根之后，这条记录就永远读不到了，
+ * 却会一直留在存储里（`remove()` 因此一直没有调用方）。
+ *
+ * 但**先别删**。我原本打算用"不在活跃会话列表里 + 很久没更新"当判据，查证后发现它是错的：
+ * 冷会话（在磁盘上、但没被打开）本来就不在 `sessions.list()` 里，照这个判据会把
+ * 仍然存在的会话的存档删掉 —— 用户下次打开那个会话，别名/连线/位置全没了。
+ * 而宿主目前**没有**可靠的"会话是否还在"的探针：`sessionQuery.readTitle(id)` 返回
+ * `undefined` 的含义是"日志里没有标题事件"，日志读不动时它是**抛错**，两者都不能证明会话消失。
+ *
+ * 所以这里只做三件安全的事：
+ *   1. 数出候选（不在已知会话集合里 + 超过 graceMs 没更新）；
+ *   2. 把候选数交给调用方（进程日志），让"存储在长"这件事**看得见**，而不是无声膨胀；
+ *   3. 顺手暴露 `remove()` 的用法，等宿主给出可靠的"会话已删除"信号后，把 isGone
+ *      换成那个信号即可 —— 判定与删除是分开的，届时不需要改这里的结构。
+ *
+ * 任何一步拿不到信息（枚举不支持、读不动、版本不认识）都**不候选**：宁可留垃圾。
+ *
+ * @param {object} store createStore 的返回值
+ * @param {{knownIds?: Iterable<string>, now?: number, graceMs?: number, limit?: number}} [options]
+ * @returns {Promise<{supported: boolean, total: number, candidates: string[]}>}
+ */
+export async function findOrphanRecords(store, options = {}) {
+  const { knownIds, now = Date.now(), graceMs = 90 * 24 * 60 * 60 * 1000, limit = 200 } = options;
+  const result = { supported: false, total: 0, candidates: [] };
+  if (!store || typeof store.listKeys !== 'function') return result;
+  const keys = store.listKeys();
+  if (keys === null) return result;                     /* 枚举不了 ≠ 没有记录 */
+  result.supported = true;
+  result.total = keys.length;
+
+  const known = new Set();
+  if (knownIds) for (const id of knownIds) known.add(String(id));
+  /* 已知集合为空时**绝不**判定：那通常意味着会话列表没读到，
+     照此推断会把整个存储都当成孤儿。 */
+  if (known.size === 0) return result;
+
+  for (const key of keys) {
+    if (result.candidates.length >= limit) break;
+    if (known.has(key)) continue;
+    const record = await store.read(key);
+    if (!record || record.incompatible || !record.state) continue;   /* 读不动/不认识：不候选 */
+    const updatedAt = Number(record.state.updatedAt);
+    if (!Number.isFinite(updatedAt) || now - updatedAt < graceMs) continue;
+    result.candidates.push(key);
+  }
+  return result;
+}
+
+/**
  * 把打开的领域句柄包成图谱存储。
  *
  * @param {{table: (name: string) => object, close: () => Promise<void>}} domain
@@ -154,6 +219,21 @@ export function createStore(domain, now = () => Date.now()) {
         return await table().delete(key);
       } catch {
         return false;
+      }
+    },
+
+    /**
+     * 记录键（能枚举时）。宿主后端不提供枚举就返回 **null**（而不是空数组）：
+     * "枚举不了"和"一条都没有"是两件完全不同的事，调用方必须能分辨 ——
+     * 回收逻辑一旦把前者当成后者，就会以为整个存储都是空的。
+     */
+    listKeys() {
+      try {
+        const t = table();
+        if (!t || typeof t.keys !== 'function') return null;
+        return toKeyArray(t.keys());
+      } catch {
+        return null;
       }
     },
 
