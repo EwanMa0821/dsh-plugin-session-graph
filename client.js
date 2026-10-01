@@ -2201,26 +2201,34 @@ const CSS = `
    并退回 flex-basis:auto —— 侧栏就按内容撑开（实测占掉大半屏，看起来跟没改一样）。
    所以用最保守的三个长写属性：定宽 330px、窄窗口 max-width 兜底、最小可用宽度。
    另：这段是模板字符串，注释里**不能出现反引号**，否则会提前闭合（构建期护栏见 build-client）。 */
+/* 展示逻辑对齐原型（prototype/session-graph-interactive.html）：
+   只有头部固定，**其余全在同一个滚动区里**，顺序是
+   提问 → 回答 → 元信息 → 用量/产物 → 操作按钮（按钮最后，不是最前）。
+   原型是 ".detail 里放固定 .detail-hd + 一个 .detail-body"，我们少一层包装，
+   所以用「整列滚动 + 头部 sticky」达到同样的观感，不动 JSX。 */
 .sg-side{flex:0 0 330px;max-width:46vw;min-width:240px;border-left:.5px solid var(--dsw-alias-border-l1);display:flex;
-  flex-direction:column;min-height:0;user-select:text;-webkit-user-select:text}
+  flex-direction:column;min-height:0;overflow-y:auto;user-select:text;-webkit-user-select:text}
+/* 头部要压住滚动内容，否则文字会从下面透出来 */
 .sg-side-hd{padding:13px 15px 11px;border-bottom:.5px solid var(--dsw-alias-border-l1);display:flex;
-  align-items:center;gap:8px;flex:0 0 auto}
+  align-items:center;gap:8px;flex:0 0 auto;position:sticky;top:0;z-index:2;
+  background:var(--dsw-alias-bg-base)}
 .sg-side-hd .sg-t{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);flex:0 0 auto}
 .sg-side-hd .sg-s{font-size:11.5px;color:var(--dsw-alias-label-caption);overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap;min-width:0}
 .sg-x{margin-left:auto;border:none;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;
   font-size:15px;padding:2px 5px;border-radius:5px;flex:0 0 auto}
 .sg-x:hover{background:var(--dsw-alias-interactive-bg-hover)}
-.sg-side-meta{padding:12px 15px 0;flex:0 0 auto}
+.sg-side-meta{padding:12px 15px 0;flex:0 0 auto;order:1}
 .sg-side-acts{padding:12px 15px 13px;flex:0 0 auto;border-top:.5px solid var(--dsw-alias-border-l1);
   margin-top:12px;display:flex;flex-direction:column;gap:7px}
 /* 唯一滚动的区域。输入框让位由 .sg-root 的 padding-bottom 统一负责（画布与侧栏一起让开），
    这里不再单独留白，否则侧栏底部会白出一大块。 */
-/* 详情面板的**阅读优先**顺序：头部/元信息在最上（固定），正文（提问/回答）占满剩余高度，
-   操作按钮压到最后一行。DOM 顺序仍是"固定区在前、滚动区在后"（切会话时元信息不该被正文挤走），
-   这里只改视觉顺序 —— 所以用 flex order，而不是搬 JSX。 */
-.sg-side-bd{flex:1;overflow-y:auto;padding:12px 15px 16px;min-height:0;order:1}
-.sg-side-acts{order:2}
+/* 详情面板的顺序对齐原型：提问/回答在最前，元信息居中，操作按钮最后。
+   三者都在**同一个滚动列**里（滚动由 .sg-side 承担），所以这里不再各管各的溢出。
+   用 flex order 表达顺序，是因为 DOM 顺序要保持"正文最后"以兼容既有用例与读屏顺序。 */
+.sg-side-bd{flex:0 0 auto;overflow:visible;padding:12px 15px 0;min-height:0;order:0}
+.sg-side-meta{order:1}
+.sg-side-acts{order:2;border-bottom:.5px solid transparent}
 /* 小标题在正文区与固定区都要用，所以不做后代限定 */
 .sg-lb{font-size:11px;font-weight:600;letter-spacing:.05em;color:var(--dsw-alias-label-caption);
   margin-bottom:6px}

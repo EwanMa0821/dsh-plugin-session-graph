@@ -615,7 +615,7 @@ function selectBlock(id) {
   return render(ctx.slots.Component, props);
 }
 
-test('详情面板：元信息与操作固定在顶部，只有正文区滚动', async () => {
+test('详情面板：对齐原型 —— 只有头部固定，正文在前、操作最后', async () => {
   /* 回归：正文排在前面时，长正文会把元信息与操作永远挤出可视区 */
   resetComponent();
   render(ctx.slots.Component, props);
@@ -629,9 +629,11 @@ test('详情面板：元信息与操作固定在顶部，只有正文区滚动',
     '固定区在前、滚动区在后');
 
   const css = String(elements(after).find((n) => n.type === 'style').props.children);
-  assert.match(css, /\.sg-side-bd\{[^}]*overflow-y:auto/, '正文区是唯一的滚动容器');
-  assert.match(css, /\.sg-side-meta\{[^}]*flex:0 0 auto/, '元信息不参与拉伸');
-  assert.match(css, /\.sg-side-acts\{[^}]*flex:0 0 auto/, '操作不参与拉伸');
+  assert.match(css, /\.sg-side\{[^}]*overflow-y:auto/, '整列滚动（原型：只有头部固定）');
+  assert.match(css, /\.sg-side-hd\{[^}]*position:sticky/, '头部吸附在顶部');
+  assert.match(css, /\.sg-side-bd\{[^}]*order:0/, '提问/回答在最前');
+  assert.match(css, /\.sg-side-meta\{[^}]*order:1/, '元信息居中');
+  assert.match(css, /\.sg-side-acts\{[^}]*order:2/, '操作按钮最后');
   /* 定宽 330px（对齐原型），窄窗口用 max-width 兜底。注意不能把数学函数写进 flex 简写：
      一旦被判非法，整条声明作废、退回 flex-basis:auto，侧栏就按内容撑开 —— 实测占掉大半屏。 */
   assert.match(css, /\.sg-side\{flex:0 0 330px;max-width:46vw/, '右栏定宽 330px，窄窗口 max-width 兜底');
