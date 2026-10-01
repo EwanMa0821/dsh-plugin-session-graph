@@ -160,6 +160,11 @@ export const UI = {
   },
   'corner.incomplete': { zh: '{n} 个块数据不完整', en: '{n} blocks have incomplete data' },
   'corner.broken': { zh: '{n} 条连线指向已不存在的块', en: '{n} links point to blocks that no longer exist' },
+  /* 降级留痕：宿主形状对不上时插件会退一步继续，这里把"退过"说出来 */
+  'corner.degraded': {
+    zh: '降级 {n} 项 · 最近：{why}',
+    en: '{n} degraded · latest: {why}'
+  },
 
   /* ---- 状态面板 ---- */
   'state.errorTitle': { zh: '图谱没能装配起来', en: 'The graph could not be assembled' },

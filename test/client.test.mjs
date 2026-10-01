@@ -1984,6 +1984,35 @@ test('不直接读未 inject 的服务：ctx.workspaces 属性访问抛错时视
   assert.ok(!texts.includes('会话图谱渲染失败'), '不该走到兜底卡片');
 });
 
+test('降级必须留痕：订阅抛错时视图照常渲染，且角标与控制台都报出来', () => {
+  /* 这一条锁的是"无声降级"这个病根：宿主某个服务的 subscribe 抛错时，
+     旧实现要么悄悄吞掉（视图能用但没人知道退让过），要么整片白屏。
+     现在要求：视图照常 + 角标报数 + 控制台留一条 warn。
+
+     两个前提要说清：
+     1) 必须走 render()（它才会 flush effect）—— 直接调用组件不会跑副作用；
+     2) 必须**换一个服务对象**，否则 hook 槽位跨用例复用、依赖没变，effect 不会重跑。 */
+  const warnings = [];
+  const originalWarn = console.warn;
+  const savedLocale = ctx.locale;
+  console.warn = (...args) => warnings.push(args.map(String).join(' '));
+  try {
+    ctx.locale = {
+      getSnapshot: () => ({ active: 'zh' }),
+      subscribe() { throw new Error('boom-subscribe'); }
+    };
+    render(ctx.slots.Component, props);              /* 首帧 + effect：订阅抛错 → 留痕 */
+    const second = JSON.stringify(render(ctx.slots.Component, props));
+    assert.ok(second.includes('适应视图'), '工具条还在（没有白屏）');
+    assert.ok(second.includes('降级'), '角标报出降级：' + second.slice(0, 300));
+  } finally {
+    ctx.locale = savedLocale;
+    console.warn = originalWarn;
+  }
+  assert.ok(warnings.some((w) => w.includes('[session-graph] 降级：订阅快照源失败')),
+    '控制台也留痕：' + warnings.join(' | '));
+});
+
 /* ============================================================================
    回归：这一批是"装完插件整个界面坏掉"以及若干静默失效的直接原因
    ============================================================================ */

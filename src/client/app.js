@@ -84,7 +84,8 @@ function optionalService(ctx, name) {
   try {
     if (!ctx || typeof ctx.get !== 'function') return undefined;
     return ctx.get(name);
-  } catch {
+  } catch (error) {
+    degrade('可选服务读取失败：' + name, error);
     return undefined;
   }
 }
@@ -133,7 +134,10 @@ const CSS = `
 .sg-corner{position:absolute;right:10px;bottom:8px;z-index:6;pointer-events:none;
   padding:3px 9px;border-radius:7px;font-size:11.5px;
   background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-caption);
-  border:.5px solid var(--dsw-alias-border-l3)}
+  border:.5px solid var(--dsw-alias-border-l3);display:flex;gap:8px;align-items:center}
+/* 降级那一段要能悬停看全文，所以单独把指针事件放回来（整块仍是 none，
+   免得角标盖住下面的连线交互） */
+.sg-corner-diag{pointer-events:auto;color:var(--dsw-alias-label-warning,#b26a00);cursor:help}
 /* 空态 / 加载态 / 错误态 */
 .sg-state{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:7;
   display:flex;flex-direction:column;gap:9px;align-items:flex-start;
@@ -317,6 +321,55 @@ const CSS = `
 /* ------------------------------------------------------------ 小工具 */
 
 /**
+ * 降级留痕。
+ *
+ * 宿主服务的形状不在我们手里，很多路径只能"退一步继续"（订阅不上就只用首帧、
+ * 时间线读不动就当没有本地轮次）。但**退让必须留痕**：这个插件几次线上级故障的
+ * 共同特征就是"看起来什么都没发生"—— 白屏、没有标签、取不到数，全是无声的。
+ *
+ * 所以每次降级记一条（有界环形缓冲），角标上给数字与最近一条原因。
+ * 不写日志文件、不弹窗、不改变主流程 —— 但下一次出问题时，一张截图就能说清
+ * "哪一步退让了"。
+ */
+const DIAG_LIMIT = 20;
+const diagStore = (() => {
+  let list = [];
+  const listeners = new Set();
+  return {
+    getSnapshot: () => list,
+    subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+    add(reason, error) {
+      const detail = error && (error.message || String(error));
+      const entry = { reason, detail: detail ? String(detail).slice(0, 200) : '', at: Date.now() };
+      /* 同一个原因连着来就更新最后一条，别让重复把缓冲冲掉 */
+      const last = list[list.length - 1];
+      if (last && last.reason === reason) list = [...list.slice(0, -1), entry];
+      else list = [...list, entry].slice(-DIAG_LIMIT);
+      listeners.forEach((fn) => { try { fn(); } catch { /* 监听者自己炸了不该带走记录 */ } });
+    }
+  };
+})();
+
+/** 记一条降级：给角标留痕，也给控制台留一条 warn（不打断用户） */
+function degrade(reason, error) {
+  diagStore.add(reason, error);
+  try { console.warn('[session-graph] 降级：' + reason, error || ''); } catch { /* 控制台不可用 */ }
+}
+
+/**
+ * 跑一段可能抛的代码：抛了就记一条降级并返回兜底值。
+ * 用它替代"空 catch" —— 行为一样，但留下痕迹。
+ */
+function attempt(reason, fn, fallback) {
+  try {
+    return fn();
+  } catch (error) {
+    degrade(reason, error);
+    return fallback;
+  }
+}
+
+/**
  * 订阅一个快照源。只依赖 `{ getSnapshot, subscribe }` 这两个方法。
  *
  * **订阅与退订都必须自己守异常。** 它们是 effect 里的同步调用：一旦宿主某个服务
@@ -325,23 +378,26 @@ const CSS = `
  * 而标签（另一个纯 thunk）照常显示，看起来"只是没内容"。渲染期的兜底接不住它。
  */
 function useSource(source) {
-  const [value, setValue] = React.useState(() => {
-    try { return source && source.getSnapshot ? source.getSnapshot() : undefined; } catch { return undefined; }
-  });
+  const [value, setValue] = React.useState(() => attempt(
+    '快照首帧读取失败',
+    () => (source && source.getSnapshot ? source.getSnapshot() : undefined),
+    undefined));
   React.useEffect(() => {
     if (!source || typeof source.subscribe !== 'function') return undefined;
     let alive = true;
-    const pull = () => { if (alive) { try { setValue(source.getSnapshot()); } catch { /* 源暂时不可读 */ } } };
+    const pull = () => { if (alive) setValue(attempt('快照读取失败', () => source.getSnapshot(), undefined)); };
     pull();
     let off;
     try {
       off = source.subscribe(pull);
-    } catch {
-      return undefined;                    /* 订阅不上就只用首帧快照，绝不因此白屏 */
+    } catch (error) {
+      /* 订阅不上就只用首帧快照，绝不因此白屏 —— 但必须留痕 */
+      degrade('订阅快照源失败', error);
+      return undefined;
     }
     return () => {
       alive = false;
-      try { if (typeof off === 'function') off(); } catch { /* 退订失败不影响卸载 */ }
+      attempt('退订快照源失败', () => { if (typeof off === 'function') off(); }, undefined);
     };
   }, [source]);
   return value;
@@ -369,7 +425,7 @@ function resolveSessionId(props, snapshot) {
       try {
         const v = typeof sessions[key] === 'function' ? sessions[key]() : sessions[key];
         if (typeof v === 'string' && v) return v;
-      } catch { /* 换个来源继续找 */ }
+      } catch (error) { degrade('会话服务形状探测失败', error); }
     }
   }
   const list = listOf(snapshot);
@@ -387,7 +443,8 @@ function workspaceIdOf(ctx, sessionId) {
     const items = snap && Array.isArray(snap.items) ? snap.items : [];
     const hit = items.find((it) => Array.isArray(it.sessionIds) && it.sessionIds.includes(sessionId));
     return (hit && hit.workspaceId) || (items[0] && items[0].workspaceId) || '';
-  } catch {
+  } catch (error) {
+    degrade('工作区读取失败', error);
     return '';
   }
 }
@@ -397,6 +454,8 @@ function workspaceIdOf(ctx, sessionId) {
 function GraphView(props) {
   const { ctx, target, sessions } = props || {};
   const listSnapshot = useSource(sessions && sessions.list);
+  /* 降级记录也要订阅：角标显示"降级了几项"，出问题时截图即可定位 */
+  const diagSnapshot = useSource(diagStore);
   /* 归档会话在图谱里仍会出现，但**点不动**（FR-14：目标不可用要禁用并说明原因）。
      `workspaces` 是可选服务，只能走 ctx.get —— 属性访问在未 inject 时会抛，
      而这一抛会让宿主把整个视图卸掉（白屏）。 */
@@ -497,7 +556,8 @@ function GraphView(props) {
       ro.observe(el);
       setSize({ w: el.clientWidth || 900, h: el.clientHeight || 600 });
       return () => ro.disconnect();
-    } catch {
+    } catch (error) {
+      degrade('视口尺寸测量失败', error);
       return undefined;                    /* 量不到尺寸就用默认视口，视图照常画 */
     }
   }, []);
@@ -515,7 +575,8 @@ function GraphView(props) {
       return () => {
         if (typeof el.removeEventListener === 'function') el.removeEventListener('wheel', stopScroll);
       };
-    } catch {
+    } catch (error) {
+      degrade('滚轮监听挂载失败', error);
       return undefined;                    /* 挂不上就退回 React 的被动监听，不因此白屏 */
     }
   }, []);
@@ -542,15 +603,15 @@ function GraphView(props) {
     try {
       const order = familyOf(sessionsNorm, sessionId).order;
       return order.length ? order.join(',') : sessionKey;
-    } catch {
+    } catch (error) {
+      degrade('家族计算失败', error);
       return sessionKey;                     /* 家族算不出来时退回全量，宁可慢不要漏 */
     }
   }, [sessionsNorm, sessionId, sessionKey]);
-  const localTurns = React.useMemo(() => {
-    /* 装配器的时间线形状不在我们手里：读不动就当没有本地轮次，
-       绝不让它把整片视图带成白屏。 */
-    try { return turnsFromTimeline(graphSnapshot && graphSnapshot.timeline); } catch { return []; }
-  }, [graphSnapshot]);
+  const localTurns = React.useMemo(() => attempt(
+    '本地时间线读取失败',
+    () => turnsFromTimeline(graphSnapshot && graphSnapshot.timeline),
+    []), [graphSnapshot]);
 
   /* 家族里其他会话的轮次要向 Host 取（本地的装配器时间线只覆盖当前会话）。
      取不到就退化成"只有当前会话有块"——家族骨架仍然完整。 */
@@ -593,7 +654,8 @@ function GraphView(props) {
     let pending;
     try {
       pending = carrier(url, { credentials: 'same-origin' });
-    } catch {
+    } catch (error) {
+      degrade('取数请求构造失败', error);
       setRouteOk(false);
       loadedRef.current = true;
       setLoaded(true);
@@ -631,8 +693,9 @@ function GraphView(props) {
         loadedRef.current = true;
         setLoaded(true);
       })
-      .catch(() => {
+      .catch((error) => {
         if (!alive) return;
+        degrade('取数失败', error);
         setRouteOk(false);
         loadedRef.current = true;
         setLoaded(true);
@@ -752,8 +815,9 @@ function GraphView(props) {
         });
       });
       out[sessionId] = [...byTurn.values()].sort((a, b) => a.turn - b.turn);
-    } catch {
+    } catch (error) {
       /* 远程载荷形状意外时保留原样，不让它把视图带成白屏 */
+      degrade('远程轮次合并失败', error);
     }
     return out;
   }, [remote, localTurns, sessionId]);
@@ -1541,8 +1605,22 @@ function GraphView(props) {
     cornerNotes.push(t('corner.incomplete', { n: fmtNum(graph.stats.incomplete) }));
   }
   if (brokenCount > 0) cornerNotes.push(t('corner.broken', { n: fmtNum(brokenCount) }));
-  const cornerNote = cornerNotes.length
-    ? h('div', { className: 'sg-corner' }, cornerNotes.join(' · '))
+
+  /* 降级留痕（见 degrade）：角标给数字与最近一条原因，悬停看全部。
+     这一条的存在意义就是——下次出问题时**一张截图**就能说清哪一步退让了。 */
+  const diagEntries = diagSnapshot;
+  const diagNote = diagEntries.length
+    ? h('span', {
+        className: 'sg-corner-diag',
+        title: diagEntries.map((d) => d.reason + (d.detail ? '：' + d.detail : '')).join('\n')
+      }, t('corner.degraded', {
+        n: fmtNum(diagEntries.length),
+        why: diagEntries[diagEntries.length - 1].reason
+      }))
+    : null;
+
+  const cornerNote = (cornerNotes.length || diagNote)
+    ? h('div', { className: 'sg-corner' }, [...cornerNotes, diagNote].filter(Boolean))
     : null;
 
   /* 首次装配中：Host 还没回来、本地一个块也没有 → 骨架屏（FR-13）。
@@ -1971,7 +2049,7 @@ function apply(ctx) {
       if (typeof ctx.effect === 'function') ctx.effect(registerDicts, 'session-graph: dictionaries');
       else registerDicts();
     }
-  } catch { /* 宿主不认这份字典时退回本地取值 */ }
+  } catch (error) { degrade('字典注册失败', error); }
 
   /* 视图数据层：只做纯折叠，不订阅会话事件、不轮询、不写 DOM */
   ctx.uiConversation.views.register({
