@@ -162,7 +162,8 @@ const api = registered[0].factory((name) => {
 });
 
 test('factory 返回 { inject, apply }', () => {
-  assert.deepEqual(api.inject, ['slots', 'sessions', 'uiSession', 'uiConversation']);
+  assert.deepEqual(api.inject,
+    ['slots', 'sessions', 'uiSession', 'uiConversation', 'uiWorkspace', 'workspaces']);
   assert.equal(typeof api.apply, 'function');
 });
 
@@ -251,7 +252,19 @@ function fakeCtx() {
     },
     sessions: {
       list: source({ byId: Object.fromEntries(FAMILY.map((s) => [s.id, { ...s, sessionId: s.id }])) }),
-      fork(opts) { ctx.forked = opts; return Promise.resolve(); }
+      fork(opts) { ctx.forked = opts; return Promise.resolve(); },
+      /* FR-7：新建无历史会话；默认成功并回一个新 id，用例可改写 */
+      create(opts) {
+        ctx.created = opts;
+        if (ctx.createFails) return Promise.reject(new Error('配额不足'));
+        return Promise.resolve(ctx.createResult || 'fresh-session');
+      }
+    },
+    uiWorkspace: {
+      openSession(id) { ctx.opened = id; }
+    },
+    workspaces: {
+      list: source({ items: [{ workspaceId: 'ws-1', sessionIds: ['root', 'ancor', 'invest'] }] })
     }
   };
   return ctx;
@@ -1293,5 +1306,90 @@ test('骨架档：非当前会话只出会话头，可就地展开', async () =>
       .some((n) => n.props['data-sg-node'].startsWith('root:')), '展开后该会话的块出来了');
   } finally {
     serverReply = { ...serverReply, state: null, turns: REMOTE_TURNS };
+  }
+});
+
+/* ----------------------------------------- 引用式新建会话（FR-7） */
+
+const refButton = (tree) => elements(tree).find((n) => n.props && n.props.className === 'sg-act'
+  && String(n.props.children).includes('新建引用式会话'));
+
+test('新建引用式会话：建会话、记引用边、切过去', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const before = postCalls.length;
+  delete ctx.created;
+  delete ctx.opened;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    const btn = refButton(selectBlock('root:1'));
+    assert.ok(btn, '详情面板有「新建引用式会话」');
+    btn.props.onClick();
+    await new Promise((r) => setTimeout(r, 20));      /* 等新建的 await 链走完 */
+    tree = render(ctx.slots.Component, props);
+
+    assert.deepEqual(ctx.created, { workspaceId: 'ws-1' }, '按当前会话所属工作区新建');
+    assert.equal(ctx.opened, 'fresh-session', '创建后切到新会话');
+    assert.match(textIn(tree), /已新建引用式会话/);
+
+    await new Promise((r) => setTimeout(r, 520));
+    const sent = postCalls.slice(before).find((p) => p.patch.links);
+    assert.ok(sent, '引用边写回宿主');
+    const link = sent.patch.links[0];
+    assert.equal(link.kind, 'reference', '记的是引用边，不是手动边');
+    assert.deepEqual(link.from, { sessionId: 'root', turn: 1 }, '起点是源块');
+    assert.deepEqual(link.to, { sessionId: 'fresh-session' }, '终点是**整个新会话**（它还没有轮次）');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+    delete ctx.createFails;
+  }
+});
+
+test('新建会话失败时提示，且**不**留下孤立引用记录', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const before = postCalls.length;
+  ctx.createFails = true;
+  delete ctx.opened;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    refButton(selectBlock('root:1')).props.onClick();
+    await new Promise((r) => setTimeout(r, 20));
+    tree = render(ctx.slots.Component, props);
+
+    assert.match(textIn(tree), /新建会话失败/, '把失败说出来');
+    assert.equal(ctx.opened, undefined, '没有切走');
+    await new Promise((r) => setTimeout(r, 520));
+    assert.equal(postCalls.slice(before).filter((p) => p.patch.links).length, 0,
+      '失败时不写引用记录 —— 需求里点名的失败行为');
+  } finally {
+    delete ctx.createFails;
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('找不到工作区时直接说明，不去猜', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const savedWs = ctx.workspaces;
+  ctx.workspaces = { list: source({ items: [] }) };
+  const before = postCalls.length;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    refButton(selectBlock('root:1')).props.onClick();
+    await new Promise((r) => setTimeout(r, 20));
+    tree = render(ctx.slots.Component, props);
+    assert.match(textIn(tree), /找不到这个会话所属的工作区/);
+    await new Promise((r) => setTimeout(r, 520));
+    assert.equal(postCalls.slice(before).filter((p) => p.patch.links).length, 0);
+  } finally {
+    ctx.workspaces = savedWs;
+    serverReply = { ...serverReply, state: null };
   }
 });

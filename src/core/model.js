@@ -49,6 +49,20 @@ export function refToId(ref) {
   return Number.isInteger(turn) && turn > 0 ? `${sessionId}:${turn}` : '';
 }
 
+/**
+ * 从块 id / 空节点 id / 会话头 id 里取出所属会话 id。
+ *
+ * 直接 `split(':')[0]` 在 `header:<sid>` 上会得到字面量 `"header"`。
+ * 引用边常常指向**整个会话**（引用式新建出来的会话还没有轮次），
+ * 所以要认得出这种形态，否则导出时那条引用会被静默丢掉。
+ */
+export function sessionOfId(id) {
+  const s = str(id);
+  if (s.indexOf('header:') === 0) return s.slice(7);
+  const i = s.indexOf(':');
+  return i < 0 ? s : s.slice(0, i);
+}
+
 const str = (v) => (v === undefined || v === null ? '' : String(v));
 /* 注意 Number(null) === 0：显式的 null/undefined/空串必须判成"没有值"，
    否则"这一轮没有结束边界"会被读成"在 0 号事件结束"。 */
@@ -283,10 +297,12 @@ export function buildGraph(input) {
   const fam = familyOf(sessions, currentId);
   const scopedIds = new Set(fam.order);
 
-  /* 引用式会话不在血缘家族里，但被引用连线拉进范围（FR-7） */
+  /* 引用式会话不在血缘家族里，但被引用连线拉进范围（FR-7）。
+     终点可能是某个块（`sid:turn`），也可能是整个会话（`header:sid`）——
+     引用式新建出来的会话还没有轮次，只能指向会话本身。 */
   links.forEach((l) => {
     if (!l || l.kind !== 'reference') return;
-    const target = String(l.to === undefined ? '' : l.to).split(':')[0];
+    const target = sessionOfId(l.to);
     if (byId.has(target)) scopedIds.add(target);
   });
 
@@ -371,7 +387,14 @@ export function buildGraph(input) {
      - 自环拒绝（创建时就该拦，这里再兜一层）
      - **任一端点**被隐藏则整条边一并隐藏（FR-9 / FR-11），不只是从它出发的边
      - 端点已被删除或未载入时保留边、标记 broken，**不替用户删数据** */
+  /* 已知节点：块，加上每个会话的**会话头**与**空节点**。
+     引用式新建出来的会话没有轮次，引用边只能指向它的会话头；
+     只认块 id 的话这类边会被误判成断裂。 */
   const knownNode = new Set(blocks.map((b) => b.id));
+  scoped.forEach((s) => {
+    knownNode.add(`header:${s.id}`);
+    knownNode.add(emptyId(s.id));
+  });
   links.forEach((l) => {
     if (!l || (l.kind !== 'link' && l.kind !== 'reference')) return;
     const from = refToId(l.from) || str(l.from);

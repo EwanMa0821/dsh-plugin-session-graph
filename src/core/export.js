@@ -13,7 +13,7 @@
  * 正文以**缩进块**原样嵌入 —— 这样正文里的表格、代码块、列表才能正确渲染。
  */
 
-import { clip, plain, summarize, tidy } from './model.js';
+import { clip, plain, sessionOfId, summarize, tidy } from './model.js';
 
 export const FORMATS = ['mm', 'md'];
 
@@ -132,7 +132,9 @@ export function buildTree(graph, options = {}) {
   };
   const refsAt = (blockIdValue) =>
     links.filter((l) => l.kind === 'reference' && l.from === blockIdValue)
-      .map((l) => l.to.split(':')[0])
+      /* 终点可能是某个块（`sid:turn`），也可能是整个会话（`header:sid`）——
+         引用式新建出来的会话还没有轮次，只能指向会话本身。 */
+      .map((l) => sessionOfId(l.to))
       .filter((sid) => bySession.has(sid));
 
   /* 家族根：没有父、或父不在家族内的会话 */

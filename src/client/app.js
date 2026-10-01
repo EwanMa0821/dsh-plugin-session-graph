@@ -272,6 +272,18 @@ function resolveSessionId(props, snapshot) {
   return list.length === 1 ? (list[0].id || list[0].sessionId) : '';
 }
 
+/** 归属某个会话的工作区 id；拿不到就回落第一个 */
+function workspaceIdOf(ctx, sessionId) {
+  try {
+    const snap = ctx && ctx.workspaces && ctx.workspaces.list && ctx.workspaces.list.getSnapshot();
+    const items = snap && Array.isArray(snap.items) ? snap.items : [];
+    const hit = items.find((it) => Array.isArray(it.sessionIds) && it.sessionIds.includes(sessionId));
+    return (hit && hit.workspaceId) || (items[0] && items[0].workspaceId) || '';
+  } catch {
+    return '';
+  }
+}
+
 /* ------------------------------------------------------------ 主组件 */
 
 function GraphView(props) {
@@ -638,6 +650,55 @@ function GraphView(props) {
     persist({ links: next, removeLinkIds: [id] });
     setSelectedEdge(null);
   }, [links, persist, remember]);
+
+  /**
+   * 新建引用式会话（FR-7）：**不继承历史**的独立会话，用一条引用边把它与源块连起来。
+   *
+   * 新会话是**独立根**，不在源会话的血缘里，靠这条引用边被拉进图谱范围（§5.2）。
+   * 失败时不留下孤立引用记录 —— 需求里点名的失败行为。
+   */
+  const createRefSession = React.useCallback(async (b) => {
+    const api = ctx && ctx.sessions;
+    if (!api || typeof api.create !== 'function') {
+      say('当前宿主没有暴露新建会话的能力');
+      return;
+    }
+    const wsId = workspaceIdOf(ctx, b.sessionId);
+    if (!wsId) {
+      say('找不到这个会话所属的工作区，无法新建');
+      return;
+    }
+    let newId;
+    try {
+      newId = await api.create({ workspaceId: wsId });
+    } catch (e) {
+      say('新建会话失败：' + ((e && e.message) || e));
+      return;
+    }
+    if (!newId || typeof newId !== 'string') {
+      say('新建会话失败：宿主没有返回会话 id');
+      return;
+    }
+    /* 先落引用边：即便随后导航失败，用户至少能在图上看到这条关系 */
+    const label = b.alias || clip(digest(b.prompt), 24) || '';
+    const id = `reference:${b.id}->${newId}:${Date.now().toString(36)}`;
+    const next = [...links, {
+      id, kind: 'reference', from: b.id, to: `header:${newId}`,
+      ...(label ? { label } : {})
+    }];
+    remember();
+    setLinks(next);
+    persist({ links: next });
+    if (ctx.uiWorkspace && typeof ctx.uiWorkspace.openSession === 'function') {
+      try {
+        ctx.uiWorkspace.openSession(newId);
+      } catch {
+        say('引用式会话已建立，但没能自动切过去');
+        return;
+      }
+    }
+    say('已新建引用式会话');
+  }, [ctx, links, persist, remember, say]);
 
   const onWheel = React.useCallback((ev) => {
     ev.preventDefault();
@@ -1197,6 +1258,10 @@ function GraphView(props) {
         }, '→ 连接到…'),
         h('button', {
           className: 'sg-act',
+          onClick: () => { void createRefSession(b); }
+        }, '⧉ 新建引用式会话'),
+        h('button', {
+          className: 'sg-act',
           onClick: () => setRenaming({ id: b.id, value: alias[b.id] || '' })
         }, '✎ 重命名'),
         h('button', {
@@ -1403,4 +1468,4 @@ function apply(ctx) {
   }, GraphView));
 }
 
-return { inject: ['slots', 'sessions', 'uiSession', 'uiConversation'], apply };
+return { inject: ['slots', 'sessions', 'uiSession', 'uiConversation', 'uiWorkspace', 'workspaces'], apply };

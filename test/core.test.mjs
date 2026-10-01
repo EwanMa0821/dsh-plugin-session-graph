@@ -11,7 +11,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  GRAPH_VERSION, blockId, emptyId, increasedTitle, uniqueTitle,
+  GRAPH_VERSION, blockId, emptyId, increasedTitle, uniqueTitle, sessionOfId,
   turnsFromTimeline, normalizeSessions, familyOf, buildGraph, plain, clip
 } from '../src/core/model.js';
 import {
@@ -500,6 +500,80 @@ test('.mm 引用式会话用虚线边与书签图标，且不重复前缀', () =
   assert.equal((content.match(/BUILTIN="bookmark"/g) || []).length, 1);
   assert.equal((content.match(/引用：引用：/g) || []).length, 0, '不重复前缀');
   assert.equal((content.match(/<node TEXT="引用：/g) || []).length, 1);
+});
+
+test('sessionOfId 认得出会话头，split(":")[0] 认不出', () => {
+  assert.equal(sessionOfId('root:3'), 'root');
+  assert.equal(sessionOfId('header:fresh'), 'fresh');
+  assert.equal(sessionOfId('header:a:b'), 'a:b', '会话 id 自带冒号也不会切错');
+  assert.equal(sessionOfId('solo'), 'solo');
+  /* 这就是那个 bug：直接切第一段会得到字面量 "header" */
+  assert.equal('header:fresh'.split(':')[0], 'header');
+});
+
+test('引用边指向**整个会话头**时也能导出（新会话还没有轮次）', () => {
+  const sessions = normalizeSessions([
+    ...RAW_SESSIONS,
+    { id: 'fresh', title: '引用：先做需求文档', parentId: null }
+  ]);
+  /* FR-7 新建出来的会话是空壳：没有轮次，引用只能指向它的会话头 */
+  const link = { id: 'R1', kind: 'reference', from: 'root:2', to: 'header:fresh', label: '引用自' };
+  const g = buildGraph({
+    sessions,
+    turnsBySession: { ...TURNS, fresh: [] },
+    currentId: 'root',
+    links: [link]
+  });
+  const { content } = toFreeMind(g, { links: [link] });
+  assert.equal((content.match(/引用：先做需求文档/g) || []).length >= 1, true,
+    '引用式会话挂在源块之下 —— 早先 to.split(":")[0] 得到 "header"，这条会被静默丢掉');
+  assert.equal((content.match(/STYLE="dash"/g) || []).length, 1, '虚线边');
+});
+
+test('引用边指向某个块时照旧（两种终点形态都要认）', () => {
+  const sessions = normalizeSessions([
+    ...RAW_SESSIONS,
+    { id: 'ref1', title: '引用：读懂《思考，快与慢》 第 2 轮', parentId: null }
+  ]);
+  const link = { id: 'R1', kind: 'reference', from: 'root:2', to: 'ref1:1' };
+  const g = buildGraph({
+    sessions, turnsBySession: { ...TURNS, ref1: [turn(1, '引用式提问', '不带历史')] },
+    currentId: 'root', links: [link]
+  });
+  const { content } = toFreeMind(g, { links: [link] });
+  assert.equal((content.match(/STYLE="dash"/g) || []).length, 1);
+});
+
+test('指向会话头的引用边不能被误判为断裂', () => {
+  const sessions = normalizeSessions([
+    ...RAW_SESSIONS,
+    { id: 'fresh', title: '引用：新会话', parentId: null }
+  ]);
+  const mk = (to) => ({ id: 'R1', kind: 'reference', from: 'root:2', to, label: '引用自' });
+  const at = (to) => buildGraph({
+    sessions, turnsBySession: { ...TURNS, fresh: [] }, currentId: 'root', links: [mk(to)]
+  }).edges.find((e) => e.kind === 'reference');
+
+  /* 这是修掉的那个 bug：已知节点集合原先只装块 id，会话头不在里面 */
+  assert.equal(at('header:fresh').broken, false, '会话头是真实存在的节点');
+  /* 该会话确实没有第 1 轮，所以块级终点仍然该判断裂 */
+  assert.equal(at('fresh:1').broken, true);
+  assert.equal(at('ghost:9').broken, true, '真不存在');
+  assert.equal(at('header:gone').broken, true, '不存在的会话头');
+});
+
+test('引用式会话即便没有轮次也会被拉进图范围', () => {
+  const sessions = normalizeSessions([
+    ...RAW_SESSIONS,
+    { id: 'fresh', title: '引用：新会话', parentId: null }
+  ]);
+  const link = { id: 'R1', kind: 'reference', from: 'root:2', to: 'header:fresh' };
+  const g = buildGraph({
+    sessions, turnsBySession: { ...TURNS, fresh: [] }, currentId: 'root', links: [link]
+  });
+  assert.equal(g.sessions.some((s) => s.id === 'fresh'), true,
+    '血缘上它是独立根，靠引用边才进得来');
+  assert.equal(g.blocks.some((b) => b.sessionId === 'fresh'), false, '它确实还没有块');
 });
 
 test('正文里的尖括号是内容：摘要保留它，导出里被正确转义', () => {
