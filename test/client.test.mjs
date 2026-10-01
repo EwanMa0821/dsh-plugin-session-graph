@@ -18,9 +18,19 @@ import fs from 'node:fs';
 /* ------------------------------------------------- 最小浏览器环境 */
 
 const registered = [];
+/** window 上的监听器要真的收下来，否则拖拽/连线这类全局手势根本测不到 */
+const listeners = new Map();
 globalThis.window = {
-  addEventListener() {}, removeEventListener() {},
+  addEventListener(type, fn) {
+    if (!listeners.has(type)) listeners.set(type, new Set());
+    listeners.get(type).add(fn);
+  },
+  removeEventListener(type, fn) { const s = listeners.get(type); if (s) s.delete(fn); },
   __ModuleLoader__: { load(reg) { registered.push(reg); } }
+};
+/** 派发一个 window 事件 */
+const fire = (type, ev) => {
+  [...(listeners.get(type) || [])].forEach((fn) => fn(ev || {}));
 };
 globalThis.document = {
   createElement(tag) { return { tag, href: '', download: '', click() { this.clicked = true; } }; },
@@ -63,10 +73,29 @@ const React = {
     queued.push({ i, fn, deps, prev });
     return undefined;
   },
-  useMemo(fn) { cursor++; return fn(); },
-  useCallback(fn) { cursor++; return fn; },
+  useMemo(fn, deps) {
+    const i = cursor++;
+    const prev = slots[i];
+    if (prev && prev.deps && deps && sameDeps(prev.deps, deps)) return prev.value;
+    const value = fn();
+    slots[i] = { deps, value };
+    return value;
+  },
+  /* 必须按依赖项记忆 —— 真实 React 里 useCallback([]) 是**稳定标识**。
+     若每次都返回新函数，任何以它为依赖的 effect 会每渲染重跑，
+     连带把它的清理逻辑（例如「取消待发写入」）也每帧执行一次。 */
+  useCallback(fn, deps) {
+    const i = cursor++;
+    const prev = slots[i];
+    if (prev && prev.deps && deps && sameDeps(prev.deps, deps)) return prev.fn;
+    slots[i] = { deps, fn };
+    return fn;
+  },
   useRef(v) { const i = cursor++; if (slots[i] === undefined) slots[i] = { value: { current: v } }; return slots[i].value; }
 };
+
+/** 与 React 的依赖比较一致：长度相同且逐项 Object.is */
+const sameDeps = (a, b) => a.length === b.length && a.every((x, i) => Object.is(x, b[i]));
 
 /** 渲染一次；cursor 归零，hook 槽位按调用顺序复用；副作用在渲染后统一执行 */
 function render(component, props) {
@@ -82,8 +111,15 @@ function render(component, props) {
   pass += 1;
   return tree;
 }
-/** 丢弃全部 hook 状态：需要一个"刚挂载"的干净组件时用 */
+/** 丢弃全部 hook 状态：需要一个"刚挂载"的干净组件时用。
+ *  先跑卸载清理 —— 真实 React 卸载时会跑；不跑的话上一个实例的在途 fetch
+ *  会落到新实例上把状态覆盖掉，造出来的假象极难查。 */
 function resetComponent() {
+  slots.forEach((s) => {
+    if (s && typeof s.cleanup === 'function') {
+      try { s.cleanup(); } catch { /* 清理失败不该影响后续用例 */ }
+    }
+  });
   slots = [];
   cursor = 0;
   pass = 0;
@@ -625,5 +661,230 @@ test('存档版本不兼容时明确说明，而不是悄悄只读', async () =>
     assert.match(String(ro.props.title), /更新的版本/);
   } finally {
     serverReply = { ...serverReply, state: null, writable: true, incompatible: false };
+  }
+});
+
+/* ------------------------------------------------------------- 连线 */
+
+const canvasOf = (tree) => elements(tree).find((n) => typeof n.props.className === 'string'
+  && n.props.className.includes('sg-canvas-wrap'));
+
+/** 造一个画布上的 mousedown：closest 的行为按真实选择器分派 */
+const press = (tree, opts) => canvasOf(tree).props.onMouseDown({
+  button: 0, clientX: opts.x === undefined ? 10 : opts.x, clientY: opts.y === undefined ? 10 : opts.y,
+  target: {
+    closest(sel) {
+      if (sel.includes('.sg-tools')) return null;
+      if (opts.handle && sel === '[data-sg-link-handle]') return { getAttribute: () => opts.handle };
+      if (opts.node && sel === '[data-sg-node]') return { getAttribute: () => opts.node };
+      return null;
+    }
+  },
+  preventDefault() {}
+});
+
+const releaseOver = (nodeId) => fire('mouseup', {
+  target: {
+    closest: (sel) => (sel === '[data-sg-node]' && nodeId ? { getAttribute: () => nodeId } : null)
+  }
+});
+
+const nodeEl = (tree, id) => elements(tree).find((n) => n.props && n.props['data-sg-node'] === id);
+
+test('从把手拖到另一个块即建立连线，并写回宿主', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const before = postCalls.length;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    assert.ok(nodeEl(tree, 'root:1').props.children.some((c) => c && c.props
+      && c.props['data-sg-link-handle'] === 'root:1'), '块上有连线把手');
+
+    const badge = elements(tree).find((n)=>n.props&&n.props.className==='sg-ro');
+    console.log('PROBE 徽章', badge ? String(badge.props.children) : '（无）');
+    console.log('PROBE 挂载后 blocks', elements(tree).filter((n)=>n.props&&n.props['data-sg-node']).length);
+    press(tree, { handle: 'root:1' });
+    tree = render(ctx.slots.Component, props);
+    console.log('PROBE 连线态', canvasOf(tree).props.className);
+    assert.ok(canvasOf(tree).props.className.includes('sg-linking'), '进入连线态');
+
+    fire('mousemove', { clientX: 320, clientY: 240, preventDefault() {} });
+    tree = render(ctx.slots.Component, props);
+    const preview = elements(tree).find((n) => n.props && n.props.className === 'sg-e-preview');
+    assert.ok(preview, '拖拽时有预览线');
+    assert.match(preview.props.d, /^M/);
+
+    releaseOver('ancor:1');
+    tree = render(ctx.slots.Component, props);
+    assert.ok(!canvasOf(tree).props.className.includes('sg-linking'), '松手后退出连线态');
+
+    await new Promise((r) => setTimeout(r, 520));
+    const sent = postCalls.slice(before).find((p) => p.patch.links);
+    assert.ok(sent, '连线提交到宿主');
+    assert.equal(sent.patch.links[0].kind, 'link');
+    assert.deepEqual(sent.patch.links[0].from, { sessionId: 'root', turn: 1 }, '提交的是持久形态');
+    assert.deepEqual(sent.patch.links[0].to, { sessionId: 'ancor', turn: 1 });
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('松手落在空白处即取消，不产生连线', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const before = postCalls.length;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    press(tree, { handle: 'root:1' });
+    render(ctx.slots.Component, props);
+    releaseOver(null);
+    tree = render(ctx.slots.Component, props);
+    assert.ok(!canvasOf(tree).props.className.includes('sg-linking'));
+
+    await new Promise((r) => setTimeout(r, 520));
+    assert.equal(postCalls.slice(before).filter((p) => p.patch.links).length, 0);
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('把块连到它自己会被拒绝并提示', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const before = postCalls.length;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    press(tree, { handle: 'root:1' });
+    render(ctx.slots.Component, props);
+    releaseOver('root:1');
+    tree = render(ctx.slots.Component, props);
+    const toast = elements(tree).find((n) => typeof n.props.children === 'string'
+      && n.props.children.includes('不能把一个块连到它自己'));
+    assert.ok(toast, '给出了自环提示');
+
+    await new Promise((r) => setTimeout(r, 520));
+    assert.equal(postCalls.slice(before).filter((p) => p.patch.links).length, 0, '没有写入');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('「连接到…」：点一次按钮、再点目标块即完成', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const before = postCalls.length;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    const after = selectBlock('root:1');
+    const btn = elements(after).find((n) => n.props && n.props.className === 'sg-act'
+      && String(n.props.children).includes('连接到…'));
+    assert.ok(btn, '详情面板有「连接到…」');
+    btn.props.onClick();
+
+    tree = render(ctx.slots.Component, props);
+    assert.ok(canvasOf(tree).props.className.includes('sg-linking'), '进入点击式连线态');
+    const hint = elements(tree).find((n) => n.props && n.props.className === 'sg-hint');
+    assert.match(String(hint.props.children), /点击另一个块完成连线/);
+
+    press(tree, { node: 'ancor:2' });
+    render(ctx.slots.Component, props);
+    await new Promise((r) => setTimeout(r, 520));
+    const sent = postCalls.slice(before).find((p) => p.patch.links);
+    assert.ok(sent);
+    assert.deepEqual(sent.patch.links[0].to, { sessionId: 'ancor', turn: 2 });
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('Esc 取消连线态', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    press(tree, { handle: 'root:1' });
+    tree = render(ctx.slots.Component, props);
+    assert.ok(canvasOf(tree).props.className.includes('sg-linking'));
+
+    fire('keydown', { key: 'Escape' });
+    tree = render(ctx.slots.Component, props);
+    assert.ok(!canvasOf(tree).props.className.includes('sg-linking'), 'Esc 之后回到常态');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('连线后弹出标签输入框，Enter 写入标签', async () => {
+  serverReply = { ...serverReply, state: blankState() };
+  const before = postCalls.length;
+  try {
+    resetComponent();
+    render(ctx.slots.Component, props);
+    await tick();
+    let tree = render(ctx.slots.Component, props);
+    press(tree, { handle: 'root:1' });
+    render(ctx.slots.Component, props);
+    releaseOver('ancor:1');
+    tree = render(ctx.slots.Component, props);
+
+    const input = elements(tree).find((n) => n.props && n.props.className === 'sg-linkdraft-in');
+    assert.ok(input, '建完连线就弹出标签输入框');
+
+    input.props.onChange({ target: { value: '结论建立在这上面' } });
+    tree = render(ctx.slots.Component, props);
+    const again = elements(tree).find((n) => n.props && n.props.className === 'sg-linkdraft-in');
+    again.props.onKeyDown({ key: 'Enter', stopPropagation() {} });
+    tree = render(ctx.slots.Component, props);
+    assert.ok(!elements(tree).some((n) => n.props && n.props.className === 'sg-linkdraft'),
+      '确认后浮层消失');
+
+    await new Promise((r) => setTimeout(r, 520));
+    const sent = postCalls.slice(before).filter((p) => p.patch.links).pop();
+    assert.equal(sent.patch.links[0].label, '结论建立在这上面');
+  } finally {
+    serverReply = { ...serverReply, state: null };
+  }
+});
+
+test('点边标签即选中该连线，可改标签也可删除', async () => {
+  serverReply = {
+    ...serverReply,
+    state: blankState({
+      links: [{ id: 'L1', kind: 'link', from: 'root:1', to: 'ancor:1', label: '因为' }]
+    })
+  };
+  const before = postCalls.length;
+  try {
+    let tree = await mountLoaded();
+    const label = elements(tree).find((n) => n.props && n.props.className === 'sg-elabel');
+    assert.ok(label, '边标签画在画布上');
+    assert.equal(label.props.children, '因为');
+    label.props.onClick({ stopPropagation() {} });
+
+    tree = render(ctx.slots.Component, props);
+    const side = elements(tree).find((n) => n.props && n.props.className === 'sg-side');
+    const plain = JSON.stringify(side.props.children.map((k) => k && k.props && k.props.className));
+    assert.match(plain, /sg-side-acts/, '右栏切成了连线面板');
+
+    const del = elements(tree).find((n) => n.props && typeof n.props.className === 'string'
+      && n.props.className.includes('sg-danger'));
+    assert.ok(del, '有删除按钮');
+    del.props.onClick();
+    await new Promise((r) => setTimeout(r, 520));
+
+    const sent = postCalls.slice(before).find((p) => p.patch.removeLinkIds);
+    assert.deepEqual(sent.patch.removeLinkIds, ['L1'], '删除按 id 上报，而不是整表覆盖');
+  } finally {
+    serverReply = { ...serverReply, state: null };
   }
 });

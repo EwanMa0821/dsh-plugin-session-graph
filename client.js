@@ -1311,6 +1311,7 @@ const CSS = `
   cursor:grab;
   background-image:radial-gradient(var(--dsw-alias-border-l2) 1px,transparent 1px);background-size:22px 22px}
 .sg-canvas-wrap.sg-panning{cursor:grabbing}
+.sg-canvas-wrap.sg-linking{cursor:crosshair}
 .sg-world{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform}
 .sg-world svg{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}
 .sg-e-branch{fill:none;stroke:var(--dsw-alias-label-dimmed);stroke-width:1.6}
@@ -1326,6 +1327,25 @@ const CSS = `
 .sg-elabel:hover{background:var(--dsw-alias-bg-layer-2)}
 .sg-elabel-ref{color:var(--dsw-alias-label-caption)}
 .sg-elabel-broken{color:var(--dsw-alias-state-error-primary);text-decoration:line-through}
+/* 连线把手：悬停或选中时才显形，平时不打扰 */
+.sg-handle{position:absolute;right:-6px;bottom:-6px;width:12px;height:12px;border-radius:50%;
+  background:var(--dsw-alias-bg-layer-1);border:1.5px solid var(--dsw-alias-state-business-primary);
+  cursor:crosshair;opacity:0;transition:opacity .12s;z-index:2}
+.sg-node:hover .sg-handle,.sg-node.sg-selected .sg-handle{opacity:1}
+.sg-node .sg-handle:hover{background:var(--dsw-alias-state-business-primary)}
+/* 拖拽中的预览线 */
+.sg-e-preview{fill:none;stroke:var(--dsw-alias-state-business-primary);stroke-width:1.6;
+  stroke-dasharray:5 4;pointer-events:none}
+/* 连线标签的输入浮层 */
+.sg-linkdraft{position:absolute;z-index:30;display:flex;gap:6px;padding:6px;
+  border-radius:9px;background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-elevation-panel)}
+.sg-linkdraft-in{height:28px;width:180px;padding:0 9px;border-radius:7px;font:inherit;font-size:12.5px;
+  border:.5px solid var(--dsw-alias-border-l3);background:var(--dsw-alias-bg-base);
+  color:var(--dsw-alias-label-primary)}
+.sg-linkdraft-in:focus{outline:none;border-color:var(--dsw-alias-state-business-primary)}
+.sg-linkdraft-in.sg-wide{width:100%}
+.sg-act.sg-danger{color:var(--dsw-alias-state-error-primary)}
+.sg-act.sg-danger:hover{background:var(--dsw-alias-state-error-tertiary)}
 .sg-node{position:absolute;border-radius:var(--dsw-radius-md,12px);background:var(--dsw-alias-bg-layer-1);
   box-shadow:var(--dsw-elevation-stroke);padding:8px 11px;display:flex;flex-direction:column;gap:3px;
   cursor:grab;user-select:none;transition:background .12s,box-shadow .12s}
@@ -1710,6 +1730,57 @@ function GraphView(props) {
   /* ---- 交互 ---- */
   const drag = React.useRef(null);
   const [panning, setPanning] = React.useState(false);
+  /* 连线模式（FR-9）：drag = 从把手拖出，click = 面板里点了「连接到…」再点目标 */
+  const [linking, setLinking] = React.useState(null);
+  /* 刚建好的连线，等用户给标签 */
+  const [linkDraft, setLinkDraft] = React.useState(null);
+
+  /** 屏幕坐标 → 世界坐标（预览线要用） */
+  const toWorld = React.useCallback((ev) => {
+    const r = hostRef.current ? hostRef.current.getBoundingClientRect() : { left: 0, top: 0 };
+    return {
+      x: (ev.clientX - r.left - view.panX) / view.scale,
+      y: (ev.clientY - r.top - view.panY) / view.scale
+    };
+  }, [view]);
+
+  /** 屏幕坐标 → 画布内坐标（浮层定位要用，不参与世界变换） */
+  const toCanvas = React.useCallback((ev) => {
+    const r = hostRef.current ? hostRef.current.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+  }, []);
+
+  /** 建立一条手动连线（FR-9），随后弹出标签输入框 */
+  const createLink = React.useCallback((from, to, at) => {
+    if (!from || !to) return;
+    if (from === to) { say('不能把一个块连到它自己'); return; }
+    /* 同一对块之间允许多条（不同标签），所以 id 要唯一而不是由端点决定 */
+    const id = `link:${from}->${to}:${Date.now().toString(36)}`;
+    const next = [...links, { id, kind: 'link', from, to }];
+    setLinks(next);
+    persist({ links: next });
+    setLinkDraft({ id, value: '', x: at ? at.x : 0, y: at ? at.y : 0 });
+  }, [links, persist, say]);
+
+  /** 写入某条连线的标签；空字符串即清除标签 */
+  const labelLink = React.useCallback((id, value) => {
+    const text = String(value === undefined || value === null ? '' : value).trim().slice(0, 120);
+    const next = links.map((l) => {
+      if (l.id !== id) return l;
+      if (text === '') { const { label: _drop, ...rest } = l; return rest; }
+      return { ...l, label: text };
+    });
+    setLinks(next);
+    persist({ links: next });
+  }, [links, persist]);
+
+  /** 删除一条手动连线 */
+  const removeLink = React.useCallback((id) => {
+    const next = links.filter((l) => l.id !== id);
+    setLinks(next);
+    persist({ links: next, removeLinkIds: [id] });
+    setSelectedEdge(null);
+  }, [links, persist]);
 
   const onWheel = React.useCallback((ev) => {
     ev.preventDefault();
@@ -1726,7 +1797,9 @@ function GraphView(props) {
 
   const onDown = React.useCallback((ev) => {
     const el = ev.target;
-    if (el.closest && el.closest('.sg-tools')) return;
+    /* 工具条、边标签、标签输入框都不能被当成画布：
+       这个处理函数会 preventDefault，落在输入框上会让它永远拿不到焦点。 */
+    if (el.closest && el.closest('.sg-tools, .sg-elabel, .sg-linkdraft')) return;
     if (ev.button !== 0) return;
 
     /* 必须掐掉按下事件的默认行为：否则浏览器会从画布背后的文字节点起选区，
@@ -1741,6 +1814,28 @@ function GraphView(props) {
     const nodeEl = el.closest ? el.closest('[data-sg-node]') : null;
     const id = nodeEl ? nodeEl.getAttribute('data-sg-node') : null;
     const hit = id && nodeMap.has(id) ? id : null;
+
+    /* 从块右下角的把手拖出连线（FR-9） */
+    const handleEl = el.closest ? el.closest('[data-sg-link-handle]') : null;
+    if (handleEl) {
+      const from = handleEl.getAttribute('data-sg-link-handle');
+      if (from && nodeMap.has(from)) {
+        const p = toWorld(ev);
+        setLinking({ from, mode: 'drag', x: p.x, y: p.y });
+        drag.current = null;
+        return;
+      }
+    }
+
+    /* 连线模式下点目标块即完成（FR-9 的第二条触发路径） */
+    if (linking && linking.mode === 'click') {
+      if (!hit) return;                      /* 点空白不取消，避免误触 */
+      setLinking(null);
+      if (hit === linking.from) { say('不能把一个块连到它自己'); return; }
+      createLink(linking.from, hit, toCanvas(ev));
+      return;
+    }
+
     /* 在**按下**时选中，而不是等抬起：双击过程中手抖一两个像素很常见，
        若靠"没移动过"来决定选中，双击就会既不选中、又照样分叉 */
     if (hit) setSelected(hit);
@@ -1752,10 +1847,24 @@ function GraphView(props) {
       id: hit
     };
     setPanning(true);
-  }, [nodeMap, view]);
+  }, [nodeMap, view, linking, createLink, say, toWorld, toCanvas]);
+
+  /* 全局监听只在挂载时注册一次。但它要用到每次渲染都可能变的值（连线状态、
+     新建回调、节点表…），直接闭包会读到陈旧值；把最新值放进 ref，
+     既不重复注册监听、又永远读到当前值。 */
+  const latestRef = React.useRef({});
+  latestRef.current = { linking, createLink, say, toWorld, toCanvas, nodeMap };
 
   React.useEffect(() => {
     const move = (ev) => {
+      const L = latestRef.current;
+      /* 拖拽连线中：预览线跟着指针走 */
+      if (L.linking && L.linking.mode === 'drag') {
+        if (typeof ev.preventDefault === 'function') ev.preventDefault();
+        const p = L.toWorld(ev);
+        setLinking((l) => (l && l.mode === 'drag' ? { ...l, x: p.x, y: p.y } : l));
+        return;
+      }
       const d = drag.current;
       if (!d) return;
       /* 拖拽期间持续拦默认行为：挡住原生的拖放、拖拽滚动与选区 */
@@ -1765,7 +1874,20 @@ function GraphView(props) {
       if (Math.abs(dx) + Math.abs(dy) > 3) { d.moved = true; viewTouchedRef.current = true; }
       if (d.kind === 'pan') setView((v) => ({ ...v, panX: d.px + dx, panY: d.py + dy, fitted: true }));
     };
-    const up = () => {
+    const up = (ev) => {
+      const L = latestRef.current;
+      /* 松手落在哪个块上就与它连线；落在空白处取消（FR-9） */
+      if (L.linking && L.linking.mode === 'drag') {
+        const el = ev && ev.target;
+        const nodeEl = el && el.closest ? el.closest('[data-sg-node]') : null;
+        const to = nodeEl ? nodeEl.getAttribute('data-sg-node') : null;
+        const from = L.linking.from;
+        setLinking(null);
+        if (!to) return;                                    /* 落在空白处：取消 */
+        if (to === from) { L.say('不能把一个块连到它自己'); return; }
+        if (L.nodeMap.has(to)) L.createLink(from, to, L.toCanvas(ev));
+        return;
+      }
       const d = drag.current;
       drag.current = null;
       setPanning(false);
@@ -1773,7 +1895,14 @@ function GraphView(props) {
       if (d && !d.moved && !d.id) setSelected(null);
     };
     /* 拖到窗口外再松手也要收尾，否则拖拽状态会一直挂着 */
-    const cancel = (ev) => { if (ev && ev.key === 'Escape') { drag.current = null; setPanning(false); } };
+    const cancel = (ev) => {
+      if (!ev || ev.key !== 'Escape') return;
+      drag.current = null;
+      setPanning(false);
+      setLinking(null);
+      setLinkDraft(null);
+      setSelectedEdge(null);
+    };
     window.addEventListener('mousemove', move);
     window.addEventListener('mouseup', up);
     window.addEventListener('blur', up);
@@ -1941,7 +2070,13 @@ function GraphView(props) {
       badges),
     h('div', { className: 'sg-ask' + (digest(b.prompt) ? '' : ' sg-empty') },
       b.alias ? '✎ ' + b.alias : (clip(digest(b.prompt), 110) || '（该轮提问尚未载入）')),
-    h('div', { className: 'sg-ans' }, clip(digest(b.response, 'first-paragraph'), 220) || '（该轮回答尚未载入）'));
+    h('div', { className: 'sg-ans' }, clip(digest(b.response, 'first-paragraph'), 220) || '（该轮回答尚未载入）'),
+    /* 连线把手：拖到另一个块即可建立手动边（FR-9）。悬停或选中时才显形。 */
+    h('div', {
+      className: 'sg-handle',
+      'data-sg-link-handle': n.id,
+      title: '拖到另一个块建立连线'
+    }));
   });
 
   /* 三种边不只靠颜色区分（§5.2）：线型不同，箭头也分实心与空心 */
@@ -1976,6 +2111,19 @@ function GraphView(props) {
     }, e.label);
   }).filter(Boolean);
 
+  /* 拖拽连线中的预览线：从源块右中侧连到指针 */
+  const previewEdge = (linking && linking.mode === 'drag' && Number.isFinite(linking.x))
+    ? (() => {
+      const a = nodeMap.get(linking.from);
+      if (!a) return null;
+      return h('path', {
+        key: '__link-preview',
+        className: 'sg-e-preview',
+        d: curve(R(a), [linking.x, linking.y])
+      });
+    })()
+    : null;
+
   /* 断裂的边指向已不存在的块：几何上画不出来，但**不能装作没这回事** */
   const brokenCount = edgeList.filter((e) => e.broken).length;
 
@@ -1992,6 +2140,30 @@ function GraphView(props) {
           '发出第一条消息之后，图谱里就会出现第一个块。')
       : null;
 
+  /* 刚建好的连线：就地弹出标签输入框（FR-9）。
+     Enter 或失焦确认，Esc 取消；留空即无标签。 */
+  const labelInput = linkDraft ? h('div', {
+    className: 'sg-linkdraft',
+    style: { left: Math.max(8, Math.min(linkDraft.x, (size.w || 900) - 240)), top: Math.max(8, linkDraft.y) }
+  },
+  h('input', {
+    className: 'sg-linkdraft-in',
+    autoFocus: true,
+    maxLength: 120,
+    placeholder: '标签（可留空）',
+    value: linkDraft.value,
+    onChange: (e) => {
+      const v = e.target.value;
+      setLinkDraft((d) => (d ? { ...d, value: v } : d));
+    },
+    onKeyDown: (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') { labelLink(linkDraft.id, linkDraft.value); setLinkDraft(null); }
+      else if (e.key === 'Escape') { setLinkDraft(null); }
+    },
+    onBlur: () => { labelLink(linkDraft.id, linkDraft.value); setLinkDraft(null); }
+  })) : null;
+
   /* 内容由宿主侧读取；读取失败时当前会话仍有骨架，只是没有问答文本 */
   const contentHint = (!routeOk && !graph.error && laid.nodes.length)
     ? h('div', { className: 'sg-hint sg-hint-warn' },
@@ -2003,11 +2175,55 @@ function GraphView(props) {
     ? h('div', { className: 'sg-hint sg-hint-warn' }, saveError + '（改动仍在本页生效）')
     : null;
 
-  const detail = selected ? buildDetail() : h('div', { className: 'sg-emptybox' },
-    '家族 ' + (graph.error ? 0 : graph.stats.sessions) + ' 个会话 · ' +
-    (graph.error ? 0 : graph.stats.blocks) + ' 个块',
-    h('br'), h('br'),
-    '点一个块看它的提问与回答；双击块从那里分叉。');
+  const detail = selectedEdge
+    ? buildEdgeDetail()
+    : (selected ? buildDetail() : h('div', { className: 'sg-emptybox' },
+      '家族 ' + (graph.error ? 0 : graph.stats.sessions) + ' 个会话 · ' +
+      (graph.error ? 0 : graph.stats.blocks) + ' 个块',
+      h('br'), h('br'),
+      '点一个块看它的提问与回答；双击块从那里分叉。'));
+
+  function buildEdgeDetail() {
+    const e = edgeList.find((x) => x.id === selectedEdge);
+    if (!e) return h('div', { className: 'sg-emptybox' }, '这条连线已经不在了。');
+    const nameOf = (id) => {
+      const n = nodeMap.get(id);
+      if (!n) return id + '（已不存在）';
+      if (n.kind === 'header') return n.title;
+      const b = n.block;
+      return '第 ' + b.turn + ' 轮 · ' + (b.alias || clip(digest(b.prompt), 20) || b.sessionTitle);
+    };
+    return [
+      h('div', { key: 'hd', className: 'sg-side-hd' },
+        h('span', { className: 'sg-t' }, e.kind === 'reference' ? '引用连线' : '手动连线'),
+        h('button', { className: 'sg-x', onClick: () => setSelectedEdge(null) }, '✕')),
+      h('div', { key: 'meta', className: 'sg-side-meta' },
+        h('div', { className: 'sg-lb' }, '连线'),
+        h('div', { className: 'sg-meta' },
+          h('span', { className: 'sg-k' }, '起点'), h('span', { className: 'sg-v' }, nameOf(e.from)),
+          h('span', { className: 'sg-k' }, '终点'), h('span', { className: 'sg-v' }, nameOf(e.to)),
+          e.broken
+            ? [h('span', { key: 'k', className: 'sg-k' }, '状态'),
+              h('span', { key: 'v', className: 'sg-v' }, '端点已不存在')]
+            : null)),
+      h('div', { key: 'acts', className: 'sg-side-acts' },
+        h('button', {
+          className: 'sg-act sg-danger',
+          onClick: () => removeLink(e.id)
+        }, '✕ 删除这条连线')),
+      h('div', { key: 'bd', className: 'sg-side-bd' },
+        h('div', { className: 'sg-sec' },
+          h('div', { className: 'sg-lb' }, '标签'),
+          h('input', {
+            className: 'sg-linkdraft-in sg-wide',
+            maxLength: 120,
+            placeholder: '（无标签）',
+            value: e.label || '',
+            onChange: (ev) => labelLink(e.id, ev.target.value)
+          }),
+          h('div', { className: 'sg-tx' }, '留空即无标签。同一对块之间可以有多条连线。')))
+    ];
+  }
 
   function buildDetail() {
     const n = nodeMap.get(selected);
@@ -2042,6 +2258,10 @@ function GraphView(props) {
         }, '⑂ 从这里分叉'),
         h('button', {
           className: 'sg-act',
+          onClick: () => setLinking({ from: b.id, mode: 'click' })
+        }, '→ 连接到…'),
+        h('button', {
+          className: 'sg-act',
           onClick: () => {
             const next = { ...hidden, [b.id]: !hidden[b.id] };
             setHidden(next);
@@ -2067,7 +2287,7 @@ function GraphView(props) {
   return h('div', { className: 'sg-root' },
     h('style', null, CSS),
     h('div', {
-      className: 'sg-canvas-wrap' + (panning ? ' sg-panning' : ''),
+      className: 'sg-canvas-wrap' + (panning ? ' sg-panning' : '') + (linking ? ' sg-linking' : ''),
       ref: hostRef, tabIndex: 0, onKeyDown, onWheel, onMouseDown: onDown
     },
       h('div', {
@@ -2090,7 +2310,8 @@ function GraphView(props) {
           stroke: 'var(--dsw-alias-label-caption)',
           strokeWidth: 1.6
         }))),
-      edges),
+      edges,
+      previewEdge),
       cell,
       edgeLabels),
       h('div', { className: 'sg-tools' },
@@ -2114,9 +2335,14 @@ function GraphView(props) {
           : null,
         h('span', { className: 'sg-zoom' }, Math.round(view.scale * 100) + '%')),
       h('div', { className: 'sg-hint' },
-        '滚轮缩放 · 拖空白平移 · 单击块看详情 · 双击块分叉 · 方向键移动 · F 适应视图'),
+        linking
+          ? (linking.mode === 'drag'
+            ? '拖到另一个块并松手建立连线 · 松在空白处取消 · Esc 取消'
+            : '点击另一个块完成连线 · Esc 取消')
+          : '滚轮缩放 · 拖空白平移 · 单击块看详情 · 双击块分叉 · 拖块右下圆点连线 · F 适应视图'),
       contentHint,
       saveHint,
+      labelInput,
       body),
     h('aside', { className: 'sg-side' }, detail),
     /* 模态与浮层挂在**视图根节点**上，而不是画布容器里 ——
