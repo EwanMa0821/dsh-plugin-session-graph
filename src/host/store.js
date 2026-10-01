@@ -16,7 +16,10 @@
  *    而不是让 open 失败或把用户的记录挪走。需求 §5.3 明确要求不猜测性解析。
  */
 
-import { STATE_VERSION, emptyState, sanitizeState, mergePatch } from '../core/state.js';
+import { STATE_VERSION, STATE_MIGRATIONS, emptyState, sanitizeState, mergePatch } from '../core/state.js';
+
+/** 迁移表里登记过的旧版本（升序）。领域声明的 compatibleVersions 由它推导。 */
+const MIGRATED_FROM = Object.keys(STATE_MIGRATIONS).map(Number).sort((a, b) => a - b);
 
 /**
  * 领域名。**必须是 `[a-z][a-z0-9_]*`，不能有连字符。**
@@ -76,6 +79,11 @@ export const familyRecordSchema = {
 export const DOMAIN_SPEC = {
   name: DOMAIN_NAME,
   version: STATE_VERSION,
+  /* 声明"本版本还能读哪些旧版本的记录"。storageDomain 只按声明放行，
+     真正的逐级迁移在 core/state.js 的 migrateState 里做。
+     这里**跟着迁移表自动走**：没登记迁移时不下发这个键（行为与今天完全一致），
+     一旦升版本并补了迁移，旧领域的记录就仍然打得开，而不是整片只读。 */
+  ...(MIGRATED_FROM.length ? { compatibleVersions: MIGRATED_FROM } : {}),
   layout: 'per-record',
   invalidRecords: 'backup-and-skip',
   tables: { [TABLE_NAME]: { valueSchema: familyRecordSchema } }

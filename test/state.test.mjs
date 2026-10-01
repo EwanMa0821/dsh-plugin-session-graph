@@ -12,8 +12,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  STATE_VERSION, LIMITS, emptyState, idToRef, refToId,
-  sanitizeState, mergePatch, stateToClient, clientPatchToState, sessionsInState
+  STATE_VERSION, STATE_MIGRATIONS, LIMITS, emptyState, idToRef, refToId,
+  sanitizeState, migrateState, mergePatch, stateToClient, clientPatchToState, sessionsInState
 } from '../src/core/state.js';
 import {
   DOMAIN_SPEC, DOMAIN_NAME, TABLE_NAME, familyRecordSchema, createStore, openStore
@@ -368,4 +368,58 @@ test('openStore 把领域打开成 store，并使用同一个 spec', async () =>
   const store = await openStore({ open: async (spec) => { got = spec; return fakeDomain(); } });
   assert.notEqual(store, null);
   assert.equal(got, DOMAIN_SPEC, '传下去的就是本插件声明的那个领域');
+});
+
+/* ------------------------------------------------------------------ 版本迁移 */
+
+test('升版本不许把老用户变成只读：旧版本走迁移，而不是被当成不认识', () => {
+  /* 真实场景：插件升到 v(n+1)，用户存档还是 v(n)。
+     旧实现 `version !== STATE_VERSION → null` 会让**所有人**同时转入只读，
+     而且没有迁移路径 —— 必须先有脚手架，升版本才是可运营的动作。 */
+  const from = STATE_VERSION - 1;
+  STATE_MIGRATIONS[from] = (state) => ({ ...state, version: STATE_VERSION, alias: { 'root:1': '迁移后的别名' } });
+  try {
+    const older = { version: from, hiddenBlocks: ['root:2'], alias: { 'root:1': '旧别名' }, updatedAt: 7 };
+    const migrated = sanitizeState(older, 100);
+    assert.notEqual(migrated, null, '旧版本必须能读');
+    assert.equal(migrated.version, STATE_VERSION, '规整后带上当前版本（写回即升级）');
+    assert.deepEqual(migrated.hiddenBlocks, ['root:2'], '迁移保住的字段不能丢');
+    assert.equal(migrated.alias['root:1'], '迁移后的别名');
+    assert.equal(migrated.updatedAt, 7);
+  } finally {
+    delete STATE_MIGRATIONS[from];
+  }
+});
+
+test('迁移链条缺环时按"不认识"处理，不猜', () => {
+  /* 直接给一个远低于当前版本的记录，且迁移表里没有那一环 */
+  const ancient = { version: STATE_VERSION - 5, hiddenBlocks: ['root:1'] };
+  assert.equal(migrateState(ancient), null, '缺环必须停住');
+  assert.equal(sanitizeState(ancient, 1), null, '停住之后按不认识处理（调用方拒绝写入）');
+});
+
+test('更新的版本绝不改写（降级场景）', () => {
+  const newer = { version: STATE_VERSION + 1, hiddenBlocks: ['root:1'] };
+  assert.equal(sanitizeState(newer, 1), null, '更新版本的记录不能被按旧形状改写');
+});
+
+test('迁移函数没推进版本时判为写坏，而不是死循环', () => {
+  const from = STATE_VERSION - 1;
+  STATE_MIGRATIONS[from] = (state) => ({ ...state });        /* 故意不改 version */
+  try {
+    assert.equal(migrateState({ version: from }), null);
+  } finally {
+    delete STATE_MIGRATIONS[from];
+  }
+});
+
+test('领域声明跟着迁移表走：没有迁移时不下发 compatibleVersions', () => {
+  const keys = Object.keys(STATE_MIGRATIONS).map(Number).sort((a, b) => a - b);
+  if (keys.length === 0) {
+    assert.equal('compatibleVersions' in DOMAIN_SPEC, false,
+      '今天没有迁移，声明里就不该出现这个键（保持与旧版完全一致的行为）');
+  } else {
+    assert.deepEqual(DOMAIN_SPEC.compatibleVersions, keys);
+  }
+  assert.equal(DOMAIN_SPEC.version, STATE_VERSION);
 });

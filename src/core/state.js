@@ -91,40 +91,91 @@ const sxSanitizeLink = (raw, now) => {
 };
 
 /**
+ * 版本迁移。
+ *
+ * 为什么要这份脚手架：`sanitizeState` 遇到不认识的版本会返回 null，调用方据此
+ * **拒绝应用**（宁可只读也不要猜）。这个方向对旧版本成立，但**升版本时就翻车**：
+ * 所有老用户的存档会在同一刻变成"不认识"，界面集体转入只读，而且没有迁移路径 ——
+ * 必须让用户删掉存档才能恢复。这不可接受。
+ *
+ * 所以规则改成三条：
+ *   1. 版本相同 → 直接规整；
+ *   2. 版本更旧 → 逐级跑迁移函数，再按当前版本规整（**写回时自然升级**，
+ *      所以一条记录只要被碰过一次就自愈了）；
+ *   3. 版本更新 → 仍返回 null（那是更新的插件写的，我们不该按旧形状改写它）。
+ *
+ * 升版本时的操作：把 `STATE_VERSION` 加一，并在下面的表里补一条
+ * `旧版本 -> 迁移函数`。表里缺环时迁移会停住并按"不认识"处理，不会半途产出
+ * 形状可疑的状态。
+ *
+ * @type {Record<number, (state: object) => object>}
+ */
+export const STATE_MIGRATIONS = {
+  /* 示例（首次真正升版本时删掉注释并补上）：
+     1: (state) => ({ ...state, version: 2, 新增字段: [] }) */
+};
+
+/**
+ * 把旧版本记录逐级迁移到当前版本。
+ * @param {object} raw 外来记录
+ * @returns {object|null} 迁移后的记录；链条不完整时返回 null
+ */
+export function migrateState(raw) {
+  let state = raw;
+  let version = Number(state && state.version);
+  if (!Number.isFinite(version)) return null;      /* 版本字段缺失/不是数字：不认识 */
+  let guard = 0;
+  while (version < STATE_VERSION) {
+    const step = STATE_MIGRATIONS[version];
+    if (typeof step !== 'function') return null;      /* 缺环：宁可只读，不要猜 */
+    state = step(state);
+    const next = Number(state && state.version);
+    if (!(next > version)) return null;               /* 迁移函数没推进版本 = 写坏了 */
+    version = next;
+    if ((guard += 1) > 64) return null;               /* 防死循环 */
+  }
+  return state;
+}
+
+/**
  * 把任意外来记录规整成合法状态。
  * @returns {object|null} 版本不认识时返回 null（调用方据此拒绝应用，而不是猜）
  */
 export function sanitizeState(raw, now = 0) {
   if (!sxIsObject(raw)) return null;
   const version = Number(raw.version);
-  if (version !== STATE_VERSION) return null;
+  /* 更新的版本不碰（可能是新版插件写的）；版本字段缺失/不是数字一律当不认识。
+     注意下面全部读 `src` 而不是 `raw` —— 迁移可能改过字段形状。 */
+  if (!Number.isFinite(version) || version > STATE_VERSION) return null;
+  const src = version === STATE_VERSION ? raw : migrateState(raw);
+  if (!sxIsObject(src)) return null;
 
-  const viewport = sxIsObject(raw.viewport)
+  const viewport = sxIsObject(src.viewport)
     ? {
-      zoom: sxClamp(raw.viewport.zoom, 0.25, 2, 1),
-      panX: sxClamp(raw.viewport.panX, -1e6, 1e6, 0),
-      panY: sxClamp(raw.viewport.panY, -1e6, 1e6, 0)
+      zoom: sxClamp(src.viewport.zoom, 0.25, 2, 1),
+      panX: sxClamp(src.viewport.panX, -1e6, 1e6, 0),
+      panY: sxClamp(src.viewport.panY, -1e6, 1e6, 0)
     }
     : null;
 
   return {
     version: STATE_VERSION,
-    links: (Array.isArray(raw.links) ? raw.links : [])
+    links: (Array.isArray(src.links) ? src.links : [])
       .slice(0, LIMITS.links).map((l) => sxSanitizeLink(l, now)).filter(Boolean),
-    positions: sxCapObject(raw.positions, LIMITS.positions, (v) => {
+    positions: sxCapObject(src.positions, LIMITS.positions, (v) => {
       if (!sxIsObject(v)) return null;
       const x = Number(v.x);
       const y = Number(v.y);
       return Number.isFinite(x) && Number.isFinite(y) ? { x: Math.round(x), y: Math.round(y) } : null;
     }),
     viewport,
-    collapsedSessions: sxUniq(raw.collapsedSessions, LIMITS.collapsedSessions),
-    hiddenBlocks: sxUniq(raw.hiddenBlocks, LIMITS.hiddenBlocks),
-    alias: sxCapObject(raw.alias, LIMITS.alias, (v) => {
+    collapsedSessions: sxUniq(src.collapsedSessions, LIMITS.collapsedSessions),
+    hiddenBlocks: sxUniq(src.hiddenBlocks, LIMITS.hiddenBlocks),
+    alias: sxCapObject(src.alias, LIMITS.alias, (v) => {
       const text = sxStr(v).trim().slice(0, LIMITS.aliasLength);
       return text === '' ? null : text;
     }),
-    updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : now
+    updatedAt: Number.isFinite(Number(src.updatedAt)) ? Number(src.updatedAt) : now
   };
 }
 
