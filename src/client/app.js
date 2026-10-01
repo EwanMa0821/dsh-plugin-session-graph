@@ -116,7 +116,10 @@ function digest(text, mode) {
 }
 
 const CSS = `
-.sg-root{position:absolute;inset:0;display:flex;font-family:inherit;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-base);user-select:none;-webkit-user-select:none}
+/* 视图根铺满整个对话根，**包括输入框所占的那一条**。输入框的 z-index 更高，
+   所以这里必须给它让位：padding-bottom 让画布与侧栏一起收在输入框之上
+   （只给侧栏正文留白是不够的 —— 侧栏最后一段会被压住，正是"看不到对话内容"的成因）。 */
+.sg-root{position:absolute;inset:0;box-sizing:border-box;padding-bottom:var(--sg-composer-reserve, 104px);display:flex;font-family:inherit;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-base);user-select:none;-webkit-user-select:none}
 .sg-canvas-wrap{flex:1;min-width:0;position:relative;overflow:hidden;user-select:none;-webkit-user-select:none;
   cursor:grab;
   background-image:radial-gradient(var(--dsw-alias-border-l2) 1px,transparent 1px);background-size:22px 22px}
@@ -243,10 +246,11 @@ const CSS = `
 /* 右栏：元信息与操作**固定**在上，只有正文区滚动。
    正文可能很长，若把它排在前面，元信息和操作会被永远挤出可视区。 */
 /* 宽度对齐原型（prototype/session-graph-interactive.html 里是 width:330px / flex:0 0 330px）。
-   原先的 clamp(320px,26vw,430px) 在窄窗口里会吃掉半个屏幕，画布挤成一条 ——
-   用户看到的就是"侧边栏太宽、看不到对话内容"。窄窗口用 46vw 兜底，保证画布还剩一半。
-   min-height:0 与下面正文区的 overflow 一起，才是"正文能滚、元信息与操作不被挤走"。 */
-.sg-side{flex:0 0 min(330px, 46vw);border-left:.5px solid var(--dsw-alias-border-l1);display:flex;
+   **不要在 flex 简写里写数学函数**：一旦「flex:0 0 min(...)」被判定非法，整条声明作废
+   并退回 flex-basis:auto —— 侧栏就按内容撑开（实测占掉大半屏，看起来跟没改一样）。
+   所以用最保守的三个长写属性：定宽 330px、窄窗口 max-width 兜底、最小可用宽度。
+   另：这段是模板字符串，注释里**不能出现反引号**，否则会提前闭合（构建期护栏见 build-client）。 */
+.sg-side{flex:0 0 330px;max-width:46vw;min-width:240px;border-left:.5px solid var(--dsw-alias-border-l1);display:flex;
   flex-direction:column;min-height:0;user-select:text;-webkit-user-select:text}
 .sg-side-hd{padding:13px 15px 11px;border-bottom:.5px solid var(--dsw-alias-border-l1);display:flex;
   align-items:center;gap:8px;flex:0 0 auto}
@@ -259,11 +263,9 @@ const CSS = `
 .sg-side-meta{padding:12px 15px 0;flex:0 0 auto}
 .sg-side-acts{padding:12px 15px 13px;flex:0 0 auto;border-top:.5px solid var(--dsw-alias-border-l1);
   margin-top:12px;display:flex;flex-direction:column;gap:7px}
-/* 唯一滚动的区域。
-   底部留出输入框的高度：视图根铺满整个对话根（含输入框所在区域），
-   输入框的 z-index 更高，会把正文最后一段盖住 —— 用户看到的就是"看不到对话内容"。
-   把这段高度用 padding 让出来，最后一段就能滚进可视区点得到、看得见。 */
-.sg-side-bd{flex:1;overflow-y:auto;padding:12px 15px 16px;padding-bottom:calc(16px + 96px);min-height:0}
+/* 唯一滚动的区域。输入框让位由 .sg-root 的 padding-bottom 统一负责（画布与侧栏一起让开），
+   这里不再单独留白，否则侧栏底部会白出一大块。 */
+.sg-side-bd{flex:1;overflow-y:auto;padding:12px 15px 16px;min-height:0}
 /* 小标题在正文区与固定区都要用，所以不做后代限定 */
 .sg-lb{font-size:11px;font-weight:600;letter-spacing:.05em;color:var(--dsw-alias-label-caption);
   margin-bottom:6px}
@@ -1932,12 +1934,13 @@ function GraphView(props) {
           }, incompatible ? t('ro.incompatible') : t('ro.readonly'))
           : null,
         h('span', { className: 'sg-zoom' }, Math.round(view.scale * 100) + '%')),
-      h('div', { className: 'sg-hint' },
-        linking
-          ? (linking.mode === 'drag'
-            ? t('hint.linkingDrag')
-            : t('hint.linkingClick'))
-          : t('hint.idle')),
+      /* 左下角的操作提示按用户要求去掉：它长期占着画布，而同样的信息在工具条与
+         空态里都有。连线过程中的临时提示（linking）保留 —— 那是"正在做什么"的反馈，
+         不是常驻说明。 */
+      linking
+        ? h('div', { className: 'sg-hint' },
+          linking.mode === 'drag' ? t('hint.linkingDrag') : t('hint.linkingClick'))
+        : null,
       contentHint,
       saveHint,
       scaleHint,

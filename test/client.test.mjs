@@ -632,12 +632,12 @@ test('详情面板：元信息与操作固定在顶部，只有正文区滚动',
   assert.match(css, /\.sg-side-bd\{[^}]*overflow-y:auto/, '正文区是唯一的滚动容器');
   assert.match(css, /\.sg-side-meta\{[^}]*flex:0 0 auto/, '元信息不参与拉伸');
   assert.match(css, /\.sg-side-acts\{[^}]*flex:0 0 auto/, '操作不参与拉伸');
-  /* 宽度对齐原型（330px），窄窗口用 46vw 兜底：原先的 clamp(320px,26vw,430px)
-     在窄窗口会吃掉半个屏幕，画布被挤成一条。 */
-  assert.match(css, /\.sg-side\{flex:0 0 min\(330px, 46vw\)/, '右栏宽度对齐原型且有窄窗口兜底');
-  /* 视图根铺满整个对话根（含输入框区域），输入框 z-index 更高会盖住正文最后一段 ——
-     这正是"看不到对话内容"的成因，所以正文区底部必须让出这段高度。 */
-  assert.match(css, /\.sg-side-bd\{[^}]*padding-bottom:calc\(16px \+ 96px\)/, '正文区底部让出输入框高度');
+  /* 定宽 330px（对齐原型），窄窗口用 max-width 兜底。注意不能把数学函数写进 flex 简写：
+     一旦被判非法，整条声明作废、退回 flex-basis:auto，侧栏就按内容撑开 —— 实测占掉大半屏。 */
+  assert.match(css, /\.sg-side\{flex:0 0 330px;max-width:46vw/, '右栏定宽 330px，窄窗口 max-width 兜底');
+  /* 视图根铺满整个对话根（含输入框区域），输入框 z-index 更高会盖住侧栏最后一段 ——
+     这正是"看不到对话内容 / 对话框遮挡侧栏"的成因，所以由视图根统一让位。 */
+  assert.match(css, /\.sg-root\{[^}]*padding-bottom:var\(--sg-composer-reserve/, '视图根给输入框让位');
 });
 
 test('块上的提问行不会退化成轮次号', () => {
