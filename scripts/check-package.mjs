@@ -143,6 +143,15 @@ try {
   check(actual.includes(PKG_NAME), `${OUT} 里的模块 id 与包名一致`);
   check(!/^\s*import\s/m.test(actual.replace(/^\/\*[\s\S]*?\*\//, '')),
     `${OUT} 里没有 ESM import（浏览器模块表不吃）`);
+
+  /* 客户端只允许 require 两个模块：react 与宿主的 UI 基础件。
+     基础件是**基线模块**——conversation 自己也直接 require 它，无须声明 external。 */
+  const required = new Set([...actual.matchAll(/require\(\s*["']([^"']+)["']\s*\)/g)].map((m) => m[1]));
+  const allowed = new Set(['react', '@deepseek-ai/dsh-client-ui-primitives']);
+  const extra = [...required].filter((n) => !allowed.has(n));
+  check(extra.length === 0, `客户端只 require react 与宿主 primitives（多出：${extra.join(', ') || '无'}）`);
+  check(required.has('@deepseek-ai/dsh-client-ui-primitives'),
+    '客户端用宿主的 MarkdownText / extractMarkdownPlainText 渲染 Markdown');
 } catch (e) {
   problems.push('生成客户端产物失败：' + e.message);
 }

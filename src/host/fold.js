@@ -14,8 +14,19 @@ const numOrNull = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 };
-/** 只压空白，**不**剥尖括号 —— 提问与回答里出现 <div> 这类代码是常态 */
-const squash = (v) => str(v).replace(/\s+/g, ' ').trim();
+/**
+ * 规整正文：**保留换行**。正文是 Markdown，表格、代码块、列表全靠换行成立。
+ * 也不剥尖括号 —— 提问与回答里出现 `<div>` 这类代码是常态。
+ */
+const tidy = (v) => str(v)
+  .replace(/\r\n?/g, '\n')
+  .split('\n')
+  .map((line) => line.replace(/[ \t]+$/, ''))
+  .join('\n')
+  .replace(/\n{3,}/g, '\n\n')
+  /* 首尾整体去空白：首行若留着前导空格，Markdown 会把它当缩进代码块。
+     只去整体首尾，**不动**行内缩进 —— 那正是列表与代码块的结构。 */
+  .trim();
 
 /**
  * 该条 `user/message` 是否由人类发起。
@@ -45,24 +56,25 @@ export function isHumanTurn(payload) {
 /** 从各种可能的载荷形状里取出一段可读文本 */
 export function textOf(payload) {
   if (payload === undefined || payload === null) return '';
-  if (typeof payload === 'string') return squash(payload);
+  if (typeof payload === 'string') return tidy(payload);
   if (typeof payload !== 'object') return '';
 
   const direct = payload.text ?? payload.prompt ?? payload.content;
-  if (typeof direct === 'string') return squash(direct);
+  if (typeof direct === 'string') return tidy(direct);
 
   const blocks = Array.isArray(direct) ? direct
     : Array.isArray(payload.message && payload.message.content) ? payload.message.content
       : Array.isArray(payload.blocks) ? payload.blocks
         : null;
   if (blocks) {
-    return squash(blocks.map((b) => {
+    /* 文本块之间留空行：它们本来就是不同段落，压成一行会毁掉 Markdown 结构 */
+    return tidy(blocks.map((b) => {
       if (typeof b === 'string') return b;
       if (!b || typeof b !== 'object') return '';
       /* 只认文本块：图片、工具调用块没有可读文本 */
       if (b.type !== undefined && b.type !== 'text') return '';
       return str(b.text ?? b.value ?? b.content ?? '');
-    }).join(' '));
+    }).filter(Boolean).join('\n\n'));
   }
   if (payload.message && typeof payload.message === 'object') return textOf(payload.message);
   return '';
@@ -165,4 +177,4 @@ export function linkForks(sessions, turnsBySession) {
   });
 }
 
-export { squash as squashText };
+export { tidy as tidyText };

@@ -478,11 +478,72 @@ test('.mm 进行中的块带沙漏图标', () => {
 
 /* ---------------------------------------------------------------- .md 导出 */
 
-test('.md 每个块都是一个列表项，其下两行区分问与答', () => {
+test('.md 每个块是一个列表项，其下「问」「答」各带一个正文块', () => {
   const { content } = toMarkdown(graphOf());
   assert.equal((content.match(/^- \*\*第 \d+ 轮\*\*/gm) || []).length, 5, '根会话 5 个块在顶层');
-  assert.equal((content.match(/- \*\*问\*\*：/g) || []).length, 12, '每个块一行「问」');
-  assert.equal((content.match(/- \*\*答\*\*：/g) || []).length, 12, '每个块一行「答」');
+  assert.equal((content.match(/- \*\*问\*\*/g) || []).length, 12, '每个块一个「问」');
+  assert.equal((content.match(/- \*\*答\*\*/g) || []).length, 12, '每个块一个「答」');
+});
+
+test('.md 正文以缩进块嵌入：表格与代码块不会被压成一行', () => {
+  const answer = [
+    '结论如下：', '',
+    '| 层 | 依赖 |', '|---|---|', '| L1 | 视图位 |', '',
+    '```js', 'const x = 1;', '```'
+  ].join('\n');
+  const g = buildGraph({
+    sessions: normalizeSessions([{ id: 'root', title: '根' }]),
+    turnsBySession: { root: [turn(1, '问一句', answer)] },
+    currentId: 'root'
+  });
+  const { content } = toMarkdown(g);
+  assert.ok(content.includes('    | 层 | 依赖 |'), '表格行整体缩进，仍是表格');
+  assert.ok(content.includes('    |---|'), '分隔行一起缩进');
+  assert.ok(/^ {4}```js$/m.test(content), '代码围栏缩进后仍是围栏');
+  assert.ok(content.includes('    const x = 1;'), '代码内容一起缩进');
+  /* 旧行为会把整段压成一行，产出 "| 层 | 依赖 | |---|---|" 这种四不像 */
+  assert.ok(!content.includes('| 层 | 依赖 | |---|'), '没有被压成一行');
+});
+
+test('.mm 行内 Markdown 转成 HTML，且围栏代码内的标记不被误吃', () => {
+  const answer = [
+    '| 层 | 依赖 |', '|---|---|', '| **L1** | 视图位 |', '',
+    '见 `sessionQuery` 与 [报告](https://x.md)。', '',
+    '```js', 'if (a ** b) {}', '```'
+  ].join('\n');
+  const g = buildGraph({
+    sessions: normalizeSessions([{ id: 'root', title: '根' }]),
+    turnsBySession: { root: [turn(1, '调研 **DSH**', answer)] },
+    currentId: 'root'
+  });
+  const { content } = toFreeMind(g);
+  const node = /<richcontent TYPE="NODE">([\s\S]*?)<\/richcontent>/.exec(content)[1];
+
+  assert.ok(node.includes('<b>DSH</b>'), '粗体转成 <b>');
+  assert.ok(!node.includes('**DSH**'), '不再残留 ** 源码');
+  assert.ok(node.includes('<b>L1</b>'), '表格单元格里的粗体也转了');
+  assert.ok(!node.includes('|---|---|'), '表格分隔行是纯噪声，丢掉');
+  assert.ok(node.includes('<code>sessionQuery</code>'), '行内代码转成 <code>');
+  assert.ok(node.includes('<a href="https://x.md">报告</a>'), '链接转成锚点');
+  assert.ok(node.includes('if (a ** b) {}'), '围栏内的 ** 是代码，必须原样保留');
+  assert.ok(!node.includes('```'), '围栏标记本身不留在导图里');
+  assert.equal(nodeOpen(content), nodeClose(content));
+});
+
+test('.mm 正文逐行成段：换行不会被丢掉', () => {
+  const answer = ['第一段。', '', '第二段。'].join('\n');
+  const g = buildGraph({
+    sessions: normalizeSessions([{ id: 'root', title: '根' }]),
+    turnsBySession: { root: [turn(1, '问', answer)] },
+    currentId: 'root'
+  });
+  const { content } = toFreeMind(g);
+  /* 标签只加在第一段，后续段落是独立的 <p> —— 段段都挂标签反而更乱 */
+  assert.equal((content.match(/<b>答<\/b>/g) || []).length, 1);
+  assert.ok(content.includes('<p><b>答</b>　第一段。</p>'));
+  assert.ok(content.includes('<p>第二段。</p>'), '第二段是独立的段落，没被并进第一段');
+  assert.ok(!content.includes('第一段。 第二段。'), '换行没有被压成空格');
+  assert.equal(nodeOpen(content), nodeClose(content));
 });
 
 test('.md 分叉会话以嵌套项出现，引用式不带重复前缀', () => {

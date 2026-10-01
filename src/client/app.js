@@ -4,13 +4,56 @@
    运行在 __ModuleLoader__ 的 factory 作用域里，因此可以直接使用
    上面已经内联的核心函数（buildGraph / layout / render ...）。
 
-   约束（NFR-2）：只用 --dsw-* 主题变量；不 import 任何宿主客户端包；
-   不向 document.body 追加；样式以 React 元素渲染，随组件卸载移除。
+   约束（NFR-2）：只用 --dsw-* 主题变量；除 react 与宿主的 primitives 基础件外
+   不 require 别的包；不向 document.body 追加；样式以 React 元素渲染，随组件卸载移除。
    ============================================================ */
 
 const NS = 'dsh-plugin-session-graph';
 const TARGET = 'session-graph';
 const VIEW_ORDER = 20;
+
+/* 宿主的 UI 基础件是**基线模块**：`dsh-client-ui-conversation` 自己也这样直接 require，
+   没有任何客户端插件把它写进 dsh.client.external。直接用它渲染 Markdown，
+   与产品其余部分的排版完全一致，也不必自己造一套解析器。 */
+const primitives = require('@deepseek-ai/dsh-client-ui-primitives');
+/* 取不到就退化成纯文本：宁可排版朴素，也不能因为一个导出缺失让整个视图崩掉 */
+const MarkdownText = (primitives && primitives.MarkdownText) || null;
+const extractMarkdownPlainText = (primitives && primitives.extractMarkdownPlainText) || null;
+
+/** MarkdownText 要求一整份界面文案；键就这 6 个 */
+const MD_LABELS = {
+  code: {
+    copyLabel: '复制',
+    copiedLabel: '已复制',
+    toolbarLabels: { codeLabel: '代码', wrapLabel: '自动换行', unwrapLabel: '不换行' }
+  },
+  footnotes: '脚注'
+};
+
+/** 正文渲染：优先用宿主的渲染器，缺失时退回纯文本 */
+function markdownBlock(text, key) {
+  if (!MarkdownText) return h('div', { key, className: 'sg-tx' }, text);
+  return h('div', { key, className: 'sg-md' },
+    h(MarkdownText, { text, labels: MD_LABELS, variant: 'compact' }));
+}
+
+/**
+ * 摘要成单行：优先用宿主自己的 Markdown 抽取（与产品一致），
+ * 拿不到时退回核心模块里的正则实现。
+ */
+function digest(text, mode) {
+  const src = String(text === undefined || text === null ? '' : text);
+  if (src.trim() === '') return '';
+  let plainText = '';
+  if (extractMarkdownPlainText) {
+    try {
+      plainText = extractMarkdownPlainText(src, { mode: mode || 'first-line' });
+    } catch {
+      plainText = '';
+    }
+  }
+  return squash(plainText || summarize(src));
+}
 
 const CSS = `
 .sg-root{position:absolute;inset:0;display:flex;font-family:inherit;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-base);user-select:none;-webkit-user-select:none}
@@ -81,6 +124,14 @@ const CSS = `
   margin-bottom:6px}
 .sg-sec .sg-tx{font-size:12.5px;line-height:1.6;color:var(--dsw-alias-label-secondary);word-break:break-word}
 .sg-sec .sg-tx.sg-strong{color:var(--dsw-alias-label-primary)}
+/* 宿主 markdown 渲染器的容器：面板只有 330px，宽内容要能横向滚而不是撑破布局 */
+.sg-md{font-size:12.5px}
+.sg-md>div{font-size:12.5px}
+.sg-md table{display:block;width:max-content;max-width:100%;overflow-x:auto;font-size:11.5px}
+.sg-md pre{max-width:100%;overflow-x:auto}
+.sg-md img,.sg-md svg{max-width:100%;height:auto}
+.sg-md>*:first-child{margin-top:0}
+.sg-md>*:last-child{margin-bottom:0}
 .sg-meta{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-size:12px}
 .sg-meta .sg-k{color:var(--dsw-alias-label-caption)}
 .sg-meta .sg-v{color:var(--dsw-alias-label-secondary);text-align:right}
@@ -526,8 +577,8 @@ function GraphView(props) {
       h('span', { className: 'sg-dot' + (b.status === 'open' ? ' sg-open' : b.status === 'failed' ? ' sg-failed' : '') }),
       h('span', { className: 'sg-sp' }),
       badges),
-    h('div', { className: 'sg-ask' }, b.alias ? '✎ ' + b.alias : (b.prompt || '第 ' + b.turn + ' 轮')),
-    h('div', { className: 'sg-ans' }, b.response || '（该轮回答尚未载入）'));
+    h('div', { className: 'sg-ask' }, b.alias ? '✎ ' + b.alias : (clip(digest(b.prompt), 110) || '第 ' + b.turn + ' 轮')),
+    h('div', { className: 'sg-ans' }, clip(digest(b.response, 'first-paragraph'), 220) || '（该轮回答尚未载入）'));
   });
 
   const edges = (graph.error ? [] : graph.edges).map((e) => {
@@ -574,10 +625,10 @@ function GraphView(props) {
       h('div', { key: 'bd', className: 'sg-side-bd' },
         h('div', { className: 'sg-sec' },
           h('div', { className: 'sg-lb' }, '提问'),
-          h('div', { className: 'sg-tx sg-strong' }, b.prompt || '（未载入）')),
+          b.prompt ? markdownBlock(b.prompt, 'q') : h('div', { className: 'sg-tx' }, '（未载入）')),
         h('div', { className: 'sg-sec' },
           h('div', { className: 'sg-lb' }, '回答'),
-          h('div', { className: 'sg-tx' }, b.response || '（未载入）')),
+          b.response ? markdownBlock(b.response, 'a') : h('div', { className: 'sg-tx' }, '（未载入）')),
         h('div', { className: 'sg-sec' },
           h('div', { className: 'sg-lb' }, '元信息'),
           h('div', { className: 'sg-meta' },

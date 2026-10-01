@@ -9,10 +9,11 @@
  *   2. richcontent NOTE —— 大多数工具显示备注，作为保底
  *   3. TEXT 里的提问截断 —— 连备注都不显示的工具至少能看到提问
  *
- * `.md` 里同一个块是一个列表项，其下两行 `**问**：` / `**答**：`。
+ * `.md` 里同一个块是一个列表项，其下 `**问**` / `**答**` 两个子项，
+ * 正文以**缩进块**原样嵌入 —— 这样正文里的表格、代码块、列表才能正确渲染。
  */
 
-import { clip, plain } from './model.js';
+import { clip, plain, summarize, tidy } from './model.js';
 
 export const FORMATS = ['mm', 'md'];
 
@@ -22,6 +23,64 @@ const escXml = (v) => String(v === undefined || v === null ? '' : v)
   .replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;')
   .replace(/'/g, '&apos;');
+
+/**
+ * Markdown 行内标记 → FreeMind richcontent 认的 HTML。
+ *
+ * `.mm` 的 richcontent 是 **HTML**，不是 Markdown。不转换的话，思维导图里会
+ * 原样显示 `**DSH**`、`| 层 | 依赖 |` 这些源码。先转义再做替换，顺序不能反。
+ */
+function inlineHtml(text) {
+  return escXml(text)
+    .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
+    .replace(/__([^_\n]+)__/g, '<b>$1</b>')
+    .replace(/\*([^*\n]+)\*/g, '<i>$1</i>')
+    .replace(/~~([^~\n]+)~~/g, '<s>$1</s>')
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, '<a href="$2">$1</a>');
+}
+
+/** 表格分隔行（`|---|---|`）在思维导图里只是噪声，丢掉 */
+const isTableRule = (line) => /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line) && line.includes('-');
+
+/**
+ * 把一段 Markdown 正文逐行转成 `<p>`，首行带标签（如「问」）。
+ *
+ * 空行与表格分隔行跳过（空 `<p>` 在多数思维导图软件里会渲染成一行空白）；
+ * 围栏代码换成等宽段落并丢掉 ``` 标记 —— 在导图里那三个反引号只是噪声，
+ * 且围栏内不能再套行内标记，否则代码里的 `**` 会被吃掉。
+ */
+function paragraphs(text, label) {
+  const out = [];
+  let emitted = 0;
+  const push = (html) => {
+    const head = emitted === 0 ? `<b>${escXml(label)}</b>　` : '';
+    emitted += 1;
+    out.push(`<p>${head}${html}</p>`);
+  };
+
+  let fenced = false;
+  tidy(text).split('\n').forEach((raw) => {
+    const line = raw.trim();
+    if (/^(?:```|~~~)/.test(line)) { fenced = !fenced; return; }
+    if (fenced) {
+      if (line !== '') push(`<font face="Courier New, monospace">${escXml(raw.replace(/\s+$/, ''))}</font>`);
+      return;
+    }
+    if (line === '' || isTableRule(line)) return;
+    const heading = /^#{1,6}\s+(.*)$/.exec(line);
+    push(heading ? `<b>${inlineHtml(heading[1])}</b>` : inlineHtml(line.replace(/^>\s?/, '')));
+  });
+
+  if (emitted === 0) out.push(`<p><b>${escXml(label)}</b></p>`);   /* 正文为空也要留一格 */
+  return out.join('');
+}
+
+/** 把多行文本整体缩进 n 个空格，供 Markdown 列表项内部嵌入块内容 */
+function indentBlock(text, n) {
+  const pad = ' '.repeat(n);
+  return tidy(text).split('\n').map((line) => (line === '' ? '' : pad + line)).join('\n');
+}
 
 /** 时间戳，`YYYY-MM-DD HH:mm` */
 export function stamp(at) {
@@ -120,18 +179,17 @@ export function toFreeMind(graph, options = {}) {
   function blockNode(block, depth) {
     const title = block.alias
       ? `✎ ${block.alias}`
-      : `第 ${block.turn} 轮 · ${clip(block.prompt, 24)}`;
+      : `第 ${block.turn} 轮 · ${clip(summarize(block.prompt), 24)}`;
     const bg = block.current ? ' BACKGROUND_COLOR="#e4edfd"' : '';
     out.push(`${pad(depth)}<node TEXT="${escXml(title)}" ID="${idOf(block.id)}"${bg}>`);
-    /* 第 1 层：节点富文本里「问」「答」两段 */
+    /* 第 1 层：节点富文本里「问」「答」两段。
+       正文是 Markdown，**逐行**成段，别把整段塞进一个 <p> —— 那样换行全丢。 */
     out.push(`${pad(depth + 1)}<richcontent TYPE="NODE"><html><body>` +
-      `<p><b>问</b>　${escXml(block.prompt)}</p>` +
-      `<p><b>答</b>　${escXml(block.response)}</p>` +
+      paragraphs(block.prompt, '问') + paragraphs(block.response, '答') +
       `</body></html></richcontent>`);
     /* 第 2 层：备注里的全文与元信息 */
     out.push(`${pad(depth + 1)}<richcontent TYPE="NOTE"><html><body>` +
-      `<p>问：${escXml(block.prompt)}</p>` +
-      `<p>答：${escXml(block.response)}</p>` +
+      paragraphs(block.prompt, '问：') + paragraphs(block.response, '答：') +
       `<p>元信息：${escXml(block.sessionTitle)} · 第 ${block.turn} 轮 · ` +
       `${block.toolCalls} 个工具 · ${block.deliverables} 个交付物</p>` +
       `</body></html></richcontent>`);
@@ -212,14 +270,18 @@ export function toMarkdown(graph, options = {}) {
   out.push(`# 会话图谱 · ${rootLabel}`, '');
   out.push(`> 导出时间 ${options.stamp || stamp()} · 会话 ${graph.stats.sessions} 个 · 块 ${graph.stats.blocks} 个`);
   out.push('>');
-  out.push('> 每个块内用 **问** / **答** 两行区分用户提问与助手回答。', '');
+  out.push('> 每个块内用 **问** / **答** 两段区分用户提问与助手回答，正文按其原有 Markdown 结构缩进呈现。', '');
 
   function blockItem(block, depth) {
     const alias = block.alias ? `（${block.alias}）` : '';
-    out.push(`${ind(depth)}- **第 ${block.turn} 轮**${alias}`);
-    out.push(`${ind(depth + 1)}- **问**：${block.prompt}`);
-    out.push(`${ind(depth + 1)}- **答**：${block.response}`);
-    out.push(`${ind(depth + 1)}- *${block.sessionTitle} · ${block.toolCalls} 个工具 · ${block.deliverables} 个交付物*`);
+    out.push(`${ind(depth)}- **第 ${block.turn} 轮**${alias}`, '');
+    /* 正文以缩进块嵌入，而不是拼在 `- **问**：` 后面 ——
+       拼在后面会让表格、代码块、多段列表全塌成一行。 */
+    out.push(`${ind(depth + 1)}- **问**`, '');
+    out.push(indentBlock(block.prompt, (depth + 2) * 2), '');
+    out.push(`${ind(depth + 1)}- **答**`, '');
+    out.push(indentBlock(block.response, (depth + 2) * 2), '');
+    out.push(`${ind(depth + 1)}- *${block.sessionTitle} · ${block.toolCalls} 个工具 · ${block.deliverables} 个交付物*`, '');
     tree.childrenAt(block.sessionId, block.turn).forEach((s) => sessionItem(s, depth + 1, 'fork'));
     tree.refsAt(block.id).forEach((sid) =>
       sessionItem(graph.sessions.find((s) => s.id === sid), depth + 1, 'ref'));

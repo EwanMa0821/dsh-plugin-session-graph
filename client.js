@@ -35,12 +35,52 @@ const numOrNull = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 };
-/** 只压空白。用于**正文**（提问、回答、导出）：正文里出现 `<div>` 这类代码是常态，剥标签会吃掉内容。 */
+/** 压成单行：只用于**标题、别名**这类短标签。 */
 const squash = (v) => str(v).replace(/\s+/g, ' ').trim();
-/** 剥标记语言 + 压空白。只用于**标题、别名**这类单行短标签。 */
+/** 剥标记语言 + 压成单行。同样只用于标题、别名。 */
 const plain = (v) => squash(str(v).replace(/<[^>]*>/g, ''));
 
-/** 截断，超出补省略号 */
+/**
+ * 规整**正文**（提问、回答）。
+ *
+ * 关键在于**保留换行**：正文是 Markdown，表格、代码块、列表全靠换行成立。
+ * 早先对正文也用了 squash，把所有换行折成空格，于是详情面板里退化成一大段
+ * 裸露的 Markdown 源码，导出的表格也被压成了一行。
+ */
+const tidy = (v) => str(v)
+  .replace(/\r\n?/g, '\n')
+  .split('\n')
+  .map((line) => line.replace(/[ \t]+$/, ''))
+  .join('\n')
+  .replace(/\n{3,}/g, '\n\n')
+  /* 首尾整体去空白：首行若留着前导空格，Markdown 会把它当缩进代码块。
+     只去整体首尾，**不动**行内缩进 —— 那正是列表与代码块的结构。 */
+  .trim();
+
+/**
+ * 把 Markdown 摘要成一行可读文本 —— 给导出里的 `TEXT` 属性用。
+ * 画布上的摘要不用这个，客户端用宿主自己的 `extractMarkdownPlainText`。
+ */
+function summarize(v) {
+  return squash(str(v)
+    .replace(/\r\n?/g, '\n')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/~~~[\s\S]*?~~~/g, ' ')
+    .replace(/^\s*\|?[\s:|-]+\|[\s:|-]*$/gm, ' ')
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+    .replace(/^\s{0,3}>\s?/gm, '')
+    .replace(/^\s{0,3}(?:[-*+]|\d+[.)])\s+/gm, '')
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/(\*\*|__)(.*?)\1/g, '$2')
+    .replace(/(\*|_)(.*?)\1/g, '$2')
+    .replace(/~~(.*?)~~/g, '$1')
+    .replace(/^\s*([-*_])\1{2,}\s*$/gm, ' ')
+    .replace(/[|]/g, ' '));
+}
+
+/** 截断，超出补省略号。传入的应当已经是单行文本。 */
 function clip(v, n) {
   const s = squash(v);
   return s.length > n ? s.slice(0, n) + '…' : s;
@@ -99,8 +139,8 @@ function turnsFromTimeline(timeline) {
       turn,
       startSeq: numOrNull(rec.start && rec.start.seq) ?? numOrNull(rec.seq),
       endSeq,
-      prompt: squash(rec.prompt ?? rec.ask ?? rec.promptPreview),
-      response: squash(rec.response ?? rec.answer ?? rec.responsePreview),
+      prompt: tidy(rec.prompt ?? rec.ask ?? rec.promptPreview),
+      response: tidy(rec.response ?? rec.answer ?? rec.responsePreview),
       status: rec.status === 'failed' ? 'failed' : endSeq === null ? 'open' : 'done',
       toolCalls: Number(rec.toolCalls ?? rec.toolCallCount ?? 0) || 0,
       deliverables: Number(rec.deliverables ?? rec.deliverableCount ?? 0) || 0
@@ -255,8 +295,8 @@ function buildGraph(input) {
         turn: t.turn,
         startSeq: t.startSeq ?? null,
         endSeq: t.endSeq ?? null,
-        prompt: squash(t.prompt),
-        response: squash(t.response),
+        prompt: tidy(t.prompt),
+        response: tidy(t.response),
         status: t.status || (t.endSeq === null ? 'open' : 'done'),
         toolCalls: Number(t.toolCalls) || 0,
         deliverables: Number(t.deliverables) || 0,
@@ -535,7 +575,8 @@ function moveSelection(nodes, selectedId, key) {
  *   2. richcontent NOTE —— 大多数工具显示备注，作为保底
  *   3. TEXT 里的提问截断 —— 连备注都不显示的工具至少能看到提问
  *
- * `.md` 里同一个块是一个列表项，其下两行 `**问**：` / `**答**：`。
+ * `.md` 里同一个块是一个列表项，其下 `**问**` / `**答**` 两个子项，
+ * 正文以**缩进块**原样嵌入 —— 这样正文里的表格、代码块、列表才能正确渲染。
  */
 
 
@@ -547,6 +588,64 @@ const escXml = (v) => String(v === undefined || v === null ? '' : v)
   .replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;')
   .replace(/'/g, '&apos;');
+
+/**
+ * Markdown 行内标记 → FreeMind richcontent 认的 HTML。
+ *
+ * `.mm` 的 richcontent 是 **HTML**，不是 Markdown。不转换的话，思维导图里会
+ * 原样显示 `**DSH**`、`| 层 | 依赖 |` 这些源码。先转义再做替换，顺序不能反。
+ */
+function inlineHtml(text) {
+  return escXml(text)
+    .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
+    .replace(/__([^_\n]+)__/g, '<b>$1</b>')
+    .replace(/\*([^*\n]+)\*/g, '<i>$1</i>')
+    .replace(/~~([^~\n]+)~~/g, '<s>$1</s>')
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, '<a href="$2">$1</a>');
+}
+
+/** 表格分隔行（`|---|---|`）在思维导图里只是噪声，丢掉 */
+const isTableRule = (line) => /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(line) && line.includes('-');
+
+/**
+ * 把一段 Markdown 正文逐行转成 `<p>`，首行带标签（如「问」）。
+ *
+ * 空行与表格分隔行跳过（空 `<p>` 在多数思维导图软件里会渲染成一行空白）；
+ * 围栏代码换成等宽段落并丢掉 ``` 标记 —— 在导图里那三个反引号只是噪声，
+ * 且围栏内不能再套行内标记，否则代码里的 `**` 会被吃掉。
+ */
+function paragraphs(text, label) {
+  const out = [];
+  let emitted = 0;
+  const push = (html) => {
+    const head = emitted === 0 ? `<b>${escXml(label)}</b>　` : '';
+    emitted += 1;
+    out.push(`<p>${head}${html}</p>`);
+  };
+
+  let fenced = false;
+  tidy(text).split('\n').forEach((raw) => {
+    const line = raw.trim();
+    if (/^(?:```|~~~)/.test(line)) { fenced = !fenced; return; }
+    if (fenced) {
+      if (line !== '') push(`<font face="Courier New, monospace">${escXml(raw.replace(/\s+$/, ''))}</font>`);
+      return;
+    }
+    if (line === '' || isTableRule(line)) return;
+    const heading = /^#{1,6}\s+(.*)$/.exec(line);
+    push(heading ? `<b>${inlineHtml(heading[1])}</b>` : inlineHtml(line.replace(/^>\s?/, '')));
+  });
+
+  if (emitted === 0) out.push(`<p><b>${escXml(label)}</b></p>`);   /* 正文为空也要留一格 */
+  return out.join('');
+}
+
+/** 把多行文本整体缩进 n 个空格，供 Markdown 列表项内部嵌入块内容 */
+function indentBlock(text, n) {
+  const pad = ' '.repeat(n);
+  return tidy(text).split('\n').map((line) => (line === '' ? '' : pad + line)).join('\n');
+}
 
 /** 时间戳，`YYYY-MM-DD HH:mm` */
 function stamp(at) {
@@ -645,18 +744,17 @@ function toFreeMind(graph, options = {}) {
   function blockNode(block, depth) {
     const title = block.alias
       ? `✎ ${block.alias}`
-      : `第 ${block.turn} 轮 · ${clip(block.prompt, 24)}`;
+      : `第 ${block.turn} 轮 · ${clip(summarize(block.prompt), 24)}`;
     const bg = block.current ? ' BACKGROUND_COLOR="#e4edfd"' : '';
     out.push(`${pad(depth)}<node TEXT="${escXml(title)}" ID="${idOf(block.id)}"${bg}>`);
-    /* 第 1 层：节点富文本里「问」「答」两段 */
+    /* 第 1 层：节点富文本里「问」「答」两段。
+       正文是 Markdown，**逐行**成段，别把整段塞进一个 <p> —— 那样换行全丢。 */
     out.push(`${pad(depth + 1)}<richcontent TYPE="NODE"><html><body>` +
-      `<p><b>问</b>　${escXml(block.prompt)}</p>` +
-      `<p><b>答</b>　${escXml(block.response)}</p>` +
+      paragraphs(block.prompt, '问') + paragraphs(block.response, '答') +
       `</body></html></richcontent>`);
     /* 第 2 层：备注里的全文与元信息 */
     out.push(`${pad(depth + 1)}<richcontent TYPE="NOTE"><html><body>` +
-      `<p>问：${escXml(block.prompt)}</p>` +
-      `<p>答：${escXml(block.response)}</p>` +
+      paragraphs(block.prompt, '问：') + paragraphs(block.response, '答：') +
       `<p>元信息：${escXml(block.sessionTitle)} · 第 ${block.turn} 轮 · ` +
       `${block.toolCalls} 个工具 · ${block.deliverables} 个交付物</p>` +
       `</body></html></richcontent>`);
@@ -737,14 +835,18 @@ function toMarkdown(graph, options = {}) {
   out.push(`# 会话图谱 · ${rootLabel}`, '');
   out.push(`> 导出时间 ${options.stamp || stamp()} · 会话 ${graph.stats.sessions} 个 · 块 ${graph.stats.blocks} 个`);
   out.push('>');
-  out.push('> 每个块内用 **问** / **答** 两行区分用户提问与助手回答。', '');
+  out.push('> 每个块内用 **问** / **答** 两段区分用户提问与助手回答，正文按其原有 Markdown 结构缩进呈现。', '');
 
   function blockItem(block, depth) {
     const alias = block.alias ? `（${block.alias}）` : '';
-    out.push(`${ind(depth)}- **第 ${block.turn} 轮**${alias}`);
-    out.push(`${ind(depth + 1)}- **问**：${block.prompt}`);
-    out.push(`${ind(depth + 1)}- **答**：${block.response}`);
-    out.push(`${ind(depth + 1)}- *${block.sessionTitle} · ${block.toolCalls} 个工具 · ${block.deliverables} 个交付物*`);
+    out.push(`${ind(depth)}- **第 ${block.turn} 轮**${alias}`, '');
+    /* 正文以缩进块嵌入，而不是拼在 `- **问**：` 后面 ——
+       拼在后面会让表格、代码块、多段列表全塌成一行。 */
+    out.push(`${ind(depth + 1)}- **问**`, '');
+    out.push(indentBlock(block.prompt, (depth + 2) * 2), '');
+    out.push(`${ind(depth + 1)}- **答**`, '');
+    out.push(indentBlock(block.response, (depth + 2) * 2), '');
+    out.push(`${ind(depth + 1)}- *${block.sessionTitle} · ${block.toolCalls} 个工具 · ${block.deliverables} 个交付物*`, '');
     tree.childrenAt(block.sessionId, block.turn).forEach((s) => sessionItem(s, depth + 1, 'fork'));
     tree.refsAt(block.id).forEach((sid) =>
       sessionItem(graph.sessions.find((s) => s.id === sid), depth + 1, 'ref'));
@@ -796,13 +898,56 @@ function render(graph, format, options = {}) {
    运行在 __ModuleLoader__ 的 factory 作用域里，因此可以直接使用
    上面已经内联的核心函数（buildGraph / layout / render ...）。
 
-   约束（NFR-2）：只用 --dsw-* 主题变量；不 import 任何宿主客户端包；
-   不向 document.body 追加；样式以 React 元素渲染，随组件卸载移除。
+   约束（NFR-2）：只用 --dsw-* 主题变量；除 react 与宿主的 primitives 基础件外
+   不 require 别的包；不向 document.body 追加；样式以 React 元素渲染，随组件卸载移除。
    ============================================================ */
 
 const NS = 'dsh-plugin-session-graph';
 const TARGET = 'session-graph';
 const VIEW_ORDER = 20;
+
+/* 宿主的 UI 基础件是**基线模块**：`dsh-client-ui-conversation` 自己也这样直接 require，
+   没有任何客户端插件把它写进 dsh.client.external。直接用它渲染 Markdown，
+   与产品其余部分的排版完全一致，也不必自己造一套解析器。 */
+const primitives = require('@deepseek-ai/dsh-client-ui-primitives');
+/* 取不到就退化成纯文本：宁可排版朴素，也不能因为一个导出缺失让整个视图崩掉 */
+const MarkdownText = (primitives && primitives.MarkdownText) || null;
+const extractMarkdownPlainText = (primitives && primitives.extractMarkdownPlainText) || null;
+
+/** MarkdownText 要求一整份界面文案；键就这 6 个 */
+const MD_LABELS = {
+  code: {
+    copyLabel: '复制',
+    copiedLabel: '已复制',
+    toolbarLabels: { codeLabel: '代码', wrapLabel: '自动换行', unwrapLabel: '不换行' }
+  },
+  footnotes: '脚注'
+};
+
+/** 正文渲染：优先用宿主的渲染器，缺失时退回纯文本 */
+function markdownBlock(text, key) {
+  if (!MarkdownText) return h('div', { key, className: 'sg-tx' }, text);
+  return h('div', { key, className: 'sg-md' },
+    h(MarkdownText, { text, labels: MD_LABELS, variant: 'compact' }));
+}
+
+/**
+ * 摘要成单行：优先用宿主自己的 Markdown 抽取（与产品一致），
+ * 拿不到时退回核心模块里的正则实现。
+ */
+function digest(text, mode) {
+  const src = String(text === undefined || text === null ? '' : text);
+  if (src.trim() === '') return '';
+  let plainText = '';
+  if (extractMarkdownPlainText) {
+    try {
+      plainText = extractMarkdownPlainText(src, { mode: mode || 'first-line' });
+    } catch {
+      plainText = '';
+    }
+  }
+  return squash(plainText || summarize(src));
+}
 
 const CSS = `
 .sg-root{position:absolute;inset:0;display:flex;font-family:inherit;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-base);user-select:none;-webkit-user-select:none}
@@ -873,6 +1018,14 @@ const CSS = `
   margin-bottom:6px}
 .sg-sec .sg-tx{font-size:12.5px;line-height:1.6;color:var(--dsw-alias-label-secondary);word-break:break-word}
 .sg-sec .sg-tx.sg-strong{color:var(--dsw-alias-label-primary)}
+/* 宿主 markdown 渲染器的容器：面板只有 330px，宽内容要能横向滚而不是撑破布局 */
+.sg-md{font-size:12.5px}
+.sg-md>div{font-size:12.5px}
+.sg-md table{display:block;width:max-content;max-width:100%;overflow-x:auto;font-size:11.5px}
+.sg-md pre{max-width:100%;overflow-x:auto}
+.sg-md img,.sg-md svg{max-width:100%;height:auto}
+.sg-md>*:first-child{margin-top:0}
+.sg-md>*:last-child{margin-bottom:0}
 .sg-meta{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-size:12px}
 .sg-meta .sg-k{color:var(--dsw-alias-label-caption)}
 .sg-meta .sg-v{color:var(--dsw-alias-label-secondary);text-align:right}
@@ -1318,8 +1471,8 @@ function GraphView(props) {
       h('span', { className: 'sg-dot' + (b.status === 'open' ? ' sg-open' : b.status === 'failed' ? ' sg-failed' : '') }),
       h('span', { className: 'sg-sp' }),
       badges),
-    h('div', { className: 'sg-ask' }, b.alias ? '✎ ' + b.alias : (b.prompt || '第 ' + b.turn + ' 轮')),
-    h('div', { className: 'sg-ans' }, b.response || '（该轮回答尚未载入）'));
+    h('div', { className: 'sg-ask' }, b.alias ? '✎ ' + b.alias : (clip(digest(b.prompt), 110) || '第 ' + b.turn + ' 轮')),
+    h('div', { className: 'sg-ans' }, clip(digest(b.response, 'first-paragraph'), 220) || '（该轮回答尚未载入）'));
   });
 
   const edges = (graph.error ? [] : graph.edges).map((e) => {
@@ -1366,10 +1519,10 @@ function GraphView(props) {
       h('div', { key: 'bd', className: 'sg-side-bd' },
         h('div', { className: 'sg-sec' },
           h('div', { className: 'sg-lb' }, '提问'),
-          h('div', { className: 'sg-tx sg-strong' }, b.prompt || '（未载入）')),
+          b.prompt ? markdownBlock(b.prompt, 'q') : h('div', { className: 'sg-tx' }, '（未载入）')),
         h('div', { className: 'sg-sec' },
           h('div', { className: 'sg-lb' }, '回答'),
-          h('div', { className: 'sg-tx' }, b.response || '（未载入）')),
+          b.response ? markdownBlock(b.response, 'a') : h('div', { className: 'sg-tx' }, '（未载入）')),
         h('div', { className: 'sg-sec' },
           h('div', { className: 'sg-lb' }, '元信息'),
           h('div', { className: 'sg-meta' },

@@ -93,6 +93,12 @@
 | 别名 | `TEXT` 前置 `✎ `，轮次后括号标注 |
 | 隐藏块 | 按选项跳过，跳过数量写进根备注 |
 
+**正文按其原有 Markdown 结构嵌入**，不会被压成一行：
+
+- `.md` 里正文是一个**缩进块**，所以表格、代码围栏、有序列表都能正确渲染
+- `.mm` 的 richcontent 是 **HTML 而不是 Markdown**，所以行内标记会转成 `<b>` / `<code>` / `<a>`，
+  表格分隔行与 ``` 围栏标记被丢掉，**围栏内的内容原样保留**（代码里的 `a ** b` 不会被误吃）
+
 ---
 
 ## 工作原理
@@ -107,6 +113,10 @@
 
 **客户端半**（`client.js`）向 `conversation.view` 槽位注册「图谱」视图，另外注册一个视图数据层，
 把装配器的轮次时间线折成快照。
+
+正文一律按 **Markdown** 处理：详情面板直接用宿主的 `MarkdownText` 渲染，与产品其余部分排版一致；
+画布上的一行摘要用 `extractMarkdownPlainText` 抽成纯文本。正文在数据层**保留换行**——
+表格、代码块、列表全靠它成立，压成一行就全塌了。
 
 `src/` 是唯一真源，分成三层：
 
@@ -132,7 +142,7 @@ src/client/app.js    客户端应用
 ## 开发
 
 ```bash
-node scripts/run-tests.mjs      # 94 项测试，在同一进程内运行
+node scripts/run-tests.mjs      # 101 项测试，在同一进程内运行
 node scripts/check-package.mjs  # 清单、图标、patch、产物是否过期
 node scripts/build-client.mjs   # 改过 src/ 之后必须跑
 ```
@@ -163,7 +173,8 @@ node scripts/build-client.mjs   # 改过 src/ 之后必须跑
 | 客户端分叉 | `ctx.sessions.fork({sessionId, atSeq, increaseTitle})`；失败抛 `SessionForkError` |
 | Fetch 路由 | `ctx.connection.fetch.register({path, methods, requestBody, fetch})` |
 | 下载 | `document.createElement('a')` → 设 `href` → **不挂到 `document.body`** 直接 `click()` |
-| 主题 | 只用 `--dsw-alias-*` 变量；不 import 任何 `@deepseek-ai/dsh-client-ui-*` 包 |
+| 客户端 UI 基础件 | `@deepseek-ai/dsh-client-ui-primitives` 是**基线模块**，客户端产物可直接 `require`（`dsh-client-ui-conversation` 自己也这么干，且没有插件把它写进 `dsh.client.external`）。`MarkdownText` 的 props 是 `{text, labels, variant, streaming}`，**`labels` 必给**，否则内部读属性会炸；键只有 6 个。`extractMarkdownPlainText(text, {mode})` 支持 `all` / `first-line` / `first-paragraph` |
+| 主题 | 只用 `--dsw-alias-*` 变量；除 `react` 与上面那个基础件外不 require 任何宿主包 |
 
 ### 三个会让插件静默失效的坑
 

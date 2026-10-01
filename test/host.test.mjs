@@ -195,10 +195,17 @@ test('isHumanTurn 容忍缺字段，但拒绝显式的非人类来源', () => {
 test('textOf 支持字符串、text 字段与内容块数组', () => {
   assert.equal(textOf('  直接文本 '), '直接文本');
   assert.equal(textOf({ text: '甲' }), '甲');
-  assert.equal(textOf({ content: [{ text: '甲' }, { text: '乙' }] }), '甲 乙');
+  /* 文本块之间留空行：它们本是不同段落，压成一行会毁掉 Markdown 结构 */
+  assert.equal(textOf({ content: [{ text: '甲' }, { text: '乙' }] }), '甲\n\n乙');
   assert.equal(textOf({ message: { content: [{ text: '嵌套' }] } }), '嵌套');
   assert.equal(textOf({ content: { nothing: 1 } }), '');
   assert.equal(textOf(null), '');
+});
+
+test('textOf 保留正文换行（Markdown 的表格与代码块全靠它）', () => {
+  const md = '结论：\n\n| 层 | 依赖 |\n|---|---|\n| L1 | 视图位 |\n\n```js\nconst x = 1;\n```';
+  assert.equal(textOf({ content: [{ type: 'text', text: md }] }), md);
+  assert.equal(textOf(md), md);
 });
 
 /* ------------------------------------------------------- 分叉源推导 */
@@ -305,7 +312,10 @@ test('buildPayload(format=md) 产出 Markdown 大纲', async () => {
   const out = await buildPayload(fakeCtx(), params({ sessionId: 'root', format: 'md' }), {});
   assert.match(out.filename, /\.md$/);
   assert.match(out.body, /^# 会话图谱/);
-  assert.match(out.body, /- \*\*问\*\*：/);
+  assert.match(out.body, /- \*\*问\*\*/);
+  assert.match(out.body, /- \*\*答\*\*/);
+  /* 正文以缩进块跟在标签后面，而不是拼在同一行 */
+  assert.ok(/ {2}- \*\*问\*\*\n\n {4}Q1/m.test(out.body), '「问」下面跟的是缩进正文块');
 });
 
 test('buildPayload 尊重 includeHidden', async () => {

@@ -28,12 +28,52 @@ const numOrNull = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 };
-/** 只压空白。用于**正文**（提问、回答、导出）：正文里出现 `<div>` 这类代码是常态，剥标签会吃掉内容。 */
+/** 压成单行：只用于**标题、别名**这类短标签。 */
 export const squash = (v) => str(v).replace(/\s+/g, ' ').trim();
-/** 剥标记语言 + 压空白。只用于**标题、别名**这类单行短标签。 */
+/** 剥标记语言 + 压成单行。同样只用于标题、别名。 */
 export const plain = (v) => squash(str(v).replace(/<[^>]*>/g, ''));
 
-/** 截断，超出补省略号 */
+/**
+ * 规整**正文**（提问、回答）。
+ *
+ * 关键在于**保留换行**：正文是 Markdown，表格、代码块、列表全靠换行成立。
+ * 早先对正文也用了 squash，把所有换行折成空格，于是详情面板里退化成一大段
+ * 裸露的 Markdown 源码，导出的表格也被压成了一行。
+ */
+export const tidy = (v) => str(v)
+  .replace(/\r\n?/g, '\n')
+  .split('\n')
+  .map((line) => line.replace(/[ \t]+$/, ''))
+  .join('\n')
+  .replace(/\n{3,}/g, '\n\n')
+  /* 首尾整体去空白：首行若留着前导空格，Markdown 会把它当缩进代码块。
+     只去整体首尾，**不动**行内缩进 —— 那正是列表与代码块的结构。 */
+  .trim();
+
+/**
+ * 把 Markdown 摘要成一行可读文本 —— 给导出里的 `TEXT` 属性用。
+ * 画布上的摘要不用这个，客户端用宿主自己的 `extractMarkdownPlainText`。
+ */
+export function summarize(v) {
+  return squash(str(v)
+    .replace(/\r\n?/g, '\n')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/~~~[\s\S]*?~~~/g, ' ')
+    .replace(/^\s*\|?[\s:|-]+\|[\s:|-]*$/gm, ' ')
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+    .replace(/^\s{0,3}>\s?/gm, '')
+    .replace(/^\s{0,3}(?:[-*+]|\d+[.)])\s+/gm, '')
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/(\*\*|__)(.*?)\1/g, '$2')
+    .replace(/(\*|_)(.*?)\1/g, '$2')
+    .replace(/~~(.*?)~~/g, '$1')
+    .replace(/^\s*([-*_])\1{2,}\s*$/gm, ' ')
+    .replace(/[|]/g, ' '));
+}
+
+/** 截断，超出补省略号。传入的应当已经是单行文本。 */
 export function clip(v, n) {
   const s = squash(v);
   return s.length > n ? s.slice(0, n) + '…' : s;
@@ -92,8 +132,8 @@ export function turnsFromTimeline(timeline) {
       turn,
       startSeq: numOrNull(rec.start && rec.start.seq) ?? numOrNull(rec.seq),
       endSeq,
-      prompt: squash(rec.prompt ?? rec.ask ?? rec.promptPreview),
-      response: squash(rec.response ?? rec.answer ?? rec.responsePreview),
+      prompt: tidy(rec.prompt ?? rec.ask ?? rec.promptPreview),
+      response: tidy(rec.response ?? rec.answer ?? rec.responsePreview),
       status: rec.status === 'failed' ? 'failed' : endSeq === null ? 'open' : 'done',
       toolCalls: Number(rec.toolCalls ?? rec.toolCallCount ?? 0) || 0,
       deliverables: Number(rec.deliverables ?? rec.deliverableCount ?? 0) || 0
@@ -248,8 +288,8 @@ export function buildGraph(input) {
         turn: t.turn,
         startSeq: t.startSeq ?? null,
         endSeq: t.endSeq ?? null,
-        prompt: squash(t.prompt),
-        response: squash(t.response),
+        prompt: tidy(t.prompt),
+        response: tidy(t.response),
         status: t.status || (t.endSeq === null ? 'open' : 'done'),
         toolCalls: Number(t.toolCalls) || 0,
         deliverables: Number(t.deliverables) || 0,

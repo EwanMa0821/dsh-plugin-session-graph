@@ -64,6 +64,12 @@ function render(component, props) {
   pass += 1;
   return tree;
 }
+/** 丢弃全部 hook 状态：需要一个"刚挂载"的干净组件时用 */
+function resetComponent() {
+  slots = [];
+  cursor = 0;
+  pass = 0;
+}
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
 /* ------------------------------------------------------- 装载产物 */
@@ -76,9 +82,28 @@ test('client.js 以正确的 id 与形状注册进 __ModuleLoader__', () => {
   assert.equal(typeof registered[0].factory, 'function');
 });
 
+/* 宿主 UI 基础件的最小替身。只保留插件真正用到的两个导出。 */
+function fakeExtractMarkdownPlainText(markdown, options = {}) {
+  const text = String(markdown === undefined || markdown === null ? '' : markdown).replace(/\r\n?/g, '\n');
+  const strip = (s) => s.replace(/[*_`#>|]/g, ' ').replace(/\s+/g, ' ').trim();
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (options.mode === 'first-line') return strip(lines[0] || '');
+  if (options.mode === 'first-paragraph') {
+    const para = text.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean)[0] || '';
+    return strip(para);
+  }
+  return strip(text);
+}
+
+/* 组件不在这里渲染：待测组件把它当元素产出，测试直接断言它的 props。 */
+function MarkdownText() { return null; }
+
+const primitivesStub = { MarkdownText, extractMarkdownPlainText: fakeExtractMarkdownPlainText };
+
 const api = registered[0].factory((name) => {
   if (name === 'react') return React;
-  throw new Error('客户端半不允许 import 宿主包：' + name);
+  if (name === '@deepseek-ai/dsh-client-ui-primitives') return primitivesStub;
+  throw new Error('客户端半只允许 react 与宿主 primitives，收到：' + name);
 });
 
 test('factory 返回 { inject, apply }', () => {
@@ -103,10 +128,29 @@ const turnsOf = (prefix, n) => Array.from({ length: n }, (_, i) => ({
 }));
 
 /* Host 侧取回的家族轮次 */
+/** 3 轮，其中第 2 轮是 Markdown 富文本（表格 + 代码块），用来验证渲染与摘要 */
+const MARKDOWN_ANSWER = [
+  '结论如下：',
+  '',
+  '| 层 | 依赖什么 |',
+  '|---|---|',
+  '| L1 | 自定义视图渲染位 |',
+  '| L2 | 读会话 + 分叉 |',
+  '',
+  '```js',
+  'const x = 1;',
+  '```',
+  '',
+  '推荐 **L3 导出** 作为起点。'
+].join('\n');
+
 const REMOTE_TURNS = {
   root: turnsOf('远程根会话', 5),
   ancor: turnsOf('锚定', 3),
-  invest: turnsOf('投资', 2)
+  invest: [
+    { ...turnsOf('投资', 2)[0] },
+    { ...turnsOf('投资', 2)[1], prompt: '第 2 问有 **加粗** 与 `行内代码`', response: MARKDOWN_ANSWER }
+  ]
 };
 
 /* 本地装配器提供的当前会话时间线：只有已载入的两轮，其中第二轮进行中 */
@@ -345,4 +389,56 @@ test('右键不进入拖拽状态，也不拦默认行为', () => {
     preventDefault: () => { prevented += 1; }
   });
   assert.equal(prevented, 0);
+});
+
+/* ------------------------------------------------- markdown 渲染与摘要 */
+
+test('块摘要是干净的纯文本，不残留 markdown 标记', () => {
+  const tree = render(ctx.slots.Component, props);
+  const nodes = elements(tree);
+  /* data-sg-node 挂在外层块上，摘要文本是它的子节点 */
+  const block = nodes.find((n) => n.props && n.props['data-sg-node'] === 'invest:2');
+  assert.ok(block, '找得到那一块');
+  const ask = (block.props.children || []).flat(Infinity)
+    .find((c) => c && typeof c === 'object' && typeof c.props?.className === 'string'
+      && c.props.className.includes('sg-ask'));
+  assert.ok(ask, '块里有摘要行');
+  assert.equal(ask.props.children, '第 2 问有 加粗 与 行内代码', '** 与 ` 都被摘掉');
+  assert.ok(!/\*\*|`/.test(String(ask.props.children)));
+});
+
+test('详情面板用宿主的 MarkdownText 渲染全文，且原文换行完整传下去', async () => {
+  render(ctx.slots.Component, props);
+  await tick();
+  const tree = render(ctx.slots.Component, props);
+
+  /* 先选中 invest:2 那块 */
+  const wrap = elements(tree).find((n) => typeof n.props.className === 'string'
+    && n.props.className.includes('sg-canvas-wrap'));
+  const blockEl = { getAttribute: () => 'invest:2' };
+  wrap.props.onMouseDown({
+    button: 0, clientX: 1, clientY: 1,
+    target: { closest: (sel) => (sel === '[data-sg-node]' ? blockEl : null) },
+    preventDefault: () => {}
+  });
+  const after = render(ctx.slots.Component, props);
+
+  const mds = elements(after).filter((n) => n.type === MarkdownText);
+  assert.equal(mds.length, 2, '提问与回答各一个 MarkdownText');
+
+  const answer = mds.map((n) => String(n.props.text)).find((t) => t.includes('| 层 |'));
+  assert.ok(answer, '回答用 MarkdownText 渲染');
+  assert.equal(answer, MARKDOWN_ANSWER, '原文逐字传下去 —— 换行与表格不能在这层被压平');
+  assert.ok(answer.includes('```js'), '代码围栏保留');
+  assert.equal(mds[0].props.variant, 'compact', '窄面板用紧凑排版');
+  assert.ok(mds[0].props.labels && mds[0].props.labels.code, 'labels 必须给，否则宿主组件内部读属性会炸');
+  assert.equal(mds[0].props.labels.code.copyLabel, '复制');
+});
+
+test('未选中任何块时，画布上不产生富文本开销', () => {
+  resetComponent();
+  const tree = render(ctx.slots.Component, props);
+  assert.ok(elements(tree).some((n) => n.props && n.props['data-sg-node']), '块照常画出来');
+  assert.equal(elements(tree).filter((n) => n.type === MarkdownText).length, 0,
+    '没有选中项时不该渲染 MarkdownText');
 });
