@@ -1961,6 +1961,24 @@ test('sessions= 只报家族内的会话：家族外的会话不该进请求（�
    回归：这一批是"装完插件整个界面坏掉"以及若干静默失效的直接原因
    ============================================================================ */
 
+test('视图组件外面有兜底：渲染抛错时给出可读的错误卡片，而不是白屏', () => {
+  /* 宿主用 renderSlot(..., { only: viewId }) 把 active view 挂进对话根，
+     组件一抛错整片视图区就是纯白 —— 标签照常显示，看起来"只是没内容"，
+     现场找不到任何线索。这层外壳必须把异常兜成一张卡片。 */
+  const safe = ctx.slots.Component;
+  assert.equal(typeof safe, 'function');
+  /* 触发器要选**组件体内确实没有守卫**的那条路：resolveSessionId 会去问
+     props.sessions.current()，它抛错时异常会冒出组件体 —— 正是宿主里那种"白屏"路径。 */
+  const boom = {
+    sessionId: '',
+    ctx: {},
+    sessions: { list: { getSnapshot: () => ({ byId: {} }), subscribe: () => () => {} }, current() { throw new Error('boom-current'); } }
+  };
+  let tree;
+  assert.doesNotThrow(() => { tree = safe(boom); }, '外壳必须吞掉渲染异常');
+  assert.ok(JSON.stringify(tree).includes('会话图谱渲染失败'), '给出兜底卡片');
+});
+
 /* 宿主取视图标签时**直接调用**这个 thunk（ui-slots 的 resolveSlotLabel 是
    `typeof label === 'function' ? label() : label`，没有任何兜底），
    而且调用时机与组件无关：注册槽位、**切换会话**（activateView 里又取一次 viewTabs）、

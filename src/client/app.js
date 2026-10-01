@@ -442,16 +442,22 @@ function GraphView(props) {
 
   const graphSnapshot = useSource(target);
 
-  /* 视口尺寸：跟随容器，切换视图后回来仍正确 */
+  /* 视口尺寸：跟随容器，切换视图后回来仍正确。
+     effect 里抛出的异常**不会**被渲染兜底捕获 —— React 会直接把组件卸掉，
+     界面又变回白屏。所以这里的每一段 DOM 副作用都自己吞异常。 */
   React.useEffect(() => {
-    const el = hostRef.current;
-    if (!el || typeof ResizeObserver === 'undefined') return undefined;
-    const ro = new ResizeObserver(() => {
+    try {
+      const el = hostRef.current;
+      if (!el || typeof ResizeObserver === 'undefined') return undefined;
+      const ro = new ResizeObserver(() => {
+        setSize({ w: el.clientWidth || 900, h: el.clientHeight || 600 });
+      });
+      ro.observe(el);
       setSize({ w: el.clientWidth || 900, h: el.clientHeight || 600 });
-    });
-    ro.observe(el);
-    setSize({ w: el.clientWidth || 900, h: el.clientHeight || 600 });
-    return () => ro.disconnect();
+      return () => ro.disconnect();
+    } catch {
+      return undefined;                    /* 量不到尺寸就用默认视口，视图照常画 */
+    }
   }, []);
 
   /* React 把 onWheel 注册成**被动**监听（facebook/react#19654），
@@ -459,13 +465,17 @@ function GraphView(props) {
      一边把外层容器滚走。这里补一个非被动的原生监听，只负责掐掉默认滚动；
      缩放逻辑仍由 React 的 onWheel 做，两处不重复执行缩放。 */
   React.useEffect(() => {
-    const el = hostRef.current;
-    if (!el || typeof el.addEventListener !== 'function') return undefined;
-    const stopScroll = (ev) => { if (typeof ev.preventDefault === 'function') ev.preventDefault(); };
-    el.addEventListener('wheel', stopScroll, { passive: false });
-    return () => {
-      if (typeof el.removeEventListener === 'function') el.removeEventListener('wheel', stopScroll);
-    };
+    try {
+      const el = hostRef.current;
+      if (!el || typeof el.addEventListener !== 'function') return undefined;
+      const stopScroll = (ev) => { if (typeof ev.preventDefault === 'function') ev.preventDefault(); };
+      el.addEventListener('wheel', stopScroll, { passive: false });
+      return () => {
+        if (typeof el.removeEventListener === 'function') el.removeEventListener('wheel', stopScroll);
+      };
+    } catch {
+      return undefined;                    /* 挂不上就退回 React 的被动监听，不因此白屏 */
+    }
   }, []);
 
   /* 每次数据变化重建图模型。
@@ -535,7 +545,18 @@ function GraphView(props) {
         + (fullIds.length ? '&full=' + encodeURIComponent(fullIds.slice(-400).join(',')) : '');
     const carrier = typeof fetch === 'function' ? fetch : null;
     if (!carrier) { setRouteOk(false); setLoaded(true); return undefined; }
-    carrier(url, { credentials: 'same-origin' })
+    /* `fetch` 本身也可能**同步**抛（URL 构造失败、被策略拦住等）。effect 里同步抛出
+       不会被渲染兜底接住，React 会把组件整个卸掉 —— 又是白屏。所以整段套一层。 */
+    let pending;
+    try {
+      pending = carrier(url, { credentials: 'same-origin' });
+    } catch {
+      setRouteOk(false);
+      loadedRef.current = true;
+      setLoaded(true);
+      return undefined;
+    }
+    pending
       .then((r) => {
         if (!alive) return null;
         setRouteOk(!!(r && r.ok));
@@ -1866,6 +1887,31 @@ function GraphView(props) {
   }
 }
 
+/**
+ * 视图组件的兜底外壳。
+ *
+ * 宿主用 `renderSlot("conversation.view", props, { only: viewId })` 把 active view
+ * 挂进对话根里，**组件一抛错，整片视图区就是纯白**：既看不到原因，也分不清是插件坏了
+ * 还是宿主坏了（标签是另一个纯 thunk，所以照常显示 —— 界面看起来"只是没内容"）。
+ *
+ * 这里包一层 try/catch，把白屏换成一张**写明错误的卡片**，同时打 console.error。
+ * 钩子仍然在 GraphView 内部按固定顺序执行，外壳只是调用它，不改变钩子语义。
+ */
+function SafeGraphView(props) {
+  try {
+    return GraphView(props);
+  } catch (error) {
+    try { console.error('[session-graph] 视图渲染失败：', error); } catch { /* 控制台不可用 */ }
+    return h('div', { className: 'sg-root' },
+      h('style', null, CSS),
+      h('div', { className: 'sg-state sg-state-err' },
+        h('div', { className: 'sg-state-t' }, '会话图谱渲染失败'),
+        h('div', { className: 'sg-state-d' }, '这是插件的兜底界面；把下面这段发给我即可定位：'),
+        h('div', { className: 'sg-state-code' },
+          String((error && (error.stack || error.message)) || error).slice(0, 1500))));
+  }
+}
+
 /* ------------------------------------------------------------ 插件入口 */
 
 function apply(ctx) {
@@ -1914,7 +1960,7 @@ function apply(ctx) {
       }
       return { sessionId, ctx, target, sessions: ctx.sessions };
     }
-  }, GraphView));
+  }, SafeGraphView));
 }
 
 /* 服务依赖。**只列真正必需、且产品自身的视图插件也依赖的服务**：
