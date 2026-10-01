@@ -11,6 +11,9 @@
  * 版本演进照 §5.3：`version` 必填；**未知版本拒绝应用并明说不兼容，不猜测性解析**。
  */
 
+/* id 的约定归 model 管（blockId / emptyId / idToRef / refToId），这里只引用 */
+import { idToRef, refToId } from './model.js';
+
 export const STATE_VERSION = 1;
 
 /** NFR-1：超限就截断，避免一条癫狂的记录把界面拖死 */
@@ -42,29 +45,8 @@ export function emptyState(now = 0) {
 
 /* --------------------------------------------------------- id ↔ Ref */
 
-/** `sessionId:turn` / `header:sessionId` / `sessionId:empty` → Ref */
-export function idToRef(id) {
-  const s = sxStr(id);
-  if (s === '') return null;
-  const cut = s.indexOf(':');
-  if (cut <= 0) return null;
-  const head = s.slice(0, cut);
-  const tail = s.slice(cut + 1);
-  if (head === 'header') return { sessionId: tail };
-  if (tail === 'empty') return { sessionId: head };
-  const turn = Number(tail);
-  return Number.isInteger(turn) && turn > 0 ? { sessionId: head, turn } : null;
-}
-
-/** Ref → 客户端内部 id；认不出来返回空串 */
-export function refToId(ref) {
-  if (!sxIsObject(ref)) return '';
-  const sessionId = sxStr(ref.sessionId);
-  if (sessionId === '') return '';
-  if (ref.turn === undefined || ref.turn === null) return `header:${sessionId}`;
-  const turn = Number(ref.turn);
-  return Number.isInteger(turn) && turn > 0 ? `${sessionId}:${turn}` : '';
-}
+/* 实现在 model.js（id 约定归它管）。这里重导出，调用方不必关心住在哪。 */
+export { idToRef, refToId };
 
 /* ------------------------------------------------------------ 规整 */
 
@@ -73,7 +55,8 @@ const sxUniq = (raw, limit) =>
   [...new Set((Array.isArray(raw) ? raw : []).map(sxStr).filter(Boolean))].slice(0, limit);
 
 /** 干净的初始状态 */
-function sxCapObject(raw, limit, mapValue) {  const out = {};
+function sxCapObject(raw, limit, mapValue) {
+  const out = {};
   if (!sxIsObject(raw)) return out;
   let n = 0;
   for (const [k, v] of Object.entries(raw)) {

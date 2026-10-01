@@ -27,6 +27,35 @@ const blockId = (sessionId, turn) => `${sessionId}:${turn}`;
 /** 空子会话占位节点的 id（FR-8：子会话尚无自有轮次时的终点） */
 const emptyId = (sessionId) => `${sessionId}:empty`;
 
+/**
+ * 块 id ↔ 持久形态的 Ref（§5.2）。
+ *
+ * id 的约定归 model 管（`blockId` / `emptyId` 也在这里），
+ * 所以解析也放这里 —— 持久层只是引用它，不该各写一份。
+ */
+function idToRef(id) {
+  const s = String(id === undefined || id === null ? '' : id);
+  if (s === '') return null;
+  const cut = s.indexOf(':');
+  if (cut <= 0) return null;
+  const head = s.slice(0, cut);
+  const tail = s.slice(cut + 1);
+  if (head === 'header') return { sessionId: tail };
+  if (tail === 'empty') return { sessionId: head };
+  const turn = Number(tail);
+  return Number.isInteger(turn) && turn > 0 ? { sessionId: head, turn } : null;
+}
+
+/** Ref → 客户端内部 id；认不出来返回空串 */
+function refToId(ref) {
+  if (!ref || typeof ref !== 'object' || Array.isArray(ref)) return '';
+  const sessionId = str(ref.sessionId);
+  if (sessionId === '') return '';
+  if (ref.turn === undefined || ref.turn === null) return `header:${sessionId}`;
+  const turn = Number(ref.turn);
+  return Number.isInteger(turn) && turn > 0 ? `${sessionId}:${turn}` : '';
+}
+
 const str = (v) => (v === undefined || v === null ? '' : String(v));
 /* 注意 Number(null) === 0：显式的 null/undefined/空串必须判成"没有值"，
    否则"这一轮没有结束边界"会被读成"在 0 号事件结束"。 */
@@ -345,6 +374,28 @@ function buildGraph(input) {
     });
   });
 
+  /* 手动边与引用边：由用户数据生成（§5.2 三种 kind 中，branch 是推导的，这两类是存下来的）。
+     - 自环拒绝（创建时就该拦，这里再兜一层）
+     - **任一端点**被隐藏则整条边一并隐藏（FR-9 / FR-11），不只是从它出发的边
+     - 端点已被删除或未载入时保留边、标记 broken，**不替用户删数据** */
+  const knownNode = new Set(blocks.map((b) => b.id));
+  links.forEach((l) => {
+    if (!l || (l.kind !== 'link' && l.kind !== 'reference')) return;
+    const from = refToId(l.from) || str(l.from);
+    const to = refToId(l.to) || str(l.to);
+    if (!from || !to || from === to) return;
+    if (!includeHidden && (hidden[from] || hidden[to])) return;
+    edges.push({
+      id: str(l.id) || `${l.kind}:${from}->${to}`,
+      kind: l.kind,
+      from,
+      to,
+      ...(l.label ? { label: str(l.label) } : {}),
+      broken: !knownNode.has(from) || !knownNode.has(to),
+      ...(l.createdAt !== undefined ? { createdAt: l.createdAt } : {})
+    });
+  });
+
   const stats = {
     sessions: scoped.length,
     blocks: blocks.length,
@@ -514,6 +565,31 @@ function edgePath(edge, nodeMap) {
   }
   if (a.x === b.x) return orth([B(a), T(b)], 10);
   return a.x + a.w <= b.x ? curve(R(a), L(b)) : curve(L(a), R(b));
+}
+
+/**
+ * 边标签的落点（FR-9：标签显示在边中点，过长截断、悬停完整显示）。
+ *
+ * 贝塞尔那段的中点恰好是两端锚点的算术平均 ——
+ * curve() 的控制点偏移在 t=0.5 处正好抵消（x 方向 3dx−3dx=0）。
+ * 端点找不到时返回 null，调用方跳过即可。
+ */
+function edgeMidpoint(edge, nodeMap) {
+  const a = nodeMap.get(edge.from) || nodeMap.get(`header:${edge.parentId}`);
+  const b = nodeMap.get(edge.to);
+  if (!a || !b) return null;
+  if (edge.kind === 'link' || edge.kind === 'reference') {
+    if (edge.route === 'right' && Number.isFinite(edge.xr)) {
+      return { x: edge.xr, y: (R(a)[1] + R(b)[1]) / 2 };
+    }
+    const left = a.x + a.w <= b.x;
+    const p = left ? R(a) : L(a);
+    const q = left ? L(b) : R(b);
+    return { x: (p[0] + q[0]) / 2, y: (p[1] + q[1]) / 2 };
+  }
+  const p = a.x === b.x ? B(a) : (a.x + a.w <= b.x ? R(a) : L(a));
+  const q = a.x === b.x ? T(b) : (a.x + a.w <= b.x ? L(b) : R(b));
+  return { x: (p[0] + q[0]) / 2, y: (p[1] + q[1]) / 2 };
 }
 
 /**
@@ -912,6 +988,8 @@ function render(graph, format, options = {}) {
  * 版本演进照 §5.3：`version` 必填；**未知版本拒绝应用并明说不兼容，不猜测性解析**。
  */
 
+/* id 的约定归 model 管（blockId / emptyId / idToRef / refToId），这里只引用 */
+
 const STATE_VERSION = 1;
 
 /** NFR-1：超限就截断，避免一条癫狂的记录把界面拖死 */
@@ -943,29 +1021,7 @@ function emptyState(now = 0) {
 
 /* --------------------------------------------------------- id ↔ Ref */
 
-/** `sessionId:turn` / `header:sessionId` / `sessionId:empty` → Ref */
-function idToRef(id) {
-  const s = sxStr(id);
-  if (s === '') return null;
-  const cut = s.indexOf(':');
-  if (cut <= 0) return null;
-  const head = s.slice(0, cut);
-  const tail = s.slice(cut + 1);
-  if (head === 'header') return { sessionId: tail };
-  if (tail === 'empty') return { sessionId: head };
-  const turn = Number(tail);
-  return Number.isInteger(turn) && turn > 0 ? { sessionId: head, turn } : null;
-}
-
-/** Ref → 客户端内部 id；认不出来返回空串 */
-function refToId(ref) {
-  if (!sxIsObject(ref)) return '';
-  const sessionId = sxStr(ref.sessionId);
-  if (sessionId === '') return '';
-  if (ref.turn === undefined || ref.turn === null) return `header:${sessionId}`;
-  const turn = Number(ref.turn);
-  return Number.isInteger(turn) && turn > 0 ? `${sessionId}:${turn}` : '';
-}
+/* 实现在 model.js（id 约定归它管）。这里重导出，调用方不必关心住在哪。 */
 
 /* ------------------------------------------------------------ 规整 */
 
@@ -974,7 +1030,8 @@ const sxUniq = (raw, limit) =>
   [...new Set((Array.isArray(raw) ? raw : []).map(sxStr).filter(Boolean))].slice(0, limit);
 
 /** 干净的初始状态 */
-function sxCapObject(raw, limit, mapValue) {  const out = {};
+function sxCapObject(raw, limit, mapValue) {
+  const out = {};
   if (!sxIsObject(raw)) return out;
   let n = 0;
   for (const [k, v] of Object.entries(raw)) {
@@ -1259,6 +1316,16 @@ const CSS = `
 .sg-e-branch{fill:none;stroke:var(--dsw-alias-label-dimmed);stroke-width:1.6}
 .sg-e-link{fill:none;stroke:var(--dsw-alias-state-business-primary);stroke-width:1.6;stroke-dasharray:6 5}
 .sg-e-ref{fill:none;stroke:var(--dsw-alias-label-caption);stroke-width:1.7;stroke-dasharray:1.5 4.5}
+/* 端点已不存在的边：保留数据但画不出来，用样式说明而不假装它不存在 */
+.sg-e-broken{stroke:var(--dsw-alias-state-error-primary);stroke-dasharray:2 3;opacity:.55}
+/* 边标签：落在边中点，过长截断、悬停看全文（FR-9） */
+.sg-elabel{position:absolute;transform:translate(-50%,-50%);max-width:150px;padding:1px 6px;
+  border-radius:5px;background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-elevation-stroke);
+  font-size:10.5px;line-height:1.5;color:var(--dsw-alias-state-business-primary);cursor:pointer;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;user-select:none}
+.sg-elabel:hover{background:var(--dsw-alias-bg-layer-2)}
+.sg-elabel-ref{color:var(--dsw-alias-label-caption)}
+.sg-elabel-broken{color:var(--dsw-alias-state-error-primary);text-decoration:line-through}
 .sg-node{position:absolute;border-radius:var(--dsw-radius-md,12px);background:var(--dsw-alias-bg-layer-1);
   box-shadow:var(--dsw-elevation-stroke);padding:8px 11px;display:flex;flex-direction:column;gap:3px;
   cursor:grab;user-select:none;transition:background .12s,box-shadow .12s}
@@ -1440,6 +1507,7 @@ function GraphView(props) {
   const [hidden, setHidden] = React.useState({});
   const [alias, setAlias] = React.useState({});
   const [links, setLinks] = React.useState([]);
+  const [selectedEdge, setSelectedEdge] = React.useState(null);
   /* 持久化：存档读回来之后才允许写，避免首帧的空状态把存档冲掉 */
   const [writable, setWritable] = React.useState(true);
   const [incompatible, setIncompatible] = React.useState(false);
@@ -1876,11 +1944,40 @@ function GraphView(props) {
     h('div', { className: 'sg-ans' }, clip(digest(b.response, 'first-paragraph'), 220) || '（该轮回答尚未载入）'));
   });
 
-  const edges = (graph.error ? [] : graph.edges).map((e) => {
+  /* 三种边不只靠颜色区分（§5.2）：线型不同，箭头也分实心与空心 */
+  const edgeList = graph.error ? [] : graph.edges;
+  const edges = edgeList.map((e) => {
     const d = edgePath(e, nodeMap);
     if (!d) return null;
-    return h('path', { key: e.id, className: 'sg-e-branch', d });
+    const cls = e.kind === 'link' ? 'sg-e-link'
+      : e.kind === 'reference' ? 'sg-e-ref' : 'sg-e-branch';
+    return h('path', {
+      key: e.id,
+      className: cls + (e.broken ? ' sg-e-broken' : ''),
+      d,
+      'data-sg-edge': e.id,
+      markerEnd: e.kind === 'branch' || e.kind === 'link'
+        ? 'url(#sg-arrow-solid)' : 'url(#sg-arrow-hollow)'
+    });
   }).filter(Boolean);
+
+  /* 标签落在边中点；过长由 CSS 截断，title 给完整文本（FR-9） */
+  const edgeLabels = edgeList.map((e) => {
+    if (!e.label) return null;
+    const p = edgeMidpoint(e, nodeMap);
+    if (!p) return null;
+    return h('div', {
+      key: 'el:' + e.id,
+      className: 'sg-elabel' + (e.kind === 'reference' ? ' sg-elabel-ref' : '')
+        + (e.broken ? ' sg-elabel-broken' : ''),
+      style: { left: p.x, top: p.y },
+      title: e.label,
+      onClick: (ev) => { ev.stopPropagation(); setSelectedEdge(e.id); }
+    }, e.label);
+  }).filter(Boolean);
+
+  /* 断裂的边指向已不存在的块：几何上画不出来，但**不能装作没这回事** */
+  const brokenCount = edgeList.filter((e) => e.broken).length;
 
   /* 空态说人话（FR-13）：不暴露状态码，只告诉用户现在能看到什么、可以做什么 */
   const body = graph.error
@@ -1978,8 +2075,24 @@ function GraphView(props) {
         style: { transform: 'translate(' + view.panX + 'px,' + view.panY + 'px) scale(' + view.scale + ')' }
       },
       h('svg', { width: Math.max(1200, (laid.bounds ? laid.bounds.maxX + 160 : 1200)),
-                 height: Math.max(760, (laid.bounds ? laid.bounds.maxY + 120 : 760)) }, edges),
-      cell),
+                 height: Math.max(760, (laid.bounds ? laid.bounds.maxY + 120 : 760)) },
+      h('defs', null,
+        h('marker', {
+          id: 'sg-arrow-solid', viewBox: '0 0 10 10', refX: 9, refY: 5,
+          markerWidth: 6, markerHeight: 6, orient: 'auto-start-reverse'
+        }, h('path', { d: 'M0,0 L10,5 L0,10 z', fill: 'var(--dsw-alias-label-dimmed)' })),
+        h('marker', {
+          id: 'sg-arrow-hollow', viewBox: '0 0 10 10', refX: 9, refY: 5,
+          markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse'
+        }, h('path', {
+          d: 'M0,0 L10,5 L0,10 z',
+          fill: 'var(--dsw-alias-bg-layer-1)',
+          stroke: 'var(--dsw-alias-label-caption)',
+          strokeWidth: 1.6
+        }))),
+      edges),
+      cell,
+      edgeLabels),
       h('div', { className: 'sg-tools' },
         h('button', { className: 'sg-btn', onClick: fit }, '适应视图 F'),
         h('button', {

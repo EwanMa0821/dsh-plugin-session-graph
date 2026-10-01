@@ -150,6 +150,31 @@ export function edgePath(edge, nodeMap) {
 }
 
 /**
+ * 边标签的落点（FR-9：标签显示在边中点，过长截断、悬停完整显示）。
+ *
+ * 贝塞尔那段的中点恰好是两端锚点的算术平均 ——
+ * curve() 的控制点偏移在 t=0.5 处正好抵消（x 方向 3dx−3dx=0）。
+ * 端点找不到时返回 null，调用方跳过即可。
+ */
+export function edgeMidpoint(edge, nodeMap) {
+  const a = nodeMap.get(edge.from) || nodeMap.get(`header:${edge.parentId}`);
+  const b = nodeMap.get(edge.to);
+  if (!a || !b) return null;
+  if (edge.kind === 'link' || edge.kind === 'reference') {
+    if (edge.route === 'right' && Number.isFinite(edge.xr)) {
+      return { x: edge.xr, y: (R(a)[1] + R(b)[1]) / 2 };
+    }
+    const left = a.x + a.w <= b.x;
+    const p = left ? R(a) : L(a);
+    const q = left ? L(b) : R(b);
+    return { x: (p[0] + q[0]) / 2, y: (p[1] + q[1]) / 2 };
+  }
+  const p = a.x === b.x ? B(a) : (a.x + a.w <= b.x ? R(a) : L(a));
+  const q = a.x === b.x ? T(b) : (a.x + a.w <= b.x ? L(b) : R(b));
+  return { x: (p[0] + q[0]) / 2, y: (p[1] + q[1]) / 2 };
+}
+
+/**
  * 适应视图：把全部节点装进视口（FR-5）。
  * @returns {{scale:number, panX:number, panY:number}}
  */

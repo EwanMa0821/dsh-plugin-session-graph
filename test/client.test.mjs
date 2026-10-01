@@ -328,10 +328,14 @@ test('渲染树里有工具栏、会话头、派生边与选中态入口', async
 
   const svg = nodes.find((n) => n.type === 'svg');
   assert.ok(svg, '有 SVG 边层');
-  const paths = (Array.isArray(svg.props.children) ? svg.props.children : [svg.props.children])
-    .filter((c) => c && c.type === 'path');
+  const paths = nodes.filter((n) => n.type === 'path' && typeof n.props.d === 'string'
+    && n.props.d.startsWith('M') && n.props['data-sg-edge'] !== undefined);
   assert.ok(paths.length >= 2, '至少两条派生边，实际 ' + paths.length);
   paths.forEach((p) => assert.match(p.props.d, /^M/));
+  assert.ok(nodes.some((n) => n.type === 'marker' && n.props.id === 'sg-arrow-solid'),
+    '有实心箭头 marker');
+  assert.ok(nodes.some((n) => n.type === 'marker' && n.props.id === 'sg-arrow-hollow'),
+    '有空心箭头 marker（引用边用）');
 });
 
 test('本地时间线覆盖远程的同名会话，进行中的轮次被标出', async () => {

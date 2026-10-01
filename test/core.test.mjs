@@ -15,7 +15,7 @@ import {
   turnsFromTimeline, normalizeSessions, familyOf, buildGraph, plain, clip
 } from '../src/core/model.js';
 import {
-  layout, bounds, edgePath, fitView, moveSelection, curve, orth, DEFAULT_LAYOUT
+  layout, bounds, edgePath, edgeMidpoint, fitView, moveSelection, curve, orth, DEFAULT_LAYOUT
 } from '../src/core/graph.js';
 import { toFreeMind, toMarkdown, exportFilename, safeFilename, render } from '../src/core/export.js';
 
@@ -191,6 +191,115 @@ test('buildGraph 隐藏端点时整条派生边一并消失（FR-11）', () => {
   const g = graphOf({ hidden: { 'ancor:2': true } });
   assert.equal(g.edges.some((e) => e.id === 'branch:invest'), false);
   assert.equal(g.edges.length, 2);
+});
+
+/* ------------------------------------------------------- 手动边与引用边 */
+
+/** 一块一链接的图，方便逐条断言 */
+const linkGraph = (links, extra = {}) => buildGraph({
+  sessions: normalizeSessions(RAW_SESSIONS),
+  turnsBySession: TURNS,
+  currentId: 'root',
+  links,
+  ...extra
+});
+
+test('手动连线真的会变成边 —— 存下来却画不出来是早先的缺口', () => {
+  const g = linkGraph([{ id: 'L1', kind: 'link', from: 'root:1', to: 'ancor:2', label: '因为' }]);
+  const e = g.edges.find((x) => x.id === 'L1');
+  assert.ok(e, '连线出现在边集合里');
+  assert.equal(e.kind, 'link');
+  assert.equal(e.from, 'root:1');
+  assert.equal(e.to, 'ancor:2');
+  assert.equal(e.label, '因为');
+  assert.equal(e.broken, false);
+});
+
+test('引用边与手动边是两种 kind，不会被混为一谈', () => {
+  const g = linkGraph([
+    { id: 'L1', kind: 'link', from: 'root:1', to: 'ancor:1' },
+    { id: 'R1', kind: 'reference', from: 'root:2', to: 'ancor:2' }
+  ]);
+  assert.equal(g.edges.find((x) => x.id === 'L1').kind, 'link');
+  assert.equal(g.edges.find((x) => x.id === 'R1').kind, 'reference');
+});
+
+test('派生边不会被当成用户数据 —— kind 是 branch', () => {
+  const g = linkGraph([]);
+  assert.ok(g.edges.every((e) => e.kind === 'branch'), '没给连线时只有派生边');
+});
+
+test('自环在建模层就被拒绝', () => {
+  const g = linkGraph([{ id: 'L1', kind: 'link', from: 'root:1', to: 'root:1' }]);
+  assert.equal(g.edges.some((e) => e.id === 'L1'), false);
+});
+
+test('连线任一端点被隐藏时整条边一并隐藏（FR-9 / FR-11）', () => {
+  const links = [{ id: 'L1', kind: 'link', from: 'root:1', to: 'ancor:2' }];
+  assert.equal(linkGraph(links).edges.some((e) => e.id === 'L1'), true);
+
+  /* 起点被隐藏 */
+  assert.equal(linkGraph(links, { hidden: { 'root:1': true } }).edges.some((e) => e.id === 'L1'), false);
+  /* 终点被隐藏 —— 早先只处理"从它出发"的边，这是漏掉的那一半 */
+  assert.equal(linkGraph(links, { hidden: { 'ancor:2': true } }).edges.some((e) => e.id === 'L1'), false);
+  /* 打开显示开关后恢复 */
+  assert.equal(
+    linkGraph(links, { hidden: { 'ancor:2': true }, includeHidden: true }).edges.some((e) => e.id === 'L1'),
+    true
+  );
+});
+
+test('端点已被删除或未载入时保留边并标记 broken，不替用户删数据', () => {
+  const g = linkGraph([{ id: 'L1', kind: 'link', from: 'root:1', to: 'gone:9' }]);
+  const e = g.edges.find((x) => x.id === 'L1');
+  assert.ok(e, '边还在');
+  assert.equal(e.broken, true, '标成断裂，由界面呈现');
+});
+
+test('同一对块之间允许多条连线（不同标签）', () => {
+  const g = linkGraph([
+    { id: 'L1', kind: 'link', from: 'root:1', to: 'ancor:1', label: '甲' },
+    { id: 'L2', kind: 'link', from: 'root:1', to: 'ancor:1', label: '乙' }
+  ]);
+  assert.deepEqual(
+    g.edges.filter((e) => e.kind === 'link').map((e) => e.label).sort(),
+    ['乙', '甲']
+  );
+});
+
+test('连线的端点用持久形态的 Ref 给也能认', () => {
+  const g = linkGraph([
+    { id: 'L1', kind: 'link', from: { sessionId: 'root', turn: 1 }, to: { sessionId: 'ancor', turn: 2 } }
+  ]);
+  const e = g.edges.find((x) => x.id === 'L1');
+  assert.equal(e.from, 'root:1');
+  assert.equal(e.to, 'ancor:2');
+});
+
+test('缺 id 的连线也能画出来（用端点兜一个稳定 id）', () => {
+  const g = linkGraph([{ kind: 'link', from: 'root:1', to: 'ancor:1' }]);
+  const e = g.edges.find((x) => x.kind === 'link');
+  assert.equal(e.id, 'link:root:1->ancor:1');
+});
+
+test('边标签的落点在两端锚点正中（FR-9）', () => {
+  const g = linkGraph([{ id: 'L1', kind: 'link', from: 'root:1', to: 'ancor:1', label: '因为' }]);
+  const { nodes, headers } = layout(g);
+  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+  const e = g.edges.find((x) => x.id === 'L1');
+  const mid = edgeMidpoint(e, nodeMap);
+
+  const a = nodeMap.get('root:1');
+  const b = nodeMap.get('ancor:1');
+  const p = a.x + a.w <= b.x ? [a.x + a.w, a.y + a.h / 2] : [a.x, a.y + a.h / 2];
+  const q = a.x + a.w <= b.x ? [b.x, b.y + b.h / 2] : [b.x + b.w, b.y + b.h / 2];
+  assert.equal(mid.x, (p[0] + q[0]) / 2);
+  assert.equal(mid.y, (p[1] + q[1]) / 2);
+  assert.equal(headers.size >= 1, true, '会话头也参与布局');
+});
+
+test('端点找不到时不给中点，调用方跳过即可', () => {
+  assert.equal(edgeMidpoint({ from: 'nope', to: 'nope2', kind: 'link' }, new Map()), null);
 });
 
 test('buildGraph 源块缺失时派生边退回源会话会话头（FR-8）', () => {

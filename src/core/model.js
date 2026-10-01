@@ -20,6 +20,35 @@ export const blockId = (sessionId, turn) => `${sessionId}:${turn}`;
 /** 空子会话占位节点的 id（FR-8：子会话尚无自有轮次时的终点） */
 export const emptyId = (sessionId) => `${sessionId}:empty`;
 
+/**
+ * 块 id ↔ 持久形态的 Ref（§5.2）。
+ *
+ * id 的约定归 model 管（`blockId` / `emptyId` 也在这里），
+ * 所以解析也放这里 —— 持久层只是引用它，不该各写一份。
+ */
+export function idToRef(id) {
+  const s = String(id === undefined || id === null ? '' : id);
+  if (s === '') return null;
+  const cut = s.indexOf(':');
+  if (cut <= 0) return null;
+  const head = s.slice(0, cut);
+  const tail = s.slice(cut + 1);
+  if (head === 'header') return { sessionId: tail };
+  if (tail === 'empty') return { sessionId: head };
+  const turn = Number(tail);
+  return Number.isInteger(turn) && turn > 0 ? { sessionId: head, turn } : null;
+}
+
+/** Ref → 客户端内部 id；认不出来返回空串 */
+export function refToId(ref) {
+  if (!ref || typeof ref !== 'object' || Array.isArray(ref)) return '';
+  const sessionId = str(ref.sessionId);
+  if (sessionId === '') return '';
+  if (ref.turn === undefined || ref.turn === null) return `header:${sessionId}`;
+  const turn = Number(ref.turn);
+  return Number.isInteger(turn) && turn > 0 ? `${sessionId}:${turn}` : '';
+}
+
 const str = (v) => (v === undefined || v === null ? '' : String(v));
 /* 注意 Number(null) === 0：显式的 null/undefined/空串必须判成"没有值"，
    否则"这一轮没有结束边界"会被读成"在 0 号事件结束"。 */
@@ -335,6 +364,28 @@ export function buildGraph(input) {
     edges.push({
       id: `branch:${s.id}`, kind: 'branch', from, to,
       sessionId: s.id, parentId: s.parentId
+    });
+  });
+
+  /* 手动边与引用边：由用户数据生成（§5.2 三种 kind 中，branch 是推导的，这两类是存下来的）。
+     - 自环拒绝（创建时就该拦，这里再兜一层）
+     - **任一端点**被隐藏则整条边一并隐藏（FR-9 / FR-11），不只是从它出发的边
+     - 端点已被删除或未载入时保留边、标记 broken，**不替用户删数据** */
+  const knownNode = new Set(blocks.map((b) => b.id));
+  links.forEach((l) => {
+    if (!l || (l.kind !== 'link' && l.kind !== 'reference')) return;
+    const from = refToId(l.from) || str(l.from);
+    const to = refToId(l.to) || str(l.to);
+    if (!from || !to || from === to) return;
+    if (!includeHidden && (hidden[from] || hidden[to])) return;
+    edges.push({
+      id: str(l.id) || `${l.kind}:${from}->${to}`,
+      kind: l.kind,
+      from,
+      to,
+      ...(l.label ? { label: str(l.label) } : {}),
+      broken: !knownNode.has(from) || !knownNode.has(to),
+      ...(l.createdAt !== undefined ? { createdAt: l.createdAt } : {})
     });
   });
 

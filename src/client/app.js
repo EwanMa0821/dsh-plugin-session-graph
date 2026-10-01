@@ -66,6 +66,16 @@ const CSS = `
 .sg-e-branch{fill:none;stroke:var(--dsw-alias-label-dimmed);stroke-width:1.6}
 .sg-e-link{fill:none;stroke:var(--dsw-alias-state-business-primary);stroke-width:1.6;stroke-dasharray:6 5}
 .sg-e-ref{fill:none;stroke:var(--dsw-alias-label-caption);stroke-width:1.7;stroke-dasharray:1.5 4.5}
+/* 端点已不存在的边：保留数据但画不出来，用样式说明而不假装它不存在 */
+.sg-e-broken{stroke:var(--dsw-alias-state-error-primary);stroke-dasharray:2 3;opacity:.55}
+/* 边标签：落在边中点，过长截断、悬停看全文（FR-9） */
+.sg-elabel{position:absolute;transform:translate(-50%,-50%);max-width:150px;padding:1px 6px;
+  border-radius:5px;background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-elevation-stroke);
+  font-size:10.5px;line-height:1.5;color:var(--dsw-alias-state-business-primary);cursor:pointer;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;user-select:none}
+.sg-elabel:hover{background:var(--dsw-alias-bg-layer-2)}
+.sg-elabel-ref{color:var(--dsw-alias-label-caption)}
+.sg-elabel-broken{color:var(--dsw-alias-state-error-primary);text-decoration:line-through}
 .sg-node{position:absolute;border-radius:var(--dsw-radius-md,12px);background:var(--dsw-alias-bg-layer-1);
   box-shadow:var(--dsw-elevation-stroke);padding:8px 11px;display:flex;flex-direction:column;gap:3px;
   cursor:grab;user-select:none;transition:background .12s,box-shadow .12s}
@@ -247,6 +257,7 @@ function GraphView(props) {
   const [hidden, setHidden] = React.useState({});
   const [alias, setAlias] = React.useState({});
   const [links, setLinks] = React.useState([]);
+  const [selectedEdge, setSelectedEdge] = React.useState(null);
   /* 持久化：存档读回来之后才允许写，避免首帧的空状态把存档冲掉 */
   const [writable, setWritable] = React.useState(true);
   const [incompatible, setIncompatible] = React.useState(false);
@@ -683,11 +694,40 @@ function GraphView(props) {
     h('div', { className: 'sg-ans' }, clip(digest(b.response, 'first-paragraph'), 220) || '（该轮回答尚未载入）'));
   });
 
-  const edges = (graph.error ? [] : graph.edges).map((e) => {
+  /* 三种边不只靠颜色区分（§5.2）：线型不同，箭头也分实心与空心 */
+  const edgeList = graph.error ? [] : graph.edges;
+  const edges = edgeList.map((e) => {
     const d = edgePath(e, nodeMap);
     if (!d) return null;
-    return h('path', { key: e.id, className: 'sg-e-branch', d });
+    const cls = e.kind === 'link' ? 'sg-e-link'
+      : e.kind === 'reference' ? 'sg-e-ref' : 'sg-e-branch';
+    return h('path', {
+      key: e.id,
+      className: cls + (e.broken ? ' sg-e-broken' : ''),
+      d,
+      'data-sg-edge': e.id,
+      markerEnd: e.kind === 'branch' || e.kind === 'link'
+        ? 'url(#sg-arrow-solid)' : 'url(#sg-arrow-hollow)'
+    });
   }).filter(Boolean);
+
+  /* 标签落在边中点；过长由 CSS 截断，title 给完整文本（FR-9） */
+  const edgeLabels = edgeList.map((e) => {
+    if (!e.label) return null;
+    const p = edgeMidpoint(e, nodeMap);
+    if (!p) return null;
+    return h('div', {
+      key: 'el:' + e.id,
+      className: 'sg-elabel' + (e.kind === 'reference' ? ' sg-elabel-ref' : '')
+        + (e.broken ? ' sg-elabel-broken' : ''),
+      style: { left: p.x, top: p.y },
+      title: e.label,
+      onClick: (ev) => { ev.stopPropagation(); setSelectedEdge(e.id); }
+    }, e.label);
+  }).filter(Boolean);
+
+  /* 断裂的边指向已不存在的块：几何上画不出来，但**不能装作没这回事** */
+  const brokenCount = edgeList.filter((e) => e.broken).length;
 
   /* 空态说人话（FR-13）：不暴露状态码，只告诉用户现在能看到什么、可以做什么 */
   const body = graph.error
@@ -785,8 +825,24 @@ function GraphView(props) {
         style: { transform: 'translate(' + view.panX + 'px,' + view.panY + 'px) scale(' + view.scale + ')' }
       },
       h('svg', { width: Math.max(1200, (laid.bounds ? laid.bounds.maxX + 160 : 1200)),
-                 height: Math.max(760, (laid.bounds ? laid.bounds.maxY + 120 : 760)) }, edges),
-      cell),
+                 height: Math.max(760, (laid.bounds ? laid.bounds.maxY + 120 : 760)) },
+      h('defs', null,
+        h('marker', {
+          id: 'sg-arrow-solid', viewBox: '0 0 10 10', refX: 9, refY: 5,
+          markerWidth: 6, markerHeight: 6, orient: 'auto-start-reverse'
+        }, h('path', { d: 'M0,0 L10,5 L0,10 z', fill: 'var(--dsw-alias-label-dimmed)' })),
+        h('marker', {
+          id: 'sg-arrow-hollow', viewBox: '0 0 10 10', refX: 9, refY: 5,
+          markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse'
+        }, h('path', {
+          d: 'M0,0 L10,5 L0,10 z',
+          fill: 'var(--dsw-alias-bg-layer-1)',
+          stroke: 'var(--dsw-alias-label-caption)',
+          strokeWidth: 1.6
+        }))),
+      edges),
+      cell,
+      edgeLabels),
       h('div', { className: 'sg-tools' },
         h('button', { className: 'sg-btn', onClick: fit }, '适应视图 F'),
         h('button', {
