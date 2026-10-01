@@ -21,7 +21,8 @@ const CORE = [
   'src/core/model.js',
   'src/core/graph.js',
   'src/core/export.js',
-  'src/core/state.js'
+  'src/core/state.js',
+  'src/core/scale.js'
 ];
 const APP = 'src/client/app.js';
 export const OUT = 'client.js';

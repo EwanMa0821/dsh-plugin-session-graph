@@ -18,6 +18,9 @@ import {
   layout, bounds, edgePath, edgeMidpoint, fitView, moveSelection, curve, orth, DEFAULT_LAYOUT
 } from '../src/core/graph.js';
 import { toFreeMind, toMarkdown, exportFilename, safeFilename, render } from '../src/core/export.js';
+import {
+  TIERS, SLOW_LAYOUT_MS, tierOf, tierFeatures, sessionsWithBlocks, timedLayout
+} from '../src/core/scale.js';
 
 /* ------------------------------------------------------------------ 夹具 */
 
@@ -756,6 +759,72 @@ test('bounds 把被拖远的块也算进去，适应视图才不会漏掉它', (
   const auto = layout(g);
   const saved = layout(g, { positions: { 'root:1': { x: 2000, y: 0 } } });
   assert.ok(bounds(saved.nodes).maxX > bounds(auto.nodes).maxX + 1000);
+});
+
+/* ------------------------------------------------- 规模降级（NFR-1） */
+
+test('tierOf 按块数分档，边界不含糊', () => {
+  assert.equal(tierOf(0), 'full');
+  assert.equal(tierOf(800), 'full', '800 仍在满档');
+  assert.equal(tierOf(801), 'dense');
+  assert.equal(tierOf(3000), 'dense', '3000 仍是密集档');
+  assert.equal(tierOf(3001), 'skeleton');
+  assert.equal(tierOf(NaN), 'full');
+  assert.equal(tierOf(undefined), 'full');
+});
+
+test('tierFeatures：越大的档省得越多', () => {
+  assert.deepEqual(tierFeatures('full'), { blockText: true, edgeLabels: true, skeletonOnly: false });
+  assert.deepEqual(tierFeatures('dense'), { blockText: false, edgeLabels: false, skeletonOnly: false });
+  assert.deepEqual(tierFeatures('skeleton'), { blockText: false, edgeLabels: false, skeletonOnly: true });
+  assert.deepEqual(tierFeatures('?'), tierFeatures('full'), '认不出的档位按满档处理');
+});
+
+test('sessionsWithBlocks：满档与密集档不限制会话', () => {
+  const sessions = normalizeSessions(RAW_SESSIONS);
+  assert.equal(sessionsWithBlocks(sessions, 'full', 'root', []), null);
+  assert.equal(sessionsWithBlocks(sessions, 'dense', 'root', []), null);
+});
+
+test('sessionsWithBlocks：骨架档只默认画当前会话', () => {
+  const sessions = normalizeSessions(RAW_SESSIONS);
+  const set = sessionsWithBlocks(sessions, 'skeleton', 'ancor', []);
+  assert.ok(set.has('ancor'), '当前会话');
+  /* 祖先不默认展开 —— 那往往正是最大的那一个，展开了就等于没降级。
+     它的**会话头**仍在，派生边也仍在，分叉骨架不会断。 */
+  assert.equal(set.has('root'), false, '祖先只出头，不默认画块');
+  assert.equal(set.has('invest'), false, '后代同理');
+});
+
+test('sessionsWithBlocks：显式展开的会话也进来，未知 id 忽略', () => {
+  const sessions = normalizeSessions(RAW_SESSIONS);
+  const set = sessionsWithBlocks(sessions, 'skeleton', 'root', ['invest', 'ghost']);
+  assert.ok(set.has('invest'));
+  assert.equal(set.has('ghost'), false);
+});
+
+test('sessionsWithBlocks：当前会话不在列表里时不硬塞', () => {
+  const sessions = normalizeSessions(RAW_SESSIONS);
+  const set = sessionsWithBlocks(sessions, 'skeleton', 'nope', []);
+  assert.equal(set.size, 0);
+});
+
+test('timedLayout 顺带量出耗时并判定是否超预算', () => {
+  let t = 0;
+  const clock = () => t;
+  t = 100;
+  const fast = timedLayout(() => { t = 150; return 'ok'; }, clock);
+  assert.equal(fast.result, 'ok');
+  assert.equal(fast.ms, 50);
+  assert.equal(fast.slow, false);
+
+  t = 0;
+  const slow = timedLayout(() => { t = SLOW_LAYOUT_MS + 1; }, clock);
+  assert.equal(slow.slow, true, '超过预算要给出回落信号');
+});
+
+test('timedLayout 不吞异常：布局炸了要让上层知道', () => {
+  assert.throws(() => timedLayout(() => { throw new Error('boom'); }, () => 0), /boom/);
 });
 
 /* --------------------------------------------------------- 布局常量契约 */

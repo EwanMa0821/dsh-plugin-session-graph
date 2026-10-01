@@ -1221,3 +1221,77 @@ test('点边标签即选中该连线，可改标签也可删除', async () => {
     serverReply = { ...serverReply, state: null };
   }
 });
+
+/* ------------------------------------------------- 规模降级（NFR-1） */
+
+/** 用某个会话作为当前会话渲染（当前会话影响骨架档的取舍） */
+const propsFor = (sid) => ctx.slots.options.inject(sid);
+
+const classCount = (tree, frag) => elements(tree).filter((n) => typeof n.props.className === 'string'
+  && n.props.className.includes(frag)).length;
+
+test('密集档：省略块内正文与边标签，并明说降级原因', async () => {
+  serverReply = {
+    ...serverReply,
+    turns: {
+      root: turnsOf('第', 900),
+      ancor: turnsOf('锚定', 3),
+      invest: turnsOf('投资', 2)
+    },
+    state: blankState({
+      links: [{ id: 'L1', kind: 'link', from: 'root:1', to: 'root:2', label: '因为' }]
+    })
+  };
+  try {
+    const tree = await mountLoaded();
+    const blocks = elements(tree).filter((n) => n.props && n.props['data-sg-node']);
+    assert.ok(blocks.length > 800, '块确实超过阈值：' + blocks.length);
+    assert.equal(classCount(tree, 'sg-ans'), 0, '不画块内回答');
+    assert.equal(classCount(tree, 'sg-elabel'), 0, '不画边标签');
+    assert.ok(classCount(tree, 'sg-ask') > 0, '提问行还在，块仍然认得出是哪一轮');
+    assert.match(textIn(tree), /已省略块内正文与边标签/, '把降级原因说出来');
+  } finally {
+    serverReply = { ...serverReply, state: null, turns: REMOTE_TURNS };
+  }
+});
+
+test('骨架档：非当前会话只出会话头，可就地展开', async () => {
+  serverReply = {
+    ...serverReply,
+    turns: {
+      root: turnsOf('根会话第', 3100),
+      ancor: turnsOf('锚定', 3),
+      invest: turnsOf('投资', 2)
+    },
+    state: blankState()
+  };
+  try {
+    const props2 = propsFor('invest');
+    resetComponent();
+    render(ctx.slots.Component, props2);
+    await tick();
+    let tree = render(ctx.slots.Component, props2);
+
+    const shown = () => elements(tree).filter((n) => n.props && n.props['data-sg-node'])
+      .map((n) => n.props['data-sg-node']);
+    assert.ok(shown().includes('invest:1'), '当前会话的块照常画');
+    assert.equal(shown().some((id) => id.startsWith('root:')), false, '巨大的祖先会话不画块');
+    assert.ok(classCount(tree, 'sg-label') >= 3, '三个会话头都在，骨架没断');
+    assert.match(textIn(tree), /只画分叉骨架与当前会话/, '把降级原因说出来');
+
+    const chevron = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-expand'));
+    assert.ok(chevron, '非当前会话的头上给展开入口');
+    assert.equal(chevron.props.children, '▸');
+
+    chevron.props.onClick({ stopPropagation() {} });
+    tree = render(ctx.slots.Component, props2);
+    const after = elements(tree).find((n) => typeof n.props.className === 'string'
+      && n.props.className.includes('sg-expand'));
+    assert.equal(after.props.children, '▾', '展开后标记翻转');
+    assert.ok(elements(tree).filter((n) => n.props && n.props['data-sg-node'])
+      .some((n) => n.props['data-sg-node'].startsWith('root:')), '展开后该会话的块出来了');
+  } finally {
+    serverReply = { ...serverReply, state: null, turns: REMOTE_TURNS };
+  }
+});

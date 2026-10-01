@@ -77,6 +77,10 @@ const CSS = `
 .sg-elabel:hover{background:var(--dsw-alias-bg-layer-2)}
 .sg-elabel-ref{color:var(--dsw-alias-label-caption)}
 .sg-elabel-broken{color:var(--dsw-alias-state-error-primary);text-decoration:line-through}
+/* 骨架档下会话头右侧的就地展开入口（NFR-1） */
+.sg-expand{flex:0 0 auto;width:15px;text-align:center;border-radius:4px;cursor:pointer;
+  color:var(--dsw-alias-label-caption);font-size:11px}
+.sg-expand:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 /* 连线把手：悬停或选中时才显形，平时不打扰 */
 .sg-handle{position:absolute;right:-6px;bottom:-6px;width:12px;height:12px;border-radius:50%;
   background:var(--dsw-alias-bg-layer-1);border:1.5px solid var(--dsw-alias-state-business-primary);
@@ -282,6 +286,19 @@ function GraphView(props) {
   const [positions, setPositions] = React.useState({});
   /* 正在拖动中的块：{ id, x, y }，只在本地生效，松手才落盘 */
   const [draggingBlock, setDraggingBlock] = React.useState(null);
+  /* 骨架档下用户显式展开的会话（NFR-1：其余按需展开） */
+  const [expandedSessions, setExpandedSessions] = React.useState([]);
+  const isExpanded = React.useCallback(
+    (sid) => expandedSessions.indexOf(sid) >= 0,
+    [expandedSessions]
+  );
+  const toggleExpanded = React.useCallback((sid) => {
+    setExpandedSessions((list) => (list.indexOf(sid) >= 0
+      ? list.filter((x) => x !== sid)
+      : [...list, sid]));
+  }, []);
+  /* 上一次布局耗时，供慢布局提示用 */
+  const lastLayoutMsRef = React.useRef(0);
   const [selectedEdge, setSelectedEdge] = React.useState(null);
   /* 正在改名的块：{ id, value } */
   const [renaming, setRenaming] = React.useState(null);
@@ -448,14 +465,33 @@ function GraphView(props) {
   }, [sessionsNorm, turnsBySession, sessionId, hidden, alias, links, showHidden]);
 
   const laid = React.useMemo(() => {
-    if (!graph || graph.error) return { nodes: [], headers: new Map(), bounds: null, opts: DEFAULT_LAYOUT };
+    if (!graph || graph.error) {
+      lastLayoutMsRef.current = 0;
+      return { nodes: [], headers: new Map(), bounds: null, opts: DEFAULT_LAYOUT };
+    }
     try {
       /* 传进已摆过的坐标：布局只负责没有坐标的那些（FR-5） */
-      return layout(graph, { positions });
+      const timed = timedLayout(() => layout(graph, { positions }));
+      lastLayoutMsRef.current = timed.ms;
+      return timed.result;
     } catch {
+      lastLayoutMsRef.current = 0;
       return { nodes: [], headers: new Map(), bounds: null, opts: DEFAULT_LAYOUT };
     }
   }, [graph, positions]);
+
+  /* 规模降级（NFR-1）：按块数选档，越大的档省得越多 */
+  const tier = graph && !graph.error ? tierOf(graph.stats.blocks) : 'full';
+  const feats = tierFeatures(tier);
+  /* 骨架档下哪些会话的块要画；null 表示不限 */
+  const blockSessions = graph && !graph.error
+    ? sessionsWithBlocks(graph.sessions, tier, sessionId, expandedSessions)
+    : null;
+  /* 布局慢过预算就提示（NFR-1 的第三条阈值） */
+  const [slowLayout, setSlowLayout] = React.useState(false);
+  React.useEffect(() => {
+    setSlowLayout(lastLayoutMsRef.current > SLOW_LAYOUT_MS);
+  }, [laid]);
 
   /* 拖动中的块就地覆盖坐标：连线跟着走，松手才落盘 */
   const shownNodes = React.useMemo(() => {
@@ -874,7 +910,13 @@ function GraphView(props) {
   }, [exportFmt, exportHidden, exportText, routeUrl, saveUrl, say]);
 
   /* ---- 渲染 ---- */
-  const nodes = showHidden ? shownNodes : shownNodes.filter((n) => !(n.kind === 'block' && n.block.hidden));
+  /* 规模降级在这里生效：骨架档只画会话头 + 指定会话的块（NFR-1） */
+  const nodes = shownNodes.filter((n) => {
+    if (n.kind !== 'block') return true;                       /* 会话头与空节点始终在 */
+    if (!showHidden && n.block.hidden) return false;
+    if (blockSessions && !blockSessions.has(n.sessionId)) return false;
+    return true;
+  });
   const cell = nodes.map((n) => {
     if (n.kind === 'header') {
       return h('div', {
@@ -886,7 +928,15 @@ function GraphView(props) {
       },
       h('span', { className: 'sg-sdot' }),
       h('span', { className: 'sg-st' }, n.title),
-      h('span', { className: 'sg-sm' }, n.turnCount + ' 轮'));
+      h('span', { className: 'sg-sm' }, n.turnCount + ' 轮'),
+      /* 骨架档下非当前会话只出头；这里给一个就地展开的入口（NFR-1「按需展开」） */
+      (feats.skeletonOnly && n.sessionId !== sessionId && n.turnCount)
+        ? h('span', {
+          className: 'sg-expand',
+          title: isExpanded(n.sessionId) ? '收起这个会话的块' : '就地展开这个会话的块',
+          onClick: (ev) => { ev.stopPropagation(); toggleExpanded(n.sessionId); }
+        }, isExpanded(n.sessionId) ? '▾' : '▸')
+        : null);
     }
     if (n.kind === 'empty') {
       return h('div', {
@@ -920,7 +970,9 @@ function GraphView(props) {
       badges),
     h('div', { className: 'sg-ask' + (digest(b.prompt) ? '' : ' sg-empty') },
       b.alias ? '✎ ' + b.alias : (clip(digest(b.prompt), 110) || '（该轮提问尚未载入）')),
-    h('div', { className: 'sg-ans' }, clip(digest(b.response, 'first-paragraph'), 220) || '（该轮回答尚未载入）'),
+    feats.blockText
+      ? h('div', { className: 'sg-ans' }, clip(digest(b.response, 'first-paragraph'), 220) || '（该轮回答尚未载入）')
+      : null,
     /* 连线把手：拖到另一个块即可建立手动边（FR-9）。悬停或选中时才显形。 */
     h('div', {
       className: 'sg-handle',
@@ -946,8 +998,9 @@ function GraphView(props) {
     });
   }).filter(Boolean);
 
-  /* 标签落在边中点；过长由 CSS 截断，title 给完整文本（FR-9） */
-  const edgeLabels = edgeList.map((e) => {
+  /* 标签落在边中点；过长由 CSS 截断，title 给完整文本（FR-9）。
+     密集档起不画标签 —— 那是边渲染里最贵的一块（NFR-1）。 */
+  const edgeLabels = feats.edgeLabels ? edgeList.map((e) => {
     if (!e.label) return null;
     const p = edgeMidpoint(e, nodeMap);
     if (!p) return null;
@@ -959,7 +1012,7 @@ function GraphView(props) {
       title: e.label,
       onClick: (ev) => { ev.stopPropagation(); setSelectedEdge(e.id); }
     }, e.label);
-  }).filter(Boolean);
+  }).filter(Boolean) : [];
 
   /* 拖拽连线中的预览线：从源块右中侧连到指针 */
   const previewEdge = (linking && linking.mode === 'drag' && Number.isFinite(linking.x))
@@ -1023,6 +1076,16 @@ function GraphView(props) {
   /* 改动没存上：说清楚原因，但**不回滚**用户刚做的操作 */
   const saveHint = saveError
     ? h('div', { className: 'sg-hint sg-hint-warn' }, saveError + '（改动仍在本页生效）')
+    : null;
+
+  /* 规模降级与慢布局都要**明说**，不能让用户以为功能坏了（NFR-1） */
+  const scaleHint = (tier !== 'full' || slowLayout)
+    ? h('div', { className: 'sg-hint sg-hint-warn' },
+      [
+        tier === 'dense' ? '块较多：为保持流畅已省略块内正文与边标签' : null,
+        tier === 'skeleton' ? '块非常多：只画分叉骨架与当前会话，点会话头的 ▸ 展开其它会话' : null,
+        slowLayout ? '布局耗时超出预算，已回落简化布局' : null
+      ].filter(Boolean).join('；'))
     : null;
 
   const detail = selectedEdge
@@ -1226,6 +1289,7 @@ function GraphView(props) {
           : '滚轮缩放 · 拖空白平移 · 单击块看详情 · 双击块分叉 · 拖块右下圆点连线 · F 适应视图'),
       contentHint,
       saveHint,
+      scaleHint,
       labelInput,
       body),
     h('aside', { className: 'sg-side' }, detail),
