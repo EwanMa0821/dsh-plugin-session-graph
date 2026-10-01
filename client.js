@@ -4077,15 +4077,30 @@ function SafeGraphView(props) {
 
 function apply(ctx) {
   /* 把字典登记进宿主的本地化服务（NFR-3 第一条：文案经宿主服务提供）。
-     注册要落在 effect 作用域里并随插件卸载回收（NFR-4），
-     与宿主自己的做法一致。登记失败不影响渲染 —— 取值时还有本地字典兜底。 */
+     注册要落在 effect 作用域里并随插件卸载回收（NFR-4），与宿主自己的做法一致。
+
+     实测：客户端 runner 的 `ctx.effect` 不接受这种登记（会抛），于是这里**退一步直接登记** ——
+     功能完全不受影响。这类"可选集成没接上"**不能记成降级**：降级是留给"数据看得见地少了"
+     的（骨架、断裂连线、取数失败），把它混进去只会在角标上常驻一条假警报 ——
+     用户明确要求过"不要假坏"。所以这里只往控制台留一条 warn。 */
   try {
     if (ctx.locale && typeof ctx.locale.register === 'function') {
       const registerDicts = () => { ctx.locale.register(NS, flatten()); };
-      if (typeof ctx.effect === 'function') ctx.effect(registerDicts, 'session-graph: dictionaries');
-      else registerDicts();
+      let scoped = false;
+      if (typeof ctx.effect === 'function') {
+        try {
+          ctx.effect(registerDicts, 'session-graph: dictionaries');
+          scoped = true;
+        } catch (error) {
+          try { console.warn('[session-graph] effect 作用域不收字典登记，改为直接登记', error || ''); } catch { /* 控制台不可用 */ }
+        }
+      }
+      if (!scoped) registerDicts();
     }
-  } catch (error) { degrade('字典注册失败', error); }
+  } catch (error) {
+    /* 连直接登记都失败：这时文案会走本地字典兜底，界面照样正确 —— 仍不算降级 */
+    try { console.warn('[session-graph] 字典登记失败，退回本地字典', error || ''); } catch { /* 控制台不可用 */ }
+  }
 
   /* 视图数据层：只做纯折叠，不订阅会话事件、不轮询、不写 DOM */
   ctx.uiConversation.views.register({
