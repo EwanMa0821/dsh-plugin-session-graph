@@ -2,8 +2,12 @@
 node_modules/
 
 # 设计资料不进公开仓库 —— 仓库只放插件本体
-docs/
-prototype/
+# 注意：写 "/docs/" "/prototype/" 而不是 "docs/" "prototype/"。
+# 少了开头的斜杠，这条规则会匹配任意层级的同名目录，
+# 连带把 assets/prototype/（README 要用的界面截图）也一起忽略掉 ——
+# 现象是 README 里的图片在 GitHub 上是坏的，而在本地看着好好的。
+/docs/
+/prototype/
 
 # 编辑器与系统
 .DS_Store

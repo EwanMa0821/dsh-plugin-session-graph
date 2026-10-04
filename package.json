@@ -39,9 +39,24 @@
   "keywords": [
     "dsh",
     "dsh-plugin",
+    "deepseek",
     "deepseek-harness",
+    "session-graph",
+    "conversation-graph",
+    "conversation-tree",
+    "session-fork",
+    "branching-conversation",
     "mindmap",
-    "session-graph"
+    "mind-map",
+    "freemind",
+    "xmind",
+    "freeplane",
+    "mindmanager",
+    "knowledge-graph",
+    "chat-history-visualization",
+    "会话图谱",
+    "对话分叉",
+    "思维导图"
   ],
   "repository": {
     "type": "git",
