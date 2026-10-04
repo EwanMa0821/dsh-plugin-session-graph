@@ -41,6 +41,23 @@ function service(ctx, key) {
   return ctx[key];
 }
 
+/**
+ * **可选**服务：只走 `ctx.get`，绝不回落到属性访问。
+ *
+ * cordis 的硬规则：没有声明在 inject 里的服务，属性访问会直接抛
+ * （`cannot get property "x" without inject`）。对必需服务那是应该炸的，
+ * 但对可选服务就成了"服务缺席 → 整条路由 500"。这里吞掉异常、返回 undefined，
+ * 让调用方走兜底路径。
+ */
+function optionalService(ctx, key) {
+  if (!ctx || typeof ctx.get !== 'function') return undefined;
+  try {
+    return ctx.get(key);
+  } catch {
+    return undefined;
+  }
+}
+
 function text(body, status) {
   return new Response(body, {
     status,
@@ -395,8 +412,9 @@ export async function buildPayload(ctx, params, limits, store) {
      永远不落盘 —— 只认存档的话，导出文件里一条手动连线都没有，而导出对话框的预览
      （客户端本地 render）里明明有。参数按 id 覆盖存档，导出的 .mm/.md 用合并结果。 */
   const links = mergeLinks(saved && saved.links, parseLinks(params.get('links')));
-  /* 归档会话由客户端告知（只有它的 workspace 快照里有这份名单）：导出的文件要与画布同口径 */
-  const archived = parseArchived(params.get('archived'));
+  /* 归档会话**以宿主读到的权威名单为准**（客户端参数只是兜底）：
+     导出的文件要与画布同口径，而画布上的归档是客户端算的 */
+  const archived = archivedIdsOf(ctx, params.get('archived'));
 
   const query = service(ctx, 'sessionQuery');
   const scope = turnScopeOf(raw, { currentId, named: ids, links });
@@ -514,6 +532,9 @@ function parseLinks(value) {
  * 导出的 Host 侧渲染必须与画布**同一口径**：画布不画归档会话，文件里也不该多出卡片。
  * 归档信息只有客户端知道（它来自 workspace 快照），所以由它随请求带上。
  * 与 `links=` 同样口径：只有"不是 JSON 数组"才判参数非法。
+ *
+ * **但这只是兜底**：宿主自己就能读到权威名单（见 `archivedIdsOf`），
+ * 主路径不依赖客户端传参。
  */
 function parseArchived(value) {
   const raw = typeof value === 'string' ? value.trim() : '';
@@ -528,6 +549,26 @@ function parseArchived(value) {
     throw Object.assign(new Error('archived 必须是 JSON 数组'), { status: 400 });
   }
   return parsed.map((x) => String(x)).filter(Boolean).slice(0, LIMITS.links);
+}
+
+/**
+ * 归档名单：**宿主自己读**为主，查询参数兜底。
+ *
+ * `workspaceRegistry.archivedSessionIds` 是 DSH 自己的权威名单
+ * （产品自身的"归档会话不参与"判定就读它），而且随归档/取消归档更新。
+ * 导出的文件必须与画布同一口径，而画布上的归档是客户端算的 —— 只靠参数传的话，
+ * 宿主版本旧一点、或客户端忘了带，文件里就会多出画布上没有的会话
+ * （实测踩到：导出把已归档的也带上了）。
+ *
+ * @param {object} ctx
+ * @param {string} raw 查询参数原文（仅在服务缺席时解析）
+ */
+function archivedIdsOf(ctx, raw) {
+  const registry = optionalService(ctx, 'workspaceRegistry');
+  if (registry && Array.isArray(registry.archivedSessionIds)) {
+    return registry.archivedSessionIds.map(String);
+  }
+  return parseArchived(raw);
 }
 
 /**

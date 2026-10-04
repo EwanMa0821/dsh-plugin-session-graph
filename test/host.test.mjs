@@ -502,6 +502,29 @@ test('导出与画布同一口径：archived= 里点名的会话不进导出文�
   assert.ok(plain.body.includes('子会话'), '不传 archived 就照旧全都导出');
 });
 
+test('归档名单以宿主为准：连参数都不用带，导出就不会带上已归档的会话', async () => {
+  /* `workspaceRegistry.archivedSessionIds` 是 DSH 自己的权威名单 —— 客户端忘了传参、
+     或者客户端版本旧，导出都不该把画布上没有的会话写进文件（实测踩到过）。 */
+  const ctx = fakeCtx({
+    get: (name) => (name === 'workspaceRegistry' ? { archivedSessionIds: ['child'] } : undefined)
+  });
+  const res = await buildPayload(ctx, params({ sessionId: 'root', format: 'mm' }), {});
+  assert.ok(res.body.includes('根会话'), '没归档的照常导出');
+  assert.ok(!res.body.includes('子会话'), '宿主自己的名单说了算，不依赖参数');
+});
+
+test('宿主没有 workspaceRegistry 服务时不报错，退回查询参数', async () => {
+  /* 可选服务只能走 ctx.get；属性访问在未 inject 时会抛，不能让整条路由 500 */
+  const ctx = fakeCtx({ get: () => { throw new Error('cannot get property without inject'); } });
+  const res = await buildPayload(ctx, params({
+    sessionId: 'root', format: 'mm', archived: JSON.stringify(['child'])
+  }), {});
+  assert.ok(!res.body.includes('子会话'), '退回参数后照样排除归档会话');
+
+  const bare = await buildPayload(ctx, params({ sessionId: 'root', format: 'mm' }), {});
+  assert.ok(bare.body.includes('子会话'), '既没服务也没参数时行为与以前一致');
+});
+
 test('archived= 不是 JSON 数组时返回 400', async () => {
   for (const bad of ['{oops', '{"a":1}']) {
     await assert.rejects(
